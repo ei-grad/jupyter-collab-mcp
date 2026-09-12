@@ -1,0 +1,87 @@
+{
+  "name": "jupyter-collab-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for live JupyterLab notebooks over RTC: read, edit and run cells in the document the user is looking at.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "jupyter",
+    "jupyterlab",
+    "notebook",
+    "ipynb",
+    "rtc",
+    "yjs",
+    "crdt",
+    "jupyter-collaboration",
+    "llm",
+    "claude"
+  ],
+  "homepage": "https://github.com/ei-grad/jupyter-collab-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/ei-grad/jupyter-collab-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ei-grad/jupyter-collab-mcp.git"
+  },
+  "author": "Lilia Grigoreva",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "jupyter-collab-mcp": "./dist/mcp/cli.js"
+  },
+  "files": [
+    "dist",
+    "skill",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "tsx src/mcp/cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:int": "vitest run --project int",
+    "check-headless": "tsx scripts/check-headless.ts",
+    "smoke": "tsx scripts/e2e-smoke.ts",
+    "acceptance": "tsx scripts/mcp-acceptance.ts",
+    "prepublishOnly": "pnpm typecheck && pnpm test:unit && pnpm build"
+  },
+  "dependencies": {
+    "@jupyter/ydoc": "^4.1.1",
+    "@jupyterlab/services": "^7.6.3",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "lib0": "^0.2.117",
+    "ws": "^8.21.3",
+    "y-protocols": "^1.0.7",
+    "y-websocket": "^3.1.0",
+    "yjs": "^13.6.32",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@types/node": "^26.4.1",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

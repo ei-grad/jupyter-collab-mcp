@@ -1,0 +1,24 @@
+# Python / uv test stand
+.venv/
+**/.venv/
+dev/jupyter/.runtime/
+# jupyter_server_ydoc writes its SQLite ystore next to the server cwd
+dev/jupyter/.jupyter_ystore.db
+**/.jupyter_ystore.db
+
+# scratch
+.scratch/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+
+# TypeScript build
+dist
+coverage
+
+# browser check artifacts and ystore journal
+dev/browser/out/
+**/.jupyter_ystore.db-journal

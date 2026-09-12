@@ -1,0 +1,24 @@
+{
+  "name": "jupyter-collab-mcp-dev-browser",
+  "version": "0.0.0",
+  "description": "Browser integration checks (Playwright) for SPEC.md §8/§12 shared execution.",
+  "scripts": {
+    "shared-execution": "tsx shared-execution.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "license": "MIT",
+  "packageManager": "pnpm@10.30.3",
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "playwright": "^1.63.0",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  },
+  "private": true,
+  "type": "module",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
