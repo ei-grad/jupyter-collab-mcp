@@ -1079,6 +1079,10 @@ parameters, credentials, assertions or claim values, and do not use stdout.
 Identity diagnostics distinguish signature, issuer, audience, expiry, missing
 or rejected email verification, email domain and provisioned-user failures.
 External callback errors remain generic and authentication checks are unchanged.
+Upstream code exchange uses the configured public callback URI, including its
+HTTPS scheme and base path, with only the incoming callback query copied onto
+it. Listener URLs and forwarded headers cannot change that URI; state, nonce
+and PKCE validation remain mandatory behind TLS-terminating proxies.
 Registrations, transactions, one-time codes, and local access tokens are encrypted at rest;
 one-time values are consumed atomically and no record outlives the signed
 upstream ID token. Redirects are checked against current operator policy at

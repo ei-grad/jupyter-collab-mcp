@@ -292,16 +292,19 @@ class OpenIdClient implements UpstreamAuthorizationClient {
     readonly nonce: string;
     readonly codeVerifier: string;
   }): Promise<string> {
+    // The Node listener sees HTTP behind TLS termination. openid-client derives
+    // the token request's redirect_uri from this URL, not additional parameters.
+    const callbackUrl = new URL(input.redirectUri);
+    callbackUrl.search = input.callbackUrl.search;
     const tokens = await oidc.authorizationCodeGrant(
       this.#configuration,
-      input.callbackUrl,
+      callbackUrl,
       {
         expectedState: input.state,
         expectedNonce: input.nonce,
         pkceCodeVerifier: input.codeVerifier,
         idTokenExpected: true
-      },
-      { redirect_uri: input.redirectUri }
+      }
     );
     if (typeof tokens.id_token !== 'string' || tokens.id_token === '') throw new UpstreamGrantError('missing_id_token');
     if (tokens.refresh_token) throw new UpstreamGrantError('unexpected_refresh_token');

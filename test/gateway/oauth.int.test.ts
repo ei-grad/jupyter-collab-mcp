@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 
 import { exchangeAuthorization, registerClient, resolveClientMetadata } from '@modelcontextprotocol/client';
+import { toNodeHandler } from '@modelcontextprotocol/node';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
 import * as oidc from 'openid-client';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -128,8 +131,8 @@ async function gateway(emailVerified: unknown = true) {
   return { oauth, upstream, backend, store, verifier, gatewayConfig };
 }
 
-async function register(oauth: GatewayOAuth): Promise<string> {
-  const response = await oauth.handle(new Request('https://mcp.example/register', {
+async function register(oauth: GatewayOAuth, publicUrl = 'https://mcp.example'): Promise<string> {
+  const response = await oauth.handle(new Request(`${publicUrl}/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -258,15 +261,20 @@ describe('hosted OAuth authorization flow', () => {
     }
   );
 
-  it.each(['success', 'nonce_mismatch', 'unexpected_refresh_token', 'missing_id_token'])(
-    'uses the real openid-client exchange: %s', async (mode) => {
+  it.each([
+    { mode: 'success', basePath: '' },
+    { mode: 'success', basePath: '/gateway/jupyter' },
+    ...['nonce_mismatch', 'unexpected_refresh_token', 'missing_id_token'].map((mode) => ({ mode, basePath: '' }))
+  ])('uses the real Node callback and openid-client exchange: $mode $basePath', async ({ mode, basePath }) => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const gatewayConfig = config();
+    const publicUrl = `https://mcp.example${basePath}`;
+    const gatewayConfig = { ...config(), publicUrl: new URL(publicUrl) };
     const store = new EncryptedStore(
       new MemoryKeyValueBackend(),
       gatewayConfig.storageKey
     );
     let authorizationNonce = '';
+    let tokenRedirectUri: string | null = null;
     const fetchImpl: typeof fetch = async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       if (url.href === gatewayConfig.oidcConfigUrl.href) {
@@ -284,6 +292,7 @@ describe('hosted OAuth authorization flow', () => {
         const headers = new Headers(init?.headers);
         expect(headers.get('authorization')).toMatch(/^Basic /u);
         const body = new URLSearchParams(String(init?.body));
+        tokenRedirectUri = body.get('redirect_uri');
         expect(body.get('grant_type')).toBe('authorization_code');
         expect(body.get('code_verifier')).toMatch(/^[A-Za-z0-9_-]{86}$/u);
         const now = Math.floor(Date.now() / 1000);
@@ -311,9 +320,9 @@ describe('hosted OAuth authorization flow', () => {
     };
 
     const oauth = await createGatewayOAuth(gatewayConfig, store, fetchImpl);
-    const clientId = await register(oauth);
+    const clientId = await register(oauth, publicUrl);
     const verifier = 'r'.repeat(64);
-    const authorizeUrl = new URL('https://mcp.example/authorize');
+    const authorizeUrl = new URL(`${publicUrl}/authorize`);
     authorizeUrl.search = new URLSearchParams({
       response_type: 'code',
       client_id: clientId,
@@ -329,11 +338,38 @@ describe('hosted OAuth authorization flow', () => {
     authorizationNonce = upstream.searchParams.get('nonce')!;
     expect(authorizationNonce).not.toBe('');
     expect(upstream.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(upstream.searchParams.get('redirect_uri')).toBe(`${publicUrl}/auth/callback`);
 
-    const callback = new URL('https://mcp.example/auth/callback');
-    callback.searchParams.set('state', upstream.searchParams.get('state')!);
-    callback.searchParams.set('code', 'upstream-code');
-    const completed = await oauth.handle(new Request(callback));
+    let incomingUrl: string | undefined;
+    const nodeHandler = toNodeHandler({
+      fetch: async (request) => {
+        incomingUrl = request.url;
+        return await oauth.handle(request) ?? new Response(null, { status: 404 });
+      }
+    });
+    const listener = createServer((request, response) => {
+      void nodeHandler(request as Parameters<typeof nodeHandler>[0], response);
+    });
+    await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve));
+    let completed: Response;
+    try {
+      const address = listener.address() as AddressInfo;
+      const callback = new URL(`http://127.0.0.1:${address.port}${basePath}/auth/callback`);
+      callback.searchParams.set('state', upstream.searchParams.get('state')!);
+      callback.searchParams.set('code', 'upstream-code');
+      completed = await fetch(callback, {
+        redirect: 'manual',
+        headers: {
+          'x-forwarded-host': 'attacker.invalid',
+          'x-forwarded-proto': 'http',
+          forwarded: 'host=attacker.invalid;proto=https'
+        }
+      });
+      expect(incomingUrl).toBe(callback.href);
+    } finally {
+      await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    }
+    expect(tokenRedirectUri).toBe(`${publicUrl}/auth/callback`);
     expect(completed?.status).toBe(303);
     const clientCallback = new URL(completed!.headers.get('location')!);
     if (mode === 'success') {
