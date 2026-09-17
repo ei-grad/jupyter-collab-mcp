@@ -133,3 +133,30 @@ For Codex, either reference the file from `AGENTS.md` or copy it to
   `npm unpublish` is available only for a limited period and breaks clients.
 - For the next version, bump `version`, update `docs/STATUS.md`, and update
   `skill/SKILL.md` if tool names or `request_id` semantics changed.
+
+## 7. Trusted publishing
+
+Future GitHub releases are published by `.github/workflows/publish.yml` through
+npm OIDC. Configure this trusted publisher in the npm package settings:
+
+| Field | Value |
+| --- | --- |
+| Provider | GitHub Actions |
+| GitHub user or organization | `ei-grad` |
+| Repository | `jupyter-collab-mcp` |
+| Workflow filename | `publish.yml` |
+| Environment | `npm` |
+| Permission | Publish |
+
+The workflow runs only when a GitHub Release is published. Its tag must be
+`v<package.json version>`. It uses a GitHub-hosted runner, grants only
+`contents: read` and `id-token: write`, and supplies no npm token. Trusted
+publishing requires npm 11.5.1 or newer and Node.js 22.14.0 or newer; the
+workflow pins newer compatible versions.
+
+npm CLI 11.15 or newer can also manage the relationship with `npm trust`, but
+granular access tokens that bypass 2FA are not accepted for trust management.
+After one OIDC publication succeeds, set Publishing access to "Require two-factor
+authentication and disallow tokens", then revoke obsolete publish tokens.
+
+[npm trusted publishing](https://docs.npmjs.com/trusted-publishers/)
