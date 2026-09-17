@@ -11,12 +11,71 @@ import * as oidc from 'openid-client';
 import type { GatewayConfig } from './config.js';
 import { isRedirectAllowed } from './config.js';
 import { EncryptedStore } from './crypto-store.js';
-import { AccessIdentity, IdentityVerifier } from './identity.js';
+import { AccessIdentity, IdentityVerifier, identityFailureReason } from './identity.js';
 
 const OAUTH_SCOPES = ['openid', 'email'] as const;
 const TRANSACTION_TTL_SECONDS = 600;
 const CODE_TTL_SECONDS = 300;
 const MAX_REQUEST_BYTES = 1024 * 1024;
+
+class UpstreamGrantError extends Error {
+  constructor(readonly reason: 'missing_id_token' | 'unexpected_refresh_token') {
+    super('upstream token response is not a bounded ID-token grant');
+  }
+}
+
+function upstreamFailureReason(error: unknown): string {
+  if (error instanceof UpstreamGrantError) {
+    switch (error.reason) {
+      case 'missing_id_token': return 'missing_id_token';
+      case 'unexpected_refresh_token': return 'unexpected_refresh_token';
+    }
+  }
+  if (error instanceof oidc.ResponseBodyError) {
+    switch (error.error) {
+      case 'invalid_client': return 'invalid_client';
+      case 'invalid_grant': return 'invalid_grant';
+      case 'invalid_request': return 'invalid_request';
+      default: return 'oauth_response_error';
+    }
+  }
+  if (error instanceof oidc.AuthorizationResponseError) return 'authorization_response_error';
+  if (error instanceof oidc.WWWAuthenticateChallengeError) return 'authentication_challenge';
+  if (error instanceof oidc.ClientError) {
+    switch (error.code) {
+      case 'OAUTH_TIMEOUT': return 'timeout';
+      case 'OAUTH_ABORT': return 'aborted';
+      case 'OAUTH_RESPONSE_IS_NOT_CONFORM': return 'unexpected_http_status';
+      case 'OAUTH_RESPONSE_IS_NOT_JSON': return 'unexpected_content_type';
+      case 'OAUTH_PARSE_ERROR': return 'parse_error';
+      case 'OAUTH_INVALID_RESPONSE': {
+        // The SDK can reject an absent ID token before our grant check runs.
+        const cause = error.cause instanceof Error ? error.cause.cause : undefined;
+        const body = typeof cause === 'object' && cause !== null && 'body' in cause ? cause.body : undefined;
+        if (typeof body === 'object' && body !== null && 'access_token' in body && !('id_token' in body)) {
+          return 'missing_id_token';
+        }
+        return 'invalid_response';
+      }
+      case 'OAUTH_JWT_CLAIM_COMPARISON_FAILED': {
+        // openid-client wraps oauth4webapi's error; inspect only its claim name,
+        // never the expected value or the token claims carried alongside it.
+        const cause = error.cause instanceof Error ? error.cause.cause : undefined;
+        const claim = typeof cause === 'object' && cause !== null && 'claim' in cause
+          ? cause.claim : undefined;
+        switch (claim) {
+          case 'nonce': return 'nonce_mismatch';
+          case 'iss': return 'issuer_mismatch';
+          case 'aud': return 'audience_mismatch';
+          default: return 'jwt_claim_comparison';
+        }
+      }
+      case 'OAUTH_JWT_TIMESTAMP_CHECK_FAILED': return 'jwt_timestamp';
+      case 'OAUTH_JSON_ATTRIBUTE_COMPARISON_FAILED': return 'response_attribute_comparison';
+    }
+  }
+  return 'unknown';
+}
 
 interface ClientRecord {
   readonly clientId: string;
@@ -244,9 +303,8 @@ class OpenIdClient implements UpstreamAuthorizationClient {
       },
       { redirect_uri: input.redirectUri }
     );
-    if (typeof tokens.id_token !== 'string' || tokens.id_token === '' || tokens.refresh_token) {
-      throw new Error('upstream token response is not a bounded ID-token grant');
-    }
+    if (typeof tokens.id_token !== 'string' || tokens.id_token === '') throw new UpstreamGrantError('missing_id_token');
+    if (tokens.refresh_token) throw new UpstreamGrantError('unexpected_refresh_token');
     return tokens.id_token;
   }
 }
@@ -554,17 +612,24 @@ export class GatewayOAuth {
     if (callbackUrl.searchParams.has('error')) {
       return clientRedirect(record, { error: 'access_denied' });
     }
-    let identity: AccessIdentity;
+    let assertion: string;
     try {
-      const assertion = await this.#upstream.exchange({
+      assertion = await this.#upstream.exchange({
         callbackUrl,
         redirectUri: endpoint(this.#config.publicUrl, '/auth/callback').href,
         state,
         nonce: record.upstreamNonce,
         codeVerifier: record.upstreamCodeVerifier
       });
+    } catch (error) {
+      process.stderr.write(`oauth_callback_failed stage=upstream_exchange reason=${upstreamFailureReason(error)}\n`);
+      return clientRedirect(record, { error: 'server_error' });
+    }
+    let identity: AccessIdentity;
+    try {
       identity = await this.#identityVerifier.verify(assertion);
-    } catch {
+    } catch (error) {
+      process.stderr.write(`oauth_callback_failed stage=identity_verification reason=${identityFailureReason(error)}\n`);
       return clientRedirect(record, { error: 'server_error' });
     }
     const remaining = identity.expiresAt - this.#now();

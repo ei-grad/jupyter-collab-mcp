@@ -1,7 +1,7 @@
 import { generateKeyPair, exportJWK, SignJWT, createLocalJWKSet } from 'jose';
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { IdentityVerifier } from '../../src/gateway/identity.js';
+import { IdentityVerifier, identityFailureReason } from '../../src/gateway/identity.js';
 
 const NOW = 1_800_000_000;
 let privateKey: CryptoKey;
@@ -79,5 +79,39 @@ describe('OIDC access identity', () => {
       .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
       .sign(privateKey);
     await expect(verifier.verify(token)).rejects.toThrow('access ID token is missing or invalid');
+    await expect(verifier.verify(token)).rejects.toMatchObject({ reason: 'email_verified_missing' });
+  });
+
+  it.each([
+    [{ exp: NOW - 1 }, 'expired'],
+    [{ nbf: NOW + 1 }, 'not_yet_valid'],
+    [{ iss: 'https://sensitive-issuer.example' }, 'issuer'],
+    [{ aud: 'sensitive-audience' }, 'audience'],
+    [{ email_verified: false }, 'email_not_verified'],
+    [{ email_verified: 'sensitive-value' }, 'email_not_verified'],
+    [{ email: 'private@other.invalid' }, 'email_domain'],
+    [{ email: 'private@example.invalid' }, 'user_not_allowed'],
+    [{ exp: null }, 'invalid_claims']
+  ] as const)('retains only a fixed failure reason %#', async (changes, reason) => {
+    const token = await issue(changes);
+    try {
+      await verifier.verify(token);
+      expect.fail('invalid identity accepted');
+    } catch (error) {
+      expect(identityFailureReason(error)).toBe(reason);
+      expect(error).not.toHaveProperty('cause');
+      expect(String(error)).toBe('Error: access ID token is missing or invalid');
+    }
+  });
+
+  it('distinguishes signature failure without preserving the assertion', async () => {
+    const pair = await generateKeyPair('RS256');
+    const token = await new SignJWT({ exp: NOW + 120 })
+      .setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).sign(pair.privateKey);
+    await expect(verifier.verify(token)).rejects.toMatchObject({ reason: 'signature' });
+  });
+
+  it('does not trust reason properties on unknown errors', () => {
+    expect(identityFailureReason({ reason: 'private-claim\ninjected' })).toBe('unknown');
   });
 });

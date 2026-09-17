@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 
 import { exchangeAuthorization, registerClient, resolveClientMetadata } from '@modelcontextprotocol/client';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import * as oidc from 'openid-client';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { loadGatewayConfig } from '../../src/gateway/config.js';
 import { EncryptedStore, MemoryKeyValueBackend } from '../../src/gateway/crypto-store.js';
@@ -18,6 +19,8 @@ const REDIRECT_URI = 'https://client.example/callback';
 let privateKey: CryptoKey;
 let localJwks: ReturnType<typeof createLocalJWKSet>;
 let publicJwk: Awaited<ReturnType<typeof exportJWK>>;
+
+afterEach(() => vi.restoreAllMocks());
 
 function config() {
   return loadGatewayConfig({
@@ -36,14 +39,15 @@ function config() {
   });
 }
 
-async function assertion(emailVerified: unknown = true): Promise<string> {
+async function assertion(emailVerified: unknown = true, changes: Record<string, unknown> = {}): Promise<string> {
   return new SignJWT({
     iss: 'https://issuer.example',
     aud: 'gateway-client',
     sub: 'alice-id',
     email: 'alice.person@example.invalid',
     email_verified: emailVerified,
-    exp: NOW + 120
+    exp: NOW + 120,
+    ...changes
   })
     .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
     .sign(privateKey);
@@ -254,7 +258,9 @@ describe('hosted OAuth authorization flow', () => {
     }
   );
 
-  it('uses the real openid-client exchange and verifies its nonce and JWKS', async () => {
+  it.each(['success', 'nonce_mismatch', 'unexpected_refresh_token', 'missing_id_token'])(
+    'uses the real openid-client exchange: %s', async (mode) => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const gatewayConfig = config();
     const store = new EncryptedStore(
       new MemoryKeyValueBackend(),
@@ -284,7 +290,7 @@ describe('hosted OAuth authorization flow', () => {
         const idToken = await new SignJWT({
           email: 'alice.person@example.invalid',
           email_verified: true,
-          nonce: authorizationNonce
+          nonce: mode === 'nonce_mismatch' ? 'sensitive-wrong-nonce' : authorizationNonce
         })
           .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
           .setIssuer('https://issuer.example')
@@ -297,7 +303,8 @@ describe('hosted OAuth authorization flow', () => {
           access_token: 'upstream-opaque',
           token_type: 'Bearer',
           expires_in: 120,
-          id_token: idToken
+          ...(mode === 'missing_id_token' ? {} : { id_token: idToken }),
+          ...(mode === 'unexpected_refresh_token' ? { refresh_token: 'sensitive-refresh-token' } : {})
         });
       }
       throw new Error(`unexpected upstream request ${url.href}`);
@@ -329,7 +336,16 @@ describe('hosted OAuth authorization flow', () => {
     const completed = await oauth.handle(new Request(callback));
     expect(completed?.status).toBe(303);
     const clientCallback = new URL(completed!.headers.get('location')!);
-    expect(clientCallback.searchParams.get('code')).not.toBeNull();
+    if (mode === 'success') {
+      expect(clientCallback.searchParams.get('code')).not.toBeNull();
+      expect(stderr).not.toHaveBeenCalled();
+    } else {
+      expect(clientCallback.searchParams.get('error')).toBe('server_error');
+      expect(clientCallback.searchParams.has('code')).toBe(false);
+      expect(stderr.mock.calls.map(([text]) => text)).toEqual([
+        `oauth_callback_failed stage=upstream_exchange reason=${mode}\n`
+      ]);
+    }
     expect(clientCallback.searchParams.get('state')).toBe('client-state');
     await oauth.close();
   });
@@ -621,8 +637,17 @@ describe('hosted OAuth authorization flow', () => {
     expect(token?.status).toBe(200);
   });
 
-  it('rejects email_verified other than boolean true before issuing a code', async () => {
-    const { oauth, upstream } = await gateway(false);
+  it.each([
+    [{ email_verified: false }, 'email_not_verified'],
+    [{ email_verified: undefined }, 'email_verified_missing'],
+    [{ email_verified: 'secret-claim\nforged-log' }, 'email_not_verified'],
+    [{ email: 'sensitive.person@other.invalid' }, 'email_domain'],
+    [{ email: 'sensitive.person@example.invalid' }, 'user_not_allowed']
+  ] as const)('diagnoses a rejected identity without its sensitive claims: %s', async (changes, reason) => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const { oauth, upstream } = await gateway();
+    upstream.assertion = await assertion(true, changes);
     const clientId = await register(oauth);
     const verifier = 'v'.repeat(64);
     const authorizeUrl = new URL('https://mcp.example/authorize');
@@ -643,6 +668,46 @@ describe('hosted OAuth authorization flow', () => {
     const clientCallback = new URL(response!.headers.get('location')!);
     expect(clientCallback.searchParams.get('error')).toBe('server_error');
     expect(clientCallback.searchParams.has('code')).toBe(false);
+    expect(stderr.mock.calls.map(([text]) => text)).toEqual([
+      `oauth_callback_failed stage=identity_verification reason=${reason}\n`
+    ]);
+    expect(stdout).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unknown', () => Object.assign(new Error('secret-error\nforged-log'), { code: 'OAUTH_TIMEOUT', reason: 'secret-reason' })],
+    ['unknown', () => Object.assign(new oidc.ClientError('secret-error'), { code: 'secret-code\nforged-log' })],
+    ['timeout', () => Object.assign(new oidc.ClientError('secret-error'), { code: 'OAUTH_TIMEOUT' })],
+    ...['invalid_client', 'invalid_grant', 'invalid_request'].map((reason) => [reason, () => new oidc.ResponseBodyError('secret-error', {
+      cause: { error: reason, error_description: 'secret-description' }, response: new Response(null, { status: 400 })
+    })] as const),
+    ['oauth_response_error', () => new oidc.ResponseBodyError('secret-error', {
+      cause: { error: 'secret-error-code\nforged-log', error_description: 'secret-description' }, response: new Response(null, { status: 400 })
+    })]
+  ] as const)('emits only a fixed upstream reason: %s', async (reason, failure) => {
+    const { oauth, upstream } = await gateway();
+    vi.spyOn(upstream, 'exchange').mockRejectedValue(failure());
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const clientId = await register(oauth);
+    const authorize = new URL('https://mcp.example/authorize');
+    authorize.search = new URLSearchParams({
+      response_type: 'code', client_id: clientId, redirect_uri: REDIRECT_URI,
+      scope: 'openid email', code_challenge: createHash('sha256').update('v'.repeat(64)).digest('base64url'),
+      code_challenge_method: 'S256'
+    }).toString();
+    await oauth.handle(new Request(authorize));
+    const callback = new URL('https://mcp.example/auth/callback');
+    callback.searchParams.set('state', upstream.lastAuthorization!.state);
+    callback.searchParams.set('code', 'sensitive-authorization-code');
+    const result = await oauth.handle(new Request(callback));
+    const location = new URL(result!.headers.get('location')!);
+    expect(location.searchParams.get('error')).toBe('server_error');
+    expect(location.searchParams.has('code')).toBe(false);
+    expect(stderr.mock.calls.map(([text]) => text)).toEqual([
+      `oauth_callback_failed stage=upstream_exchange reason=${reason}\n`
+    ]);
+    expect(stdout).not.toHaveBeenCalled();
   });
 
   it('challenges invalid bearer tokens with protected-resource discovery', async () => {

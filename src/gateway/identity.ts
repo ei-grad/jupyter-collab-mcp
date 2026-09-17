@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   createRemoteJWKSet,
   customFetch,
+  errors,
   jwtVerify,
   type JWTVerifyOptions,
   type JWTVerifyGetKey
@@ -74,6 +75,39 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+const IDENTITY_FAILURE_REASONS = [
+  'invalid_token', 'invalid_claims', 'signature', 'issuer', 'audience',
+  'expired', 'not_yet_valid', 'email_verified_missing', 'email_not_verified',
+  'email_domain', 'user_not_allowed', 'unknown'
+] as const;
+
+type IdentityFailureReason = typeof IDENTITY_FAILURE_REASONS[number];
+
+export class IdentityVerificationError extends Error {
+  constructor(readonly reason: IdentityFailureReason) {
+    super('access ID token is missing or invalid');
+  }
+}
+
+export function identityFailureReason(error: unknown): IdentityFailureReason | 'unknown' {
+  return error instanceof IdentityVerificationError && IDENTITY_FAILURE_REASONS.includes(error.reason)
+    ? error.reason : 'unknown';
+}
+
+function jwtFailureReason(error: unknown): IdentityFailureReason {
+  if (error instanceof errors.JWSSignatureVerificationFailed) return 'signature';
+  if (error instanceof errors.JWTExpired) return 'expired';
+  if (error instanceof errors.JWTClaimValidationFailed) {
+    switch (error.claim) {
+      case 'iss': return 'issuer';
+      case 'aud': return 'audience';
+      case 'nbf': return 'not_yet_valid';
+      default: return 'invalid_claims';
+    }
+  }
+  return error instanceof errors.JOSEError ? 'invalid_token' : 'unknown';
+}
+
 export class IdentityVerifier {
   readonly #options: IdentityVerifierOptions;
   readonly #getKey: JWTVerifyGetKey;
@@ -92,7 +126,7 @@ export class IdentityVerifier {
   }
 
   async verify(assertion: string): Promise<AccessIdentity> {
-    if (assertion === '') throw new Error('access ID token is missing or invalid');
+    if (assertion === '') throw new IdentityVerificationError('invalid_token');
     const now = this.#options.now?.() ?? Date.now() / 1000;
     const checks: JWTVerifyOptions = {
       issuer: this.#options.issuer,
@@ -103,8 +137,8 @@ export class IdentityVerifier {
     let payload: Awaited<ReturnType<typeof jwtVerify>>['payload'];
     try {
       ({ payload } = await jwtVerify(assertion, this.#getKey, checks));
-    } catch {
-      throw new Error('access ID token is missing or invalid');
+    } catch (error) {
+      throw new IdentityVerificationError(jwtFailureReason(error));
     }
     const { exp, nbf = 0, iss, sub, email, email_verified: emailVerified } = payload;
     const emailPattern = new RegExp(
@@ -121,18 +155,19 @@ export class IdentityVerifier {
       iss === '' ||
       typeof sub !== 'string' ||
       sub === '' ||
-      typeof email !== 'string' ||
-      emailVerified !== true ||
-      !emailPattern.test(email)
+      typeof email !== 'string'
     ) {
-      throw new Error('access ID token is missing or invalid');
+      throw new IdentityVerificationError('invalid_claims');
     }
+    if (emailVerified === undefined) throw new IdentityVerificationError('email_verified_missing');
+    if (emailVerified !== true) throw new IdentityVerificationError('email_not_verified');
+    if (!emailPattern.test(email)) throw new IdentityVerificationError('email_domain');
     let username = email.slice(0, -(`@${this.#options.emailDomain}`).length);
     if (this.#options.usernameMode === 'email-localpart-dashes') {
       username = username.replaceAll('.', '-');
     }
     if (!this.#options.allowedUsers.has(username)) {
-      throw new Error('access ID token is missing or invalid');
+      throw new IdentityVerificationError('user_not_allowed');
     }
     return new AccessIdentity({
       issuer: iss,

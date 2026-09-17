@@ -1072,6 +1072,13 @@ accepts a nonempty array of nonempty grant-type strings containing
 `authorization_code`, including clients that also request `refresh_token`, and
 registers and returns only `authorization_code`. Omitted grant types default to
 `authorization_code`; malformed or unsupported-only requests are rejected.
+Failed OAuth callbacks emit a bounded stderr diagnostic naming the upstream
+exchange or identity-verification stage and an allowlisted reason code; unknown
+errors use `unknown`. Diagnostics contain no raw errors, stacks, URLs, query
+parameters, credentials, assertions or claim values, and do not use stdout.
+Identity diagnostics distinguish signature, issuer, audience, expiry, missing
+or rejected email verification, email domain and provisioned-user failures.
+External callback errors remain generic and authentication checks are unchanged.
 Registrations, transactions, one-time codes, and local access tokens are encrypted at rest;
 one-time values are consumed atomically and no record outlives the signed
 upstream ID token. Redirects are checked against current operator policy at
