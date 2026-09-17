@@ -1,6 +1,6 @@
 {
   "name": "jupyter-collab-mcp",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "MCP server for live JupyterLab notebooks over RTC: read, edit and run cells in the document the user is looking at.",
   "keywords": [
     "mcp",
@@ -30,6 +30,7 @@
   "engines": {
     "node": ">=22"
   },
+  "packageManager": "pnpm@11.11.0",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -39,7 +40,7 @@
     }
   },
   "bin": {
-    "jupyter-collab-mcp": "./dist/mcp/cli.js"
+    "jupyter-collab-mcp": "dist/mcp/cli.js"
   },
   "files": [
     "dist",
@@ -49,6 +50,7 @@
   ],
   "scripts": {
     "start": "tsx src/mcp/cli.ts",
+    "start:http": "tsx src/mcp/cli.ts --http",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
@@ -62,9 +64,13 @@
   "dependencies": {
     "@jupyter/ydoc": "^4.1.1",
     "@jupyterlab/services": "^7.6.3",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/node": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
+    "jose": "6.2.12",
     "lib0": "^0.2.117",
+    "openid-client": "6.8.8",
+    "redis": "6.2.1",
     "ws": "^8.21.3",
     "y-protocols": "^1.0.7",
     "y-websocket": "^3.1.0",
@@ -72,16 +78,10 @@
     "zod": "^4.5.4"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.0.0",
     "@types/node": "^26.4.1",
     "@types/ws": "^8.18.1",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2",
     "vitest": "^5.0.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
   }
 }

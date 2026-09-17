@@ -315,6 +315,73 @@ export class NotebookModel {
     };
   }
 
+  /**
+   * Remove the initial cell allocated by Jupyter for a newly created file.
+   *
+   * The caller establishes provenance by invoking this only for the file it
+   * just allocated. The state check is intentionally exact so a browser edit
+   * observed before this transaction is never mistaken for the placeholder.
+   */
+  removePristineServerPlaceholder(): boolean {
+    this.#assertLive();
+    if (this.index.size !== 1) return false;
+    const entry = this.index.entries[0]!;
+    const cell = resolveCell(this.notebook, entry);
+    if (!isCodeCell(cell)) return false;
+    const allowed = new Set([
+      'id',
+      'cell_type',
+      'source',
+      'metadata',
+      'outputs',
+      'execution_count',
+      'execution_state'
+    ]);
+    if ([...cell.ymodel.keys()].some((key) => !allowed.has(key))) return false;
+    if (cell.getSource() !== '') return false;
+    const metadata = cell.getMetadata() as Record<string, unknown>;
+    const metadataKeys = Object.keys(metadata);
+    if (
+      metadataKeys.length !== 0 &&
+      !(metadataKeys.length === 1 && metadataKeys[0] === 'trusted' && metadata['trusted'] === true)
+    ) {
+      return false;
+    }
+    if (cell.getOutputs().length !== 0) return false;
+    if (cell.execution_count !== null) return false;
+    const executionState = cell.ymodel.get('execution_state');
+    if (executionState !== undefined && executionState !== 'idle') return false;
+
+    this.ydoc.transact((transaction) => {
+      this.markLocalTransaction(transaction);
+      this.notebook.deleteCell(0);
+    }, this.origin);
+    this.journal.flush();
+    return true;
+  }
+
+  /** Persist the selected server kernelspec in shared notebook metadata. */
+  setKernelSpecMetadata(spec: {
+    readonly name: string;
+    readonly displayName: string;
+    readonly language: string;
+  }): void {
+    this.#assertLive();
+    const metadata = this.ymeta.get('metadata') as Y.Map<unknown> | undefined;
+    if (metadata === undefined) {
+      throw coreError('INTERNAL_ERROR', 'the notebook has no shared metadata map');
+    }
+    this.ydoc.transact((transaction) => {
+      this.markLocalTransaction(transaction);
+      metadata.set('kernelspec', {
+        name: spec.name,
+        display_name: spec.displayName,
+        language: spec.language
+      });
+    }, this.origin);
+    this.journal.flush();
+  }
+
   #resultOf(op: OperationResult['op'], cellId: string | null): OperationResult {
     if (op === 'set_notebook_metadata' || op === 'delete_notebook_metadata') {
       return { op, notebookMetadataRevision: metadataRevisionOf(this.notebook) };
@@ -408,8 +475,8 @@ export class NotebookModel {
    * Open a new output-area generation immediately before an `execute_request`
    * (SPEC.md §8). See {@link GenerationRegistry.begin}.
    */
-  beginExecutionGeneration(cellId: string): OutputSink | null {
-    return this.generations.begin(cellId);
+  beginExecutionGeneration(cellId: string, expectedIdentityToken?: string): OutputSink | null {
+    return this.generations.begin(cellId, expectedIdentityToken);
   }
 
   /**

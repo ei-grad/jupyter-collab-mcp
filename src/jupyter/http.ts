@@ -25,10 +25,13 @@ export interface HttpResponse {
   readonly headers: Headers;
   /** Body text; `''` when there was none. */
   readonly text: string;
+  /** Redact configured credentials only when rendering diagnostics. */
+  readonly redactDiagnostic?: (text: string) => string;
 }
 
 /** Options of {@link httpRequest}. */
 export interface HttpRequestOptions {
+  readonly authHeaders?: Readonly<Record<string, string>>;
   readonly method?: string;
   /** Serialised as JSON with `Content-Type: application/json`. */
   readonly json?: unknown;
@@ -146,12 +149,16 @@ export async function httpRequest(
   const fetchImpl = options.fetchImpl ?? fetch;
   const maxRedirects = options.maxRedirects ?? 5;
   const body = options.json === undefined ? undefined : JSON.stringify(options.json);
+  const secrets = options.authHeaders === undefined ? [token] : Object.values(options.authHeaders);
+  const scrub = (value: string): string => secrets.reduce(
+    (text, secret) => secret ? text.replaceAll(secret, '<redacted>') : text, value
+  );
 
   let current = url;
   let response: Response;
   for (let hop = 0; ; hop += 1) {
-    const headers = new Headers();
-    headers.set('Authorization', `token ${token}`);
+    const headers = new Headers(options.authHeaders);
+    if (options.authHeaders === undefined) headers.set('Authorization', `token ${token}`);
     if (body !== undefined) headers.set('Content-Type', 'application/json');
 
     const init: RequestInit = { method, headers, redirect: 'manual' };
@@ -161,7 +168,7 @@ export async function httpRequest(
     try {
       response = await fetchImpl(current, init);
     } catch (error) {
-      throw mapTransportError(error, method, current);
+      throw mapTransportError(new Error(scrub(error instanceof Error ? error.message : 'transport failure')), method, scrub(current));
     }
 
     const location = response.headers.get('location');
@@ -170,17 +177,22 @@ export async function httpRequest(
 
     // Read (and discard) the body so the connection can be reused.
     await response.text();
-    const target = new URL(location, current).toString();
+    let target: string;
+    try {
+      target = new URL(location, current).toString();
+    } catch {
+      throw coreError('NETWORK_ERROR', 'server returned an invalid redirect');
+    }
     if (!isSameOrigin(target, current)) {
       // SPEC.md §11: credentials are never carried to another origin, and a
       // browser-style redirect does not widen that permission.
       throw coreError(
         'NETWORK_ERROR',
-        `${method} ${redactCredentials(current)} redirected to a different origin; ` +
+        `${method} ${redactCredentials(scrub(current))} redirected to a different origin; ` +
           'credentials are not forwarded',
         {
           retryable: false,
-          details: { from: redactCredentials(current), to: new URL(target).origin }
+          details: { from: redactCredentials(scrub(current)), to: scrub(new URL(target).origin) }
         }
       );
     }
@@ -196,15 +208,15 @@ export async function httpRequest(
   try {
     text = await response.text();
   } catch (error) {
-    throw mapTransportError(error, method, current);
+    throw mapTransportError(new Error(scrub(error instanceof Error ? error.message : 'transport failure')), method, scrub(current));
   }
 
   const allowed = options.allowStatus ?? [];
   if (!response.ok && !allowed.includes(response.status)) {
-    throw mapHttpStatus(response.status, method, current, text, options.notFoundCode);
+    throw mapHttpStatus(response.status, method, scrub(current), scrub(text), options.notFoundCode);
   }
 
-  return { status: response.status, ok: response.ok, headers: response.headers, text };
+  return { status: response.status, ok: response.ok, headers: response.headers, text, redactDiagnostic: scrub };
 }
 
 /**
@@ -218,14 +230,13 @@ export async function httpRequest(
 export function parseJsonBody<T>(response: HttpResponse, route: string): T {
   try {
     return JSON.parse(response.text) as T;
-  } catch (error) {
+  } catch {
     throw coreError(
       'INTERNAL_ERROR',
       `${redactCredentials(route)} returned a non-JSON body (status ${response.status})`,
       {
         sideEffects: 'none',
-        details: { body: redactCredentials(response.text).slice(0, 200) },
-        cause: error
+        details: { body: redactCredentials(response.redactDiagnostic?.(response.text) ?? response.text).slice(0, 200) }
       }
     );
   }

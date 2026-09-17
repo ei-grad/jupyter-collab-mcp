@@ -98,6 +98,8 @@ export interface ServerProfile {
    */
   readonly browserBaseUrl?: string;
   readonly credentialRef: CredentialRef;
+  /** Omitted means Jupyter token authentication. Header values are raw. */
+  readonly auth?: { readonly type: 'token' } | { readonly type: 'header'; readonly name: string };
   /** Separate Hub control API, only for explicitly allowed lifecycle calls. */
   readonly hubApiBaseUrl?: string;
   readonly hubUser?: string;
@@ -133,6 +135,8 @@ export interface ResolvedServer {
   /** Normalised `ws://` / `wss://` base, no trailing slash. */
   readonly wsBaseUrl: string;
   readonly token: string;
+  /** External assertion header; token is empty in this mode. */
+  readonly authHeaders?: Readonly<Record<string, string>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +721,8 @@ export interface ExecutionJob {
  */
 export interface OutputSink {
   readonly cellId: string;
+  /** Immutable identity of the shared cell object this sink owns. */
+  readonly identityToken: string;
   /** Monotonic per cell. Bumped by {@link BeginExecutionGeneration}. */
   readonly generation: number;
   /**
@@ -730,9 +736,11 @@ export interface OutputSink {
   setOutputs(outputs: NbOutput[]): boolean;
   /** Append one output. Returns whether it was applied. */
   appendOutput(o: NbOutput): boolean;
+  /** Append one delta to an existing stream output without replacing its shared Y.Text. */
+  appendStream(index: number, text: string): boolean;
   /**
-   * Replace the output at `index` - used by `update_display_data` and by
-   * `stream` coalescing. Out-of-range indices are not applied.
+   * Replace the output at `index` - used by `update_display_data`.
+   * Out-of-range indices are not applied.
    */
   updateOutput(index: number, o: NbOutput): boolean;
   /** `clear_output`. Returns whether it was applied. */
@@ -775,4 +783,7 @@ export type OutputSinkFactory = (cellId: string) => OutputSink | null;
  * Returns `null` when the cell no longer exists, in which case the queue stops
  * before sending anything to the kernel.
  */
-export type BeginExecutionGeneration = (cellId: string) => OutputSink | null;
+export type BeginExecutionGeneration = (
+  cellId: string,
+  expectedIdentityToken: string
+) => OutputSink | null;

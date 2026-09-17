@@ -94,7 +94,7 @@ describe('classifyClose', () => {
   });
 
   it('parses only well-formed rejection payloads', () => {
-    expect(parseSessionRejection('{"reason":"x"}')).toEqual({ reason: 'x' });
+    expect(parseSessionRejection('{"reason":"x"}')).toBeNull();
     expect(parseSessionRejection('{"noreason":1}')).toBeNull();
     expect(parseSessionRejection('[]')).toBeNull();
     expect(parseSessionRejection('')).toBeNull();

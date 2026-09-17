@@ -22,6 +22,29 @@ describe('jupyter-output resources (SPEC §9)', () => {
     expect(harness.fake.calls.some((call) => call.method === 'listOutputResources')).toBe(true);
   });
 
+  it('continues resource pages without duplicates or omissions', async () => {
+    harness = await connect({ fake: { resourceCount: 205 } });
+    const uris: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const listed = await harness.client.listResources(
+        cursor === undefined ? undefined : { cursor }
+      );
+      uris.push(...listed.resources.map((resource) => resource.uri));
+      cursor = listed.nextCursor;
+    } while (cursor !== undefined);
+
+    expect(uris).toHaveLength(205);
+    expect(new Set(uris).size).toBe(205);
+    expect(uris[0]).toBe('jupyter-output:out_1');
+    expect(uris[204]).toBe('jupyter-output:out_205');
+    expect(
+      harness.fake.calls
+        .filter((call) => call.method === 'listOutputResources')
+        .map((call) => call.request)
+    ).toEqual([undefined, 'res_100', 'res_200']);
+  });
+
   it('reads one snapshot through resources/read', async () => {
     harness = await connect();
     const read = await harness.client.readResource({ uri: 'jupyter-output:out_1' });

@@ -39,30 +39,21 @@ be selected based on its `description`.
 
 ## Codex
 
-Codex has no separate skill directory analogous to `~/.claude/skills/`.
-Two approaches work:
+Install the skill in Codex's user skill directory:
 
-1. Add a permanent project instruction that references the file from
-   `AGENTS.md`:
+```sh
+mkdir -p ~/.codex/skills/jupyter-collab
+cp skill/SKILL.md ~/.codex/skills/jupyter-collab/SKILL.md
+```
 
-   ```md
-   ## Working with notebooks
-   Make all edits and run cells only through the `jupyter-collab-mcp` MCP server.
-   Rules: see `skill/SKILL.md` (read it before the first tool call).
-   ```
+Start a new Codex session after installation. Codex discovers the skill from
+its YAML `name` and `description` fields. A project may also bind notebook work
+to this skill explicitly in `AGENTS.md`:
 
-   Alternatively, embed the entire contents of `SKILL.md` in `AGENTS.md` if the
-   file must not depend on the installed package.
-
-2. For an on-demand prompt, place the file in `~/.codex/prompts/`:
-
-   ```sh
-   cp skill/SKILL.md ~/.codex/prompts/jupyter-collab.md
-   ```
-
-   The instructions can then be invoked as `/jupyter-collab`. The YAML
-   frontmatter simply remains part of the text in this mode and causes no
-   problems.
+```md
+## Working with notebooks
+Use the `jupyter-collab-mcp` skill for notebook reads, edits, and execution.
+```
 
 ## Updating
 

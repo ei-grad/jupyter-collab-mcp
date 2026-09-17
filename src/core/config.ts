@@ -23,8 +23,8 @@ export type { CredentialRef, ServerKind, ServerProfile };
 /**
  * Configurable budgets of one process.
  *
- * SPEC.md §9 calls these "design values, not measured limits": they are
- * defaults an operator may raise or lower, not measured capacities. Every one
+ * SPEC.md §9 calls these design values. They are defaults an operator may
+ * raise or lower and make no capacity claim. Every one
  * of them is checked **before** the effect of a call, so exhausting a budget
  * gives `RESOURCE_LIMIT` (or `DOCUMENT_TOO_LARGE`) without consuming a
  * `request_id` and without touching the document, the file or the kernel.

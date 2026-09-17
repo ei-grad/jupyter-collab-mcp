@@ -90,6 +90,33 @@ describe('ChangeJournal ring and cursors (SPEC.md §9, §10)', () => {
     expect(published[0]!.revisions.outputsRevision).toBe('o1_3');
   });
 
+  it('materialises only the newest pending output revisions', () => {
+    let now = 1_000;
+    let materialised = 0;
+    const journal = new ChangeJournal({ limit: 100, coalesceMs: 100, now: () => now });
+    cleanups.push(() => journal.dispose());
+    journal.recordOutputs('a', () => {
+      materialised += 1;
+      return { outputsRevision: 'o1_1' as never };
+    }, 'local');
+    expect(materialised).toBe(1);
+
+    now = 1_010;
+    journal.recordOutputs('a', () => {
+      materialised += 1;
+      return { outputsRevision: 'o1_2' as never };
+    }, 'local');
+    journal.recordOutputs('a', () => {
+      materialised += 1;
+      return { outputsRevision: 'o1_3' as never };
+    }, 'local');
+    expect(materialised).toBe(1);
+
+    journal.flush();
+    expect(materialised).toBe(2);
+    expect(journal.since('chg_1').events[0]!.revisions.outputsRevision).toBe('o1_3');
+  });
+
   it('coalesces per cell, not globally', () => {
     let now = 0;
     const journal = new ChangeJournal({ limit: 100, coalesceMs: 100, now: () => now });

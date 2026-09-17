@@ -10,6 +10,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { Client } from '@modelcontextprotocol/client';
 
+import type { CollabService } from '../../src/core/index.js';
 import { createMcpServer } from '../../src/mcp/index.js';
 import type { McpServerOptions } from '../../src/mcp/index.js';
 import { FakeCollabService } from './fake-service.js';
@@ -30,10 +31,15 @@ export interface Harness {
   close(): Promise<void>;
 }
 
-export async function connect(options: { fake?: FakeOptions; server?: McpServerOptions } = {}): Promise<Harness> {
+export async function connect(
+  options: { fake?: FakeOptions; server?: McpServerOptions; service?: CollabService } = {}
+): Promise<Harness> {
   const fake = new FakeCollabService(options.fake ?? {});
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const handle = serveStdio(() => createMcpServer(fake, options.server ?? {}), { transport: serverTransport });
+  const handle = serveStdio(
+    () => createMcpServer(options.service ?? fake, options.server ?? {}),
+    { transport: serverTransport }
+  );
   const client = new Client(
     { name: 'jupyter-collab-mcp-tests', version: '0.0.0' },
     { versionNegotiation: { mode: { pin: '2026-07-28' } } }

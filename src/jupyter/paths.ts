@@ -103,6 +103,36 @@ export function normalizeBaseUrl(url: string): string {
   return url.replace(/\/+$/, '');
 }
 
+export type BaseUrlRole = 'http' | 'websocket';
+
+/**
+ * Validate an operator- or discovery-supplied base URL without reflecting it
+ * in an error. Base URLs are routing data, never a second credential channel.
+ */
+export function validateBaseUrl(
+  input: string,
+  role: BaseUrlRole,
+  label = role === 'http' ? 'HTTP base URL' : 'WebSocket base URL'
+): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    throw coreError('INVALID_ARGUMENT', `${label} must be an absolute URL`);
+  }
+  const allowed = role === 'http' ? ['http:', 'https:'] : ['ws:', 'wss:'];
+  if (!allowed.includes(parsed.protocol) || parsed.hostname === '') {
+    throw coreError('INVALID_ARGUMENT', `${label} uses an unsupported protocol or host`);
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw coreError('INVALID_ARGUMENT', `${label} must not contain user information`);
+  }
+  if (parsed.search !== '' || parsed.hash !== '') {
+    throw coreError('INVALID_ARGUMENT', `${label} must not contain a query or fragment`);
+  }
+  return normalizeBaseUrl(parsed.toString());
+}
+
 /**
  * WebSocket base for an API base: same origin, same prefix, `http`→`ws`.
  *
@@ -110,10 +140,9 @@ export function normalizeBaseUrl(url: string): string {
  * (docs/CONNECTIONS.md §9).
  */
 export function deriveWsBaseUrl(apiBaseUrl: string): string {
-  const base = normalizeBaseUrl(apiBaseUrl);
-  if (base.startsWith('https:')) return `wss:${base.slice('https:'.length)}`;
-  if (base.startsWith('http:')) return `ws:${base.slice('http:'.length)}`;
-  return base;
+  const parsed = new URL(validateBaseUrl(apiBaseUrl, 'http', 'API base URL'));
+  parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+  return normalizeBaseUrl(parsed.toString());
 }
 
 /** Join a normalised base with a route that starts with `/`. */

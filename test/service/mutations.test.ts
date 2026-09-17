@@ -34,7 +34,10 @@ interface Rig {
 
 const rigs: Rig[] = [];
 
-function rigFor(files: readonly string[] = ['a.ipynb']): Rig {
+function rigFor(
+  files: readonly string[] = ['a.ipynb'],
+  limits?: Record<string, number>
+): Rig {
   const server = makeFakeServer({
     files: files.map((path) => ({ path, type: 'notebook' as const }))
   });
@@ -43,7 +46,7 @@ function rigFor(files: readonly string[] = ['a.ipynb']): Rig {
     server,
     opens,
     service: createCollabService(
-      { servers: [PROFILE] },
+      { servers: [PROFILE], ...(limits === undefined ? {} : { limits }) },
       {
         fetchImpl: server.fetchImpl,
         guardStdout: false,
@@ -168,6 +171,18 @@ describe('notebook_create', () => {
     expect(second.nextRequestId).toBe('2');
   });
 
+  it('replays create after the first result fills the replica budget', async () => {
+    const rig = rigFor([], { maxOpenNotebooks: 1 });
+    const session = await rig.service.sessionOpen({});
+    const args = { sessionId: session.sessionId, requestId: '1', directory: '' } as const;
+    const first = await rig.service.notebookCreate(args);
+    const replay = await rig.service.notebookCreate(args);
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.notebook.notebookId).toBe(first.notebook.notebookId);
+    expect(rig.server.untitledCounter).toBe(1);
+  });
+
   it('the same number with a different payload conflicts', async () => {
     const rig = rigFor([]);
     const session = await rig.service.sessionOpen({});
@@ -238,6 +253,40 @@ describe('notebook_apply', () => {
       view: 'summary'
     });
     expect(summary.summary.cellCount).toBe(2);
+  });
+
+  it('replays a delete after the first call removed its revision-bearing target', async () => {
+    const rig = rigFor();
+    const session = await rig.service.sessionOpen({});
+    const opened = await rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
+    const cells = await rig.service.notebookRead({
+      notebookId: opened.notebook.notebookId,
+      view: 'cells'
+    });
+    const target = cells.cells[0]!;
+    const args = {
+      notebookId: opened.notebook.notebookId,
+      requestId: '1',
+      operations: [
+        {
+          op: 'delete_cell' as const,
+          cellId: target.cellId,
+          expectedCellRevision: target.cellRevision
+        }
+      ]
+    };
+
+    const first = await rig.service.notebookApply(args);
+    const replay = await rig.service.notebookApply(args);
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.firstAcceptedAt).toBe(first.firstAcceptedAt);
+    expect(replay.results).toEqual(first.results);
+    const summary = await rig.service.notebookRead({
+      notebookId: opened.notebook.notebookId,
+      view: 'summary'
+    });
+    expect(summary.summary.cellCount).toBe(0);
   });
 
   it('a stale revision is REVISION_CONFLICT before the number is consumed', async () => {

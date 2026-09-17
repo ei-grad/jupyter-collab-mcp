@@ -1,13 +1,3 @@
-/**
- * Adversarial review of `src/jupyter/rtc-connection.ts` (module: transport).
- *
- * Written by the reviewer, not the implementer. Every `it()` names the SPEC.md
- * rule it attacks; the ones that fail are review findings, the ones that pass
- * are confirmations that a claimed property really holds.
- *
- * These tests only ADD coverage: nothing in `src/` or in `test/jupyter/` is
- * modified.
- */
 import { afterEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 
@@ -82,13 +72,7 @@ function waitForState(
   });
 }
 
-/** Number of listeners a lib0 `ObservableV2` holds for one event name. */
-function observerCount(target: unknown, event: string): number {
-  const observers = (target as { _observers?: Map<string, Set<unknown>> })._observers;
-  return observers?.get(event)?.size ?? 0;
-}
-
-describe('FINDING: synced is still true when the state event says the room is not ready', () => {
+describe('SPEC.md §6: state notifications report current synchronization', () => {
   it('SPEC.md §6: "Reconnecting ... does not leave the previous synced flag true"', async () => {
     const server = await startServer();
     const { connection } = makeConnection(server);
@@ -130,9 +114,6 @@ describe('SPEC.md §12 "RAW and eviction" / "Network and restart": repeated reco
       expect(connection.rawHandlerInstalls, `round ${round}`).toBe(1);
       expect(connection.provider.messageHandlers[MESSAGE_RAW], `round ${round}`).toBe(handler);
       expect(connection.socketGeneration, `round ${round}`).toBe(round + 1);
-      // SPEC.md §6: reconnecting "does not create duplicate observers".
-      expect(observerCount(ydoc, 'update'), `round ${round}`).toBe(1);
-      expect(observerCount(connection.provider.awareness, 'update'), `round ${round}`).toBe(1);
       expect(ydoc.clientID, `round ${round}`).toBe(clientId);
       await expect(connection.save(2_000), `round ${round}`).resolves.toBe('success');
     }
@@ -177,11 +158,6 @@ describe('SPEC.md §6: a terminal signal must stop this replica from talking to 
     expect(server.room(ROOM)?.getMap('cells').get('after-conflict')).toBeUndefined();
     expect(server.seenRooms).toHaveLength(1);
 
-    // Resolved after the review: SPEC.md §6 both enumerates `conflict` among
-    // the connection states and describes the signal as "A conflict event,
-    // then failed", so the connection now passes through that state instead of
-    // leaving the enum member unreachable. It is transient - the terminal state
-    // is still `failed` with RTC_CONFLICT.
     expect(states).toEqual(['conflict', 'failed']);
     expect(connection.state).toBe('failed');
     expect(connection.terminalError?.code).toBe('RTC_CONFLICT');
@@ -228,15 +204,13 @@ describe('SPEC.md §6: a terminal signal must stop this replica from talking to 
 });
 
 describe('SPEC.md §12 "Cleanup and credentials": dispose releases everything', () => {
-  it('drops the doc/awareness observers and rejects an in-flight save', async () => {
+  it('stops document delivery and rejects an in-flight save', async () => {
     const server = await startServer();
     const ydoc = new Y.Doc();
     const { connection } = makeConnection(server, { ydoc });
     await connection.connect(5_000);
     server.setReplyToSave(false);
 
-    expect(observerCount(ydoc, 'update')).toBe(1);
-    const awareness = connection.provider.awareness;
     const pending = connection.save(5_000);
 
     connection.dispose();
@@ -244,8 +218,10 @@ describe('SPEC.md §12 "Cleanup and credentials": dispose releases everything', 
     await expect(pending).rejects.toSatisfy(
       (error: unknown) => isCoreError(error) && error.code === 'HANDLE_EXPIRED'
     );
-    expect(observerCount(ydoc, 'update')).toBe(0);
-    expect(observerCount(awareness, 'update')).toBe(0);
+    expect(connection.provider.ws).toBeNull();
+    ydoc.getMap('cells').set('after-dispose', 'must-not-arrive');
+    await sleep(400);
+    expect(server.room(ROOM)?.getMap('cells').get('after-dispose')).toBeUndefined();
     expect(connection.state).toBe('closed');
     // Diagnostics survive close (SPEC.md §4), credentials do not (SPEC.md §11).
     expect(connection.url).not.toContain(TOKEN);
@@ -253,7 +229,7 @@ describe('SPEC.md §12 "Cleanup and credentials": dispose releases everything', 
     ydoc.destroy();
   }, 20_000);
 
-  it('FINDING: the public provider handle still carries the raw token', async () => {
+  it('the public provider handle does not expose the raw token', async () => {
     const server = await startServer();
     const { connection } = makeConnection(server);
     await connection.connect(5_000);

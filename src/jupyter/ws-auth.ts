@@ -37,7 +37,7 @@ type NodeWebSocketCtor = new (
 
 /**
  * Wrap a WebSocket implementation so every socket it creates sends
- * `Authorization: token <token>`.
+ * `Authorization: token <token>`, or the supplied external assertion headers.
  *
  * @param token Jupyter token; never stored on the returned class.
  * @param base Implementation to wrap. Defaults to the `ws` package; a browser
@@ -46,9 +46,10 @@ type NodeWebSocketCtor = new (
  */
 export function authenticatedWebSocket(
   token: string,
-  base: WebSocketCtor = WebSocketImpl as unknown as WebSocketCtor
+  base: WebSocketCtor = WebSocketImpl as unknown as WebSocketCtor,
+  authHeaders?: Readonly<Record<string, string>>
 ): WebSocketCtor {
-  const options = { headers: { Authorization: `token ${token}` } };
+  const options = { headers: authHeaders ?? { Authorization: `token ${token}` }, followRedirects: false };
   const Base = base as unknown as NodeWebSocketCtor;
 
   class AuthenticatedWebSocket extends Base {

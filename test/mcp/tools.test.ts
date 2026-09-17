@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { coreError } from '../../src/core/index.js';
-import { TOOL_SPECS, jsonByteSize } from '../../src/mcp/index.js';
+import { coreError, type ServerProfile } from '../../src/core/index.js';
+import { ChangeJournal } from '../../src/core/notebook/index.js';
+import { DEDUPLICATED_TOOLS, TOOL_SPECS, jsonByteSize } from '../../src/mcp/index.js';
+import { createCollabService } from '../../src/service/index.js';
+import { FakeCollabService, TINY_PNG } from './fake-service.js';
 import { connect, metaError } from './harness.js';
 import type { Harness, ToolAnswer } from './harness.js';
 
@@ -64,14 +67,14 @@ describe('tools/list', () => {
     }
   });
 
-  it('documents the sequential request_id rule on exactly the four mutations', async () => {
+  it('marks exactly the deduplicated mutations as idempotent', async () => {
     harness = await connect();
     const listed = await harness.client.listTools();
     const deduplicated = listed.tools
-      .filter((tool) => /Deduplicated and sequential/u.test(tool.description ?? ''))
+      .filter((tool) => tool.annotations?.idempotentHint === true)
       .map((tool) => tool.name)
       .sort();
-    expect(deduplicated).toEqual(['kernel_control', 'notebook_apply', 'notebook_create', 'notebook_execute']);
+    expect(deduplicated).toEqual([...DEDUPLICATED_TOOLS].sort());
     for (const name of deduplicated) {
       const schema = listed.tools.find((tool) => tool.name === name)?.inputSchema as
         | { properties?: Record<string, unknown>; oneOf?: { properties?: Record<string, unknown> }[] }
@@ -81,12 +84,15 @@ describe('tools/list', () => {
     }
   });
 
-  it('says that a Python error is a job result on the execution tools', async () => {
-    harness = await connect();
-    const listed = await harness.client.listTools();
+  it('returns a failed kernel execution as a successful tool result', async () => {
+    harness = await connect({ fake: { executionFailed: true } });
     for (const name of ['notebook_execute', 'execution_get']) {
-      const description = listed.tools.find((tool) => tool.name === name)?.description ?? '';
-      expect(description, name).toMatch(/Python error/u);
+      const answer = await harness.call(name, VALID_ARGS[name]);
+      expect(answer.isError ?? false, name).toBe(false);
+      expect(answer.structuredContent?.['state'], name).toBe('failed');
+      expect(answer.structuredContent?.['reason'], name).toBe('ValueError: boom');
+      const cells = answer.structuredContent?.['cells'] as Array<Record<string, unknown>>;
+      expect(cells[0]?.['state'], name).toBe('failed');
     }
   });
 });
@@ -230,9 +236,60 @@ describe('error mapping', () => {
     expect(String(error['message'])).toContain('token=<redacted>');
     expect(JSON.stringify(error['details'])).toContain('token=<redacted>');
   });
+
+  it('rejects credential-bearing configured URLs before server_list serialization', async () => {
+    const profile: ServerProfile = {
+      id: 'unsafe',
+      kind: 'standalone',
+      apiBaseUrl: 'https://host.invalid/user/alice?token=url-secret',
+      browserBaseUrl: 'https://url-secret@host.invalid/user/alice',
+      credentialRef: 'literal:transport-secret'
+    };
+    harness = await connect({
+      service: createCollabService({ servers: [profile] }, { guardStdout: false })
+    });
+    const answer = await harness.call('server_list');
+    expect(answer.isError).toBe(true);
+    expect(metaError(answer)).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    expect(JSON.stringify(answer)).not.toContain('url-secret');
+    expect(JSON.stringify(answer)).not.toContain('transport-secret');
+  });
 });
 
 describe('response size and output content', () => {
+  it('extracts only protocol outputs and leaves opaque notebook data byte-identical', async () => {
+    harness = await connect({ fake: { outputShapedOpaqueData: true } });
+    const cellsAnswer = await harness.call('notebook_read', {
+      notebook_id: 'nb_1',
+      view: 'cells',
+      cell_ids: ['cell_a']
+    });
+    const cells = cellsAnswer.structuredContent?.['cells'] as Record<string, unknown>[];
+    const outputShapedValue = {
+      output_type: 'display_data',
+      index: 91,
+      output: { output_type: 'display_data', data: { 'image/png': TINY_PNG }, metadata: {} }
+    };
+    const expectedMetadata = {
+      'user/Weird Key': outputShapedValue,
+      value: ['kept', { exactlyAsGiven: true }]
+    };
+    const expectedAttachments = {
+      'opaque.png': { 'image/png': TINY_PNG },
+      nested: outputShapedValue
+    };
+    expect(JSON.stringify(cells[0]?.['metadata'])).toBe(JSON.stringify(expectedMetadata));
+    expect(JSON.stringify(cells[0]?.['attachments'])).toBe(JSON.stringify(expectedAttachments));
+    expect(cellsAnswer.content.some((block) => block.type === 'image')).toBe(false);
+
+    const outputsAnswer = await harness.call('notebook_read', {
+      notebook_id: 'nb_1',
+      view: 'outputs'
+    });
+    const image = outputsAnswer.content.find((block) => block.type === 'image');
+    expect(image).toMatchObject({ type: 'image', mimeType: 'image/png', data: TINY_PNG });
+  });
+
   it('returns a small PNG as MCP image content and drops it from structuredContent', async () => {
     harness = await connect();
     const answer = await harness.call('notebook_read', { notebook_id: 'nb_1', view: 'outputs' });
@@ -265,9 +322,91 @@ describe('response size and output content', () => {
     expect(jsonByteSize(answer.structuredContent)).toBeLessThanOrEqual(64 * 1024);
     expect(answer.structuredContent?.['response_truncated']).toBe(true);
     expect(String(answer.structuredContent?.['read_more'])).toMatch(/limits|cursor/u);
-    const summary = answer.structuredContent?.['summary'] as { cells: unknown[]; cell_count: number };
+    const summary = answer.structuredContent?.['summary'] as {
+      cells: unknown[];
+      cell_count: number;
+      page_cursor: string;
+    };
     expect(summary.cell_count).toBe(400);
     expect(summary.cells.length).toBeLessThan(400);
+    const cursor = String(summary['page_cursor']);
+    expect(Number(cursor.slice(cursor.lastIndexOf('.') + 1))).toBe(summary.cells.length);
+    expect(answer.structuredContent?.['next_cursor']).toBe(cursor);
+  });
+
+  it('pages every real journal event exactly once through the SDK', async () => {
+    const journal = new ChangeJournal({ limit: 200 });
+    for (let sequence = 1; sequence <= 100; sequence += 1) {
+      journal.publish({
+        kind: 'source_changed',
+        cellId: `cell_${String(sequence)}`,
+        revisions: {},
+        origin: 'remote'
+      });
+    }
+    const service = new FakeCollabService();
+    service.notebookChanges = async (request) => {
+      const page = journal.since(request.cursor, request.limit);
+      return {
+        notebookId: request.notebookId,
+        events: page.events,
+        nextCursor: page.nextCursor,
+        truncated: page.nextCursor !== journal.cursor,
+        connectionState: 'ready',
+        stale: false,
+        waitTimedOut: false,
+        nextRequestId: '1'
+      };
+    };
+    harness = await connect({ service, server: { responseMaxBytes: 1800 } });
+
+    const sequences: number[] = [];
+    let cursor = 'chg_0';
+    while (cursor !== journal.cursor) {
+      const answer = await harness.call('notebook_changes', {
+        notebook_id: 'nb_1',
+        cursor,
+        limit: 100
+      });
+      expect(answer.isError ?? false).toBe(false);
+      expect(jsonByteSize(answer.structuredContent)).toBeLessThanOrEqual(1800);
+      const events = answer.structuredContent?.['events'] as { sequence: number }[];
+      sequences.push(...events.map((event) => event.sequence));
+      cursor = String(answer.structuredContent?.['next_cursor']);
+    }
+    expect(sequences).toEqual(Array.from({ length: 100 }, (_unused, index) => index + 1));
+    journal.dispose();
+  });
+
+  it('returns a bounded RESOURCE_LIMIT instead of an oversized metadata success', async () => {
+    harness = await connect({ fake: { oversizedMetadata: true } });
+    const answer = await harness.call('notebook_read', {
+      notebook_id: 'nb_1',
+      view: 'cells',
+      cell_ids: ['cell_a']
+    });
+    expect(answer.isError).toBe(true);
+    expect(answer.structuredContent).toBeUndefined();
+    expect(metaError(answer)).toMatchObject({ code: 'RESOURCE_LIMIT' });
+  });
+
+  it('does not report no effects when a completed close result exceeds the budget', async () => {
+    const service = new FakeCollabService();
+    service.sessionClose = async (request) => ({
+      sessionId: request.sessionId,
+      closedNotebookIds: Array.from({ length: 100 }, (_unused, index) => `nb_${String(index)}`),
+      droppedExecutionIds: [],
+      alreadyClosed: false,
+      kernelsLeftRunning: true,
+      nextRequestId: null
+    });
+    harness = await connect({ service, server: { responseMaxBytes: 500 } });
+    const answer = await harness.call('session_close', { session_id: 'ses_1' });
+    expect(answer.isError).toBe(true);
+    expect(metaError(answer)).toMatchObject({
+      code: 'RESOURCE_LIMIT',
+      side_effects: 'unknown'
+    });
   });
 
   it('honours a smaller configured budget', async () => {

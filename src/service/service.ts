@@ -100,8 +100,12 @@ import { metadataRevisionOf, resolveCell } from '../core/notebook/read.js';
 import { withIdentity } from '../core/notebook/types.js';
 import { normalizeContentsPath, validateNotebookName } from '../jupyter/paths.js';
 import { installStdoutGuard, isStdoutGuardInstalled } from '../jupyter/stdout-guard.js';
-import type { JupyterSessionInfo, ServerClient } from '../jupyter/server-client.js';
-import type { Revalidate, RevalidateResult } from '../kernel/index.js';
+import type {
+  JupyterSessionInfo,
+  KernelSpecEntry,
+  ServerClient
+} from '../jupyter/server-client.js';
+import type { ExecutionCellRequest, Revalidate, RevalidateResult } from '../kernel/index.js';
 import {
   buildExecutionView,
   effectiveLimits,
@@ -127,7 +131,7 @@ import { SessionRegistry, type WorkingSession } from './session.js';
  * Snapshot memory of one working session.
  *
  * SPEC.md §9 requires a separate budget for output buffers but does not
- * quantify it; 32 MiB is a project value, not a measured limit.
+ * quantify it; 32 MiB is a project default with no measured-capacity claim.
  */
 export const DEFAULT_OUTPUT_STORE_BYTES = 32 * 1024 * 1024;
 
@@ -246,6 +250,7 @@ class CollabServiceImpl implements CollabService {
     // into `AUTH_REQUIRED` / `NETWORK_ERROR` now, rather than into a confusing
     // failure of the first document call.
     await this.#servers.clientFor(server).status();
+    this.#assertRunning();
     const session = this.#sessions.open(server, request.label);
     return {
       sessionId: session.id,
@@ -356,10 +361,14 @@ class CollabServiceImpl implements CollabService {
     const session = this.#sessions.require(request.sessionId);
     return session.lock.run(async () => {
       const { directory, name } = this.#validateCreate(session, request);
-      const decision = this.#begin(session, 'notebook_create', null, request.requestId, {
+      const payload = {
         directory,
         name: name ?? null
-      });
+      };
+      const replay = this.#preflight(session, 'notebook_create', null, request.requestId, payload);
+      if (replay !== null) return this.#replayValue<NotebookCreateResult>(session, replay);
+      this.#assertReplicaBudget();
+      const decision = this.#begin(session, 'notebook_create', null, request.requestId, payload);
       if (decision.kind === 'replay') {
         return this.#replayValue<NotebookCreateResult>(session, decision.receipt);
       }
@@ -383,6 +392,7 @@ class CollabServiceImpl implements CollabService {
           }
         }
         const { handle } = await this.#openHandle(session, path);
+        handle.model.removePristineServerPlaceholder();
         const snapshot = handle.model.snapshotWithCursor({
           maxCells: this.#config.limits.summaryMaxCells
         });
@@ -578,6 +588,15 @@ class CollabServiceImpl implements CollabService {
     this.#assertRunning();
     const { session, handle } = this.#locate(request.notebookId);
     return session.lock.run(async () => {
+      const payload = { operations: request.operations };
+      const replay = this.#preflight(
+        session,
+        'notebook_apply',
+        handle.notebookId,
+        request.requestId,
+        payload
+      );
+      if (replay !== null) return this.#replayValue<NotebookApplyResult>(session, replay);
       try {
         handle.assertWritable();
         if (request.operations.length === 0) {
@@ -592,9 +611,13 @@ class CollabServiceImpl implements CollabService {
         throw withEnvelopeDetails(error, session.envelope({ requestAccepted: false }));
       }
 
-      const decision = this.#begin(session, 'notebook_apply', handle.notebookId, request.requestId, {
-        operations: request.operations
-      });
+      const decision = this.#begin(
+        session,
+        'notebook_apply',
+        handle.notebookId,
+        request.requestId,
+        payload
+      );
       if (decision.kind === 'replay') {
         return this.#replayValue<NotebookApplyResult>(session, decision.receipt);
       }
@@ -630,7 +653,22 @@ class CollabServiceImpl implements CollabService {
     this.#assertRunning();
     const { session, handle } = this.#locate(request.notebookId);
     return session.lock.run(async () => {
+      const payload = {
+        cells: request.cells,
+        stopOnError: request.stopOnError ?? true
+      };
+      const replay = this.#preflight(
+        session,
+        'notebook_execute',
+        handle.notebookId,
+        request.requestId,
+        payload
+      );
+      if (replay !== null) {
+        return this.#replayExecution(session, replay, request);
+      }
       let binding;
+      const acceptedCells: ExecutionCellRequest[] = [];
       try {
         handle.assertWritable();
         if (request.cells.length === 0) {
@@ -657,6 +695,11 @@ class CollabServiceImpl implements CollabService {
               }
             });
           }
+          acceptedCells.push({
+            cellId: target.cellId,
+            sourceRevision: target.expectedSourceRevision,
+            identityToken: entry.identityToken
+          });
         }
         const active = session.activeExecutions(handle.notebookId);
         if (active.length > 0) {
@@ -676,54 +719,18 @@ class CollabServiceImpl implements CollabService {
         'notebook_execute',
         handle.notebookId,
         request.requestId,
-        {
-          cells: request.cells,
-          stopOnError: request.stopOnError ?? true
-        }
+        payload
       );
       if (decision.kind === 'replay') {
-        const receipt = decision.receipt;
-        if (receipt.failure !== null) {
-          throw withEnvelopeDetails(
-            receipt.failure,
-            session.envelope({
-              requestAccepted: true,
-              replayed: true,
-              firstAcceptedAt: receipt.firstAcceptedAt
-            })
-          );
-        }
-        if (receipt.replay?.kind === 'execution') {
-          const record = session.executions.get(receipt.replay.executionId);
-          if (record !== undefined) {
-            const view = await this.#executionView(session, record, {
-              waitMs: 0,
-              ...(request.limits === undefined ? {} : { limits: request.limits })
-            });
-            return {
-              ...view,
-              ...session.envelope({
-                requestAccepted: true,
-                replayed: true,
-                firstAcceptedAt: receipt.firstAcceptedAt
-              })
-            };
-          }
-        }
-        throw withEnvelopeDetails(
-          coreError('REQUEST_ID_EXPIRED', 'the job of this request_id is no longer retained'),
-          session.envelope({ requestAccepted: null })
-        );
+        return this.#replayExecution(session, decision.receipt, request);
       }
 
       return this.#runAccepted(session, decision.receipt, async () => {
         const executionId = binding.registry.submit({
           notebookRef: { notebookId: handle.notebookId, sessionId: session.id },
-          cells: request.cells.map((target) => ({
-            cellId: target.cellId,
-            sourceRevision: target.expectedSourceRevision
-          })),
-          getSink: (cellId: string) => handle.model.beginExecutionGeneration(cellId),
+          cells: acceptedCells,
+          getSink: (cellId: string, identityToken: string) =>
+            handle.model.beginExecutionGeneration(cellId, identityToken),
           revalidate: this.#revalidate(handle),
           stopOnError: request.stopOnError ?? true,
           maxOutputBytes: this.#config.limits.executionOutputMaxBytes
@@ -961,7 +968,21 @@ class CollabServiceImpl implements CollabService {
     this.#assertRunning();
     const { session, handle } = this.#locate(request.notebookId);
     return session.lock.run(async () => {
+      const payload = {
+        action: request.action,
+        expectedKernelId: request.expectedKernelId ?? null,
+        kernelName: 'kernelName' in request ? (request.kernelName ?? null) : null
+      };
+      const replay = this.#preflight(
+        session,
+        'kernel_control',
+        handle.notebookId,
+        request.requestId,
+        payload
+      );
+      if (replay !== null) return this.#replayValue<KernelControlResult>(session, replay);
       let bound: JupyterSessionInfo | null;
+      let selectedSpec: KernelSpecEntry | null = null;
       try {
         // The binding check runs before the receipt: `KERNEL_CHANGED` and
         // `KERNEL_SELECTION_REQUIRED` never consume a number (SPEC.md §9).
@@ -982,20 +1003,41 @@ class CollabServiceImpl implements CollabService {
             }
           });
         }
+        if (request.action === 'start' || request.action === 'switch') {
+          const available = await this.#servers.clientFor(session.server).kernelSpecs();
+          const selectedName =
+            request.action === 'switch'
+              ? request.kernelName
+              : (bound?.kernelName ?? request.kernelName ?? available.defaultName);
+          selectedSpec = available.specs.find((spec) => spec.name === selectedName) ?? null;
+          if (selectedSpec === null) {
+            throw coreError('INVALID_ARGUMENT', 'the selected kernelspec is not available', {
+              details: { kernel_name: selectedName }
+            });
+          }
+        }
       } catch (error) {
         throw withEnvelopeDetails(error, session.envelope({ requestAccepted: false }));
       }
 
-      const decision = this.#begin(session, 'kernel_control', handle.notebookId, request.requestId, {
-        action: request.action,
-        expectedKernelId: request.expectedKernelId ?? null,
-        kernelName: 'kernelName' in request ? (request.kernelName ?? null) : null
-      });
+      const decision = this.#begin(
+        session,
+        'kernel_control',
+        handle.notebookId,
+        request.requestId,
+        payload
+      );
       if (decision.kind === 'replay') {
         return this.#replayValue<KernelControlResult>(session, decision.receipt);
       }
       return this.#runAccepted(session, decision.receipt, async () => {
-        const result = await this.#applyKernelAction(session, handle, request, bound);
+        const result = await this.#applyKernelAction(
+          session,
+          handle,
+          request,
+          bound,
+          selectedSpec
+        );
         return { result, replay: { kind: 'value', value: result } };
       });
     });
@@ -1156,6 +1198,22 @@ class CollabServiceImpl implements CollabService {
 
   // -- the request ledger ----------------------------------------------------
 
+  #preflight(
+    session: WorkingSession,
+    tool: DedupTool,
+    target: string | null,
+    requestId: string,
+    payload: unknown
+  ): Receipt | null {
+    try {
+      const decision = session.ledger.preflight({ requestId, tool, target, payload });
+      return decision?.receipt ?? null;
+    } catch (error) {
+      const accepted = isCoreError(error) && error.code === 'REQUEST_ID_EXPIRED' ? null : false;
+      throw withEnvelopeDetails(error, session.envelope({ requestAccepted: accepted }));
+    }
+  }
+
   #begin(
     session: WorkingSession,
     tool: DedupTool,
@@ -1186,6 +1244,44 @@ class CollabServiceImpl implements CollabService {
       );
     }
     return { ...(receipt.replay.value as T), ...envelope };
+  }
+
+  async #replayExecution(
+    session: WorkingSession,
+    receipt: Receipt,
+    request: NotebookExecuteRequest
+  ): Promise<WithEnvelope<ExecutionView>> {
+    if (receipt.failure !== null) {
+      throw withEnvelopeDetails(
+        receipt.failure,
+        session.envelope({
+          requestAccepted: true,
+          replayed: true,
+          firstAcceptedAt: receipt.firstAcceptedAt
+        })
+      );
+    }
+    if (receipt.replay?.kind === 'execution') {
+      const record = session.executions.get(receipt.replay.executionId);
+      if (record !== undefined) {
+        const view = await this.#executionView(session, record, {
+          waitMs: 0,
+          ...(request.limits === undefined ? {} : { limits: request.limits })
+        });
+        return {
+          ...view,
+          ...session.envelope({
+            requestAccepted: true,
+            replayed: true,
+            firstAcceptedAt: receipt.firstAcceptedAt
+          })
+        };
+      }
+    }
+    throw withEnvelopeDetails(
+      coreError('REQUEST_ID_EXPIRED', 'the job of this request_id is no longer retained'),
+      session.envelope({ requestAccepted: null })
+    );
   }
 
   /** Run the effect of an accepted request and record its outcome. */
@@ -1232,7 +1328,6 @@ class CollabServiceImpl implements CollabService {
     try {
       const directory = normalizeContentsPath(request.directory);
       const name = request.name === undefined ? undefined : validateNotebookName(request.name);
-      this.#assertReplicaBudget();
       return { directory, name };
     } catch (error) {
       throw withEnvelopeDetails(error, session.envelope({ requestAccepted: false }));
@@ -1255,6 +1350,7 @@ class CollabServiceImpl implements CollabService {
     session: WorkingSession,
     path: string
   ): Promise<{ handle: NotebookHandle; reused: boolean }> {
+    this.#assertSessionOpen(session);
     this.#assertReplicaBudget();
     const server = session.server;
     const client = this.#servers.clientFor(server);
@@ -1262,6 +1358,7 @@ class CollabServiceImpl implements CollabService {
     // path; the room then closes with 4404 (spike/NOTES.md §1.2), so existence
     // is checked separately and answered as `NOTEBOOK_NOT_FOUND`.
     const stat = await client.contentsExists(path);
+    this.#assertSessionOpen(session);
     if (stat === null) {
       throw coreError('NOTEBOOK_NOT_FOUND', `no notebook at "${path}"`, { details: { path } });
     }
@@ -1271,6 +1368,7 @@ class CollabServiceImpl implements CollabService {
       });
     }
     const document = await this.#servers.collaborationSession(server, path);
+    this.#assertSessionOpen(session);
     const alreadyOpen = session.findByFileId(document.fileId);
     if (alreadyOpen !== null) return { handle: alreadyOpen, reused: true };
 
@@ -1281,13 +1379,17 @@ class CollabServiceImpl implements CollabService {
       fileId: document.fileId,
       collaborationSessionId: document.sessionId,
       wsBaseUrl: client.wsBaseUrl,
-      token: this.#servers.tokenFor(server),
+      ...client.connectionAuth(),
       awarenessUser: this.#config.awarenessUser,
       journalLimit: this.#config.limits.journalMaxEvents,
       revalidateFileId: async () =>
         (await this.#servers.collaborationSession(server, path)).fileId,
       openTimeoutMs: this.#openTimeoutMs
     });
+    if (session.closed) {
+      handle.dispose();
+      this.#assertSessionOpen(session);
+    }
     session.notebooks.set(handle.notebookId, handle);
     this.#notebookOwner.set(handle.notebookId, session);
     return { handle, reused: false };
@@ -1340,6 +1442,7 @@ class CollabServiceImpl implements CollabService {
 
   #teardownSession(session: WorkingSession): void {
     session.closed = true;
+    session.opening.clear();
     for (const handle of [...session.notebooks.values()]) this.#closeNotebook(session, handle);
     for (const executionId of session.executions.keys()) {
       this.#executionOwner.delete(executionId);
@@ -1348,6 +1451,14 @@ class CollabServiceImpl implements CollabService {
     session.outputs.clear();
     session.ledger.clear();
     this.#sessions.forget(session.id);
+  }
+
+  #assertSessionOpen(session: WorkingSession): void {
+    if (session.closed) {
+      throw coreError('HANDLE_EXPIRED', `working session ${session.id} was closed`, {
+        details: { session_id: session.id, next_request_id: null }
+      });
+    }
   }
 
   // -- outputs ---------------------------------------------------------------
@@ -1426,9 +1537,12 @@ class CollabServiceImpl implements CollabService {
    * whole `notebook_read` answer.
    */
   #revalidate(handle: NotebookHandle): Revalidate {
-    return (cellId, expected): RevalidateResult => {
+    return (cellId, expected, expectedIdentityToken): RevalidateResult => {
       try {
         const entry = handle.model.index.require(cellId);
+        if (entry.identityToken !== expectedIdentityToken) {
+          return { ok: false, code: 'cell_replaced' };
+        }
         const cell = resolveCell(handle.notebook, entry);
         const type = cellTypeOf(cell);
         const source = cell.getSource();
@@ -1460,12 +1574,17 @@ class CollabServiceImpl implements CollabService {
       options.cursor === undefined
         ? null
         : parseExecutionCursor(options.cursor, first.job.cells.length);
+    if (parsed !== null && parsed.registryCursor > first.cursor) {
+      throw coreError('CURSOR_EXPIRED', 'the execution cursor is ahead of the job state', {
+        details: { cursor: options.cursor }
+      });
+    }
     const waitMs = this.#clampWait(options.waitMs);
     // Without a cursor the caller asked for "the next change", so the wait is
     // measured from the state it is being handed right now (SPEC.md §8).
     const since = parsed?.registryCursor ?? first.cursor;
     let snapshot = first;
-    if (waitMs > 0 && !TERMINAL_JOB_STATES.has(first.job.state)) {
+    if (waitMs > 0 && (options.cursor !== undefined || !TERMINAL_JOB_STATES.has(first.job.state))) {
       const deadline = Date.now() + waitMs;
       for (;;) {
         const remaining = deadline - Date.now();
@@ -1479,7 +1598,7 @@ class CollabServiceImpl implements CollabService {
     return buildExecutionView(record, snapshot, {
       limits: this.#config.limits,
       requested: options.limits,
-      delivered: parsed?.delivered ?? null,
+      positions: parsed?.positions ?? null,
       waitTimedOut: waitMs > 0 && snapshot.cursor <= since,
       outputs: session.outputs
     });
@@ -1623,7 +1742,11 @@ class CollabServiceImpl implements CollabService {
   ): { kernelId: string; lease: ReturnType<KernelHub['acquire']> } {
     const kernelId = info.kernelId!;
     const existing = session.bindings.get(handle.notebookId);
-    if (existing !== undefined && existing.kernelId === kernelId) {
+    if (
+      existing !== undefined &&
+      existing.kernelId === kernelId &&
+      !existing.lease.client.isDisposed
+    ) {
       return { kernelId, lease: existing.lease };
     }
     if (existing !== undefined) {
@@ -1695,7 +1818,8 @@ class CollabServiceImpl implements CollabService {
     session: WorkingSession,
     handle: NotebookHandle,
     request: KernelControlRequest,
-    bound: JupyterSessionInfo | null
+    bound: JupyterSessionInfo | null,
+    selectedSpec: KernelSpecEntry | null
   ): Promise<KernelControlResult> {
     const client = this.#servers.clientFor(session.server);
     const previousKernelId = bound?.kernelId ?? null;
@@ -1791,6 +1915,9 @@ class CollabServiceImpl implements CollabService {
       handle.recordKernelChange(null);
     } else {
       this.#bind(session, handle, after);
+    }
+    if ((request.action === 'start' || request.action === 'switch') && selectedSpec !== null) {
+      handle.model.setKernelSpecMetadata(selectedSpec);
     }
 
     const status = await this.#kernelStatus(session, handle);
@@ -1950,6 +2077,15 @@ function parseOutputCursor(value: string): number {
  */
 function sliceSnapshot(snapshot: OutputSnapshot, offset: number, maxBytes: number): Buffer {
   const budget = Math.max(1, maxBytes);
+  if (
+    snapshot.encoding === 'text' &&
+    offset < snapshot.byteSize &&
+    (snapshot.bytes[offset]! & 0xc0) === 0x80
+  ) {
+    throw coreError('CURSOR_EXPIRED', 'the output cursor is not on a UTF-8 boundary', {
+      details: { output_id: snapshot.outputId, byte_offset: offset }
+    });
+  }
   let end = Math.min(snapshot.byteSize, offset + budget);
   if (end >= snapshot.byteSize) return snapshot.bytes.subarray(offset, snapshot.byteSize);
   if (snapshot.encoding === 'base64') {
@@ -1957,7 +2093,24 @@ function sliceSnapshot(snapshot: OutputSnapshot, offset: number, maxBytes: numbe
     return snapshot.bytes.subarray(offset, Math.min(end, snapshot.byteSize));
   }
   // Walk back off a UTF-8 continuation byte so no code point is split.
-  while (end > offset + 1 && (snapshot.bytes[end]! & 0xc0) === 0x80) end -= 1;
+  while (end > offset && (snapshot.bytes[end]! & 0xc0) === 0x80) end -= 1;
+  if (end === offset) {
+    let requiredEnd = offset + 1;
+    while (
+      requiredEnd < snapshot.byteSize &&
+      (snapshot.bytes[requiredEnd]! & 0xc0) === 0x80
+    ) {
+      requiredEnd += 1;
+    }
+    throw coreError('RESOURCE_LIMIT', 'the next UTF-8 code point exceeds the output byte budget', {
+      details: {
+        output_id: snapshot.outputId,
+        byte_offset: offset,
+        required_bytes: requiredEnd - offset,
+        max_bytes: budget
+      }
+    });
+  }
   return snapshot.bytes.subarray(offset, end);
 }
 

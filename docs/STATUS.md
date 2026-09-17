@@ -1,20 +1,18 @@
 # Implementation status
 
-As of 2026-09-06. Test environment `dev/jupyter/`: JupyterLab 4.6.3, jupyter-server 2.21.0,
-jupyter-collaboration 5.0.2 / jupyter_server_ydoc 3.0.2, jupyter-ydoc 4.1.1;
-Node 24.14, yjs 13.6.32, y-websocket 3.1.0, @jupyter/ydoc 4.1.1, services 7.6.3.
+Status snapshot: 2026-09-17. The verified integration stack is JupyterLab
+4.6.3, jupyter-server 2.21.0, jupyter-collaboration 5.0.2,
+jupyter-server-ydoc 3.0.2, jupyter-ydoc 4.1.1, Node.js 24,
+`@jupyter/ydoc` 4.1.1, and `@jupyterlab/services` 7.6.3.
 
-| Check | Command | Result |
-| --- | --- | --- |
-| Types | `pnpm typecheck` | clean, 0 errors |
-| Unit | `pnpm test:unit` | 26 files, 300 tests, 5.2 s |
-| Integration | `pnpm test:int` | 5 files, 29 tests, 32.4 s (environments 8889/8892/8896) |
-| E2E | `pnpm smoke` | 11 steps, exit 0, 5.6 s (environment 8893) |
+The TypeScript package is implemented end to end: the RTC transport, notebook
+model, kernel execution layer, stateful service, and MCP adapter are connected
+through the production CLI. The optional authenticated HTTP host is the same
+executable's `--http` mode.
 
-`scripts/e2e-smoke.ts` composes the three modules against a live server: create → open
-(RTC + model) → `add_cell` → execute through `ExecutionRegistry` with the model's sink →
-`finishExecution` → `readOutputs` (stream + `image/png`) → a second client sees the same
-cell, `outputs_revision`, `execution_count`, and `idle` → RAW save → read the `.ipynb`.
+Release verification runs `pnpm typecheck`, `pnpm test:unit`, `pnpm test:int`,
+`pnpm build`, `pnpm acceptance`, and `pnpm smoke`; recorded test counts and
+timings are intentionally omitted because they become stale as coverage grows.
 
 ## 1. Implementation by SPEC.md section
 
@@ -22,39 +20,39 @@ cell, `outputs_revision`, `execution_count`, and `idle` → RAW save → read th
 | --- | --- | --- |
 | §5 headless stack, RAW type 2 | `src/jupyter` | done (+ `scripts/check-headless.ts`) |
 | §6 handshake, room, close codes, reconnect, save | `src/jupyter` | done; `revision_persistence` = `unknown` |
-| §6 notebook creation | `src/jupyter` | partial: `newUntitled` only, without rename |
+| §6 notebook creation and rename | `src/jupyter`, `src/service` | done |
 | §7 cells, revisions, batch, metadata; §8 output generations; §10 journal | `src/core/notebook` | done |
 | §8 job queue, reducer, routing | `src/kernel` | done |
-| §8 kernel binding through Sessions API | — | missing; smoke calls `SessionAPI` directly |
-| §9 MCP tools, deduplication | `src/mcp` | not started (file is empty) |
+| §8 kernel binding through Sessions API | `src/service` | done |
+| §9 MCP tools, resources, limits, and deduplication | `src/mcp`, `src/service` | done |
 | §11 stdout guard, token redaction | `src/jupyter`, `src/core` | done |
-| §4 server/session/notebook registries | — | not started |
+| §4 server/session/notebook/kernel registries | `src/service` | done |
 
 ## 2. Coverage by §12 row
 
 | Area | Status | Coverage / missing work |
 | --- | --- | --- |
 | Stateful lifecycle | done | 100 edits, one `Y.Doc` and socket (`review.transport.int`) |
-| Reopen, Different conversations | not started | no handle layer or `SessionRegistry` |
+| Reopen, different conversations | done | handle reuse in one session and independent replicas across sessions |
 | Bidirectional RTC | done | `roundtrip`, `concurrent`, `transport.int`, smoke step 9 |
 | Concurrent edits | done | `concurrent.test.ts`, `review.concurrency.test.ts` |
-| Identity, ranges, external write | partial | `aset`-like replacement and queue in unit tests; no real external writer |
-| Outputs | partial | `kernel.int` covers all types; independent observer covers stream+PNG |
+| Identity, ranges, external write | done | identity and range tests plus real independent RTC replacement fixture |
+| Outputs | done | kernel integration covers output types; independent observer covers stream+PNG |
 | Execution completion | done | `execution-registry`, `kernel.int`, `review.late-output.int` |
-| Interrupt | partial | interrupt and timeout exist; MCP-request cancellation does not |
-| Shared kernel | partial | foreign busy state without writing to our cells; handle layer for two kernel handles is missing |
+| Interrupt | done | explicit interrupt, graceful shutdown evidence, timeout, and cancellation semantics |
+| Shared kernel | done | shared hub/queue, foreign busy state, and multiple handle leases |
 | Network, restart, session compatibility | partial | 1003/4400/4404/4500 budget and reconnect exist; server restart with replica is missing |
 | RAW and eviction | partial | conflict and a single handler use a fixture; no real eviction |
 | Shared execution | done | `dev/browser/shared-execution.ts` (16/16) + generations |
-| External kernel | partial | invalidation exists; browser restart and `KERNEL_NOT_BOUND` are missing |
-| Retries, Retry limit, Replay | not started | §9, MCP layer |
+| External kernel | partial | shutdown/death and binding changes are covered; an external in-place restart has no reliable server signal |
+| Retries, Retry limit, Replay | done | ledger, service, MCP, and acceptance tests |
 | Headless and save | done | `pnpm smoke`, steps 1–10 |
 | Save uncertainty, Autosave | partial | `timeout`/`skipped`/`OPERATION_UNCERTAIN` and `{autosave:true}` exist; update/save race and debounce do not |
 | Document data | done | `roundtrip.test.ts` |
-| Tool coverage | partial | model operations are complete; MCP tools are missing |
-| Create name | not started | rename/`ALREADY_EXISTS`/403 are not implemented |
-| Cursors and outputs | partial | changes/page cursors exist; `output_read`/resources do not |
-| Limits, Cleanup, and credentials | done | 750 KiB budget, `output_incomplete`, non-blocking `input()`; `review.stdout`, `lifecycle-silence`, dispose tests |
+| Tool coverage | done | all 18 tools have schemas, dispatch, and adapter tests |
+| Create name | done | rename, `ALREADY_EXISTS`, and retained untitled result are covered |
+| Cursors and outputs | done | change/page/execution/output cursors, `output_read`, and resources |
+| Limits, cleanup, and credentials | done | service budgets, bounded receipts/snapshots, stdout isolation, redaction, and disposal tests |
 | Benchmark with 100/1,000/10,000 cells | not started | — |
 
 ## 3. Known deviations
@@ -78,20 +76,18 @@ cell, `outputs_revision`, `execution_count`, and `idle` → RAW save → read th
    terminal failure is `OPERATION_UNCERTAIN`. `provider.shouldConnect === false`
    is also true during normal backoff (which has its own jitter); `state`/`terminalError`
    indicate a terminal failure.
-8. `FILE_ID_CHANGED` occurs only when `revalidateFileId` is supplied.
-9. The caller writes final `execution_count` + `idle`: `ExecutionRegistry` does not
-   touch Yjs or call `finishExecution` (smoke does this explicitly).
+8. `FILE_ID_CHANGED` occurs only when `revalidateFileId` is supplied by the service.
+9. `ExecutionRegistry` does not touch Yjs directly; the service watcher applies
+   `finishExecution` to the current notebook generation.
 10. `ChangeEvent` addresses only `cell_id`: with a duplicate ID, two objects produce
     events with the same address.
 11. `AREA_CACHE_LIMIT = 1024` and `LATE_ROUTE_LIMIT = 128` are internal
     `src/kernel` constants outside §9's configurable limits.
-12. `dev/browser/out/*.png` appears in `git status`: it is absent from `.gitignore`
-    even though the browser-step report stated otherwise.
+## 4. Public API
 
-## 4. Public API for the next step
-
-Complete lists are in each module's `index.ts`; the entries below are the foundation
-for the registry and MCP layers.
+Complete lists are in each module's `index.ts`. The package root exports the
+supported programmatic surface, including `createCollabService(config,
+options?)`, `CollabService`, and `CollabServiceOptions`.
 
 **`src/core`** (no dependencies): `CoreError`/`coreError`/`toCoreError`/`isCoreError`/
 `ERROR_CODES`/`DEFAULTS`/`redactCredentials`; `sourceRevision`, `cellRevision`,
@@ -119,7 +115,10 @@ for the registry and MCP layers.
 `dispose`; `ExecutionRegistry(kernel)` → `submit({notebookRef, cells, getSink, revalidate,
 stopOnError?, maxOutputBytes?})`, `get`, `cancel`, `waitForChange`, `dispose`.
 
-Still missing for §9: the handle layer (`ServerRegistry`, `SessionRegistry`,
-`NotebookConnection` over the three modules), kernel binding through Sessions API,
-calling `finishExecution` from that layer, `output_read`/resources, and the
-`request_id` registry.
+**`src/service`**: `createCollabService` composes server/session/notebook
+registries, kernel binding, execution completion, output snapshots/resources,
+and the sequential `request_id` ledger.
+
+**`src/mcp`**: `createMcpServer` exposes all 18 tools and output resources;
+`runCli` owns the stdout-safe stdio lifecycle. CLI help and version text go to
+stderr because stdout is reserved for MCP frames.

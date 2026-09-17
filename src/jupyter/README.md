@@ -106,8 +106,12 @@ Key decisions:
 - Kernel/session REST and WebSocket: `serverSettings()` returns the settings;
   everything else belongs to `src/kernel`.
 - JupyterHub (`hub_api_base_url`), cookie/XSRF authentication, `tls_ca_ref`, and
-  `proxy_auth_ref` from docs/CONNECTIONS.md §9 are not implemented; only token
-  authentication is supported.
+  `proxy_auth_ref` from docs/CONNECTIONS.md §9 are not implemented. Jupyter
+  tokens and an operator assertion header are supported through
+  `auth: {type: "header", name: "X-Jupyter-Access-Token"}` and `credentialRef`.
+  The server validates the assertion; MCP sends it in REST, RTC, and kernel
+  headers. The value is captured when the client is created; rotating the
+  credential requires an MCP restart.
 - RTC-level document-size enforcement (`DOCUMENT_TOO_LARGE`).
 
 ## Tests

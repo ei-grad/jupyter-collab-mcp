@@ -9,11 +9,19 @@
  * Port 8879 belongs to this file alone.
  */
 
+import { YNotebook } from '@jupyter/ydoc';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { isCoreError, type CollabService, type ExecutionView } from '../../src/core/index.js';
-import { createCollabService } from '../../src/service/index.js';
-import { apiFetchOk } from '../helpers/fetch.js';
+import {
+  isCoreError,
+  type CollabService,
+  type ExecutionView,
+  type ResolvedServer
+} from '../../src/core/index.js';
+import { RtcConnection } from '../../src/jupyter/rtc-connection.js';
+import { ServerClient } from '../../src/jupyter/server-client.js';
+import { createCollabService, NotebookHandle } from '../../src/service/index.js';
+import { apiFetch, apiFetchOk } from '../helpers/fetch.js';
 import { startStand, type Stand } from '../helpers/stand.js';
 
 const PORT = 8879;
@@ -64,6 +72,41 @@ async function settle(executionId: string, timeoutMs = 60_000): Promise<Executio
   }
 }
 
+async function openIndependentRoom(path: string): Promise<{
+  notebook: YNotebook;
+  connection: RtcConnection;
+}> {
+  const resolved: ResolvedServer = {
+    profile: {
+      id: 'stand',
+      kind: 'standalone',
+      apiBaseUrl: stand.baseUrl,
+      credentialRef: `literal:${stand.token}`
+    },
+    apiBaseUrl: stand.baseUrl,
+    wsBaseUrl: stand.wsUrl,
+    token: stand.token
+  };
+  const collaboration = await new ServerClient(resolved).collaborationSession(path);
+  const notebook = new YNotebook();
+  const connection = new RtcConnection({
+    wsBaseUrl: stand.wsUrl,
+    token: stand.token,
+    fileId: collaboration.fileId,
+    sessionId: collaboration.sessionId,
+    ydoc: notebook.ydoc,
+    awareness: notebook.awareness,
+    awarenessUser: { name: 'identity-regression', color: '#5e35b1' }
+  });
+  await connection.connect(30_000);
+  const deadline = Date.now() + 20_000;
+  while (notebook.nbformat === undefined) {
+    if (Date.now() > deadline) throw new Error('independent RTC replica did not synchronise');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return { notebook, connection };
+}
+
 beforeAll(async () => {
   stand = await startStand({ port: PORT });
   service = createCollabService({
@@ -107,6 +150,67 @@ describe('server and session lifecycle', () => {
     expect(session.kernelStarted).toBe(false);
     await service.sessionClose({ sessionId: session.sessionId });
   });
+
+  it('disposes a real ready replica that completes after session_close', async () => {
+    const allocated = await apiFetchOk(
+      { baseUrl: stand.baseUrl, token: stand.token },
+      '/api/contents/',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'notebook' })
+      }
+    );
+    const path = String(allocated.json<{ path?: string }>().path);
+    const gate: {
+      release?: () => void;
+      reached?: () => void;
+      handle?: NotebookHandle;
+    } = {};
+    const ready = new Promise<void>((resolve) => {
+      gate.reached = resolve;
+    });
+    const gated = createCollabService(
+      {
+        servers: [
+          {
+            id: 'stand',
+            kind: 'standalone',
+            apiBaseUrl: stand.baseUrl,
+            wsBaseUrl: stand.wsUrl,
+            credentialRef: `literal:${stand.token}`
+          }
+        ]
+      },
+      {
+        openHandle: async (init) => {
+          const handle = await NotebookHandle.open(init);
+          gate.handle = handle;
+          gate.reached?.();
+          await new Promise<void>((resolve) => {
+            gate.release = resolve;
+          });
+          return handle;
+        }
+      }
+    );
+
+    try {
+      const session = await gated.sessionOpen({});
+      const pending = gated.notebookOpen({ sessionId: session.sessionId, path });
+      await ready;
+      await gated.sessionClose({ sessionId: session.sessionId });
+      gate.release?.();
+
+      expect(await codeOf(() => pending)).toBe('HANDLE_EXPIRED');
+      expect(gate.handle?.closed).toBe(true);
+      expect(gate.handle?.model.isDisposed()).toBe(true);
+      expect(gate.handle?.connection.provider.ws).toBeNull();
+    } finally {
+      gate.release?.();
+      await gated.shutdown('client_request');
+    }
+  }, 60_000);
 });
 
 describe('create, open, read, apply, save', () => {
@@ -184,7 +288,7 @@ describe('create, open, read, apply, save', () => {
 
     // -- read: three views --------------------------------------------------
     const summary = await service.notebookRead({ notebookId, view: 'summary' });
-    expect(summary.summary.cellCount).toBeGreaterThanOrEqual(3);
+    expect(summary.summary.cellCount).toBeGreaterThanOrEqual(2);
     expect(summary.changesCursor).toBe(summary.summary.changesCursor);
 
     const cells = await service.notebookRead({ notebookId, view: 'cells', cellIds: [codeCellId!] });
@@ -228,6 +332,129 @@ describe('create, open, read, apply, save', () => {
 });
 
 describe('kernels and execution', () => {
+  it('does not execute a queued same-id same-source replacement received over RTC', async () => {
+    const session = await service.sessionOpen({});
+    const counter = new Counter();
+    const notebookName = nb('queued-replacement');
+    const created = await service.notebookCreate({
+      sessionId: session.sessionId,
+      requestId: counter.value,
+      directory: '',
+      name: notebookName
+    });
+    counter.take(created.nextRequestId);
+    const notebookId = created.notebook.notebookId;
+    const applied = await service.notebookApply({
+      notebookId,
+      requestId: counter.value,
+      operations: [
+        {
+          op: 'add_cell',
+          cellType: 'code',
+          source: 'import time; time.sleep(3)',
+          position: 'end'
+        },
+        { op: 'add_cell', cellType: 'code', source: 'print("must not run")', position: 'end' }
+      ]
+    });
+    counter.take(applied.nextRequestId);
+    const first = applied.results[0]!;
+    const queued = applied.results[1]!;
+    const remote = await openIndependentRoom(notebookName);
+
+    const started = await service.kernelControl({
+      notebookId,
+      requestId: counter.value,
+      action: 'start',
+      expectedKernelId: null,
+      kernelName: 'python3'
+    });
+    counter.take(started.nextRequestId);
+    const kernelId = started.kernelId!;
+    const job = await service.notebookExecute({
+      notebookId,
+      requestId: counter.value,
+      cells: [
+        { cellId: first.cellId!, expectedSourceRevision: first.sourceRevision! },
+        { cellId: queued.cellId!, expectedSourceRevision: queued.sourceRevision! }
+      ],
+      waitMs: 100
+    });
+    counter.take(job.nextRequestId);
+    expect(job.cells[0]?.state).toBe('sent');
+    expect(job.cells[1]?.state).toBe('queued');
+
+    const at = remote.notebook.cells.findIndex((cell) => cell.getId() === queued.cellId);
+    expect(at).toBeGreaterThanOrEqual(0);
+    remote.notebook.ydoc.transact(() => {
+      remote.notebook.deleteCell(at);
+      remote.notebook.insertCell(at, {
+        id: queued.cellId!,
+        cell_type: 'code',
+        source: 'print("must not run")',
+        metadata: {},
+        outputs: [{ output_type: 'stream', name: 'stdout', text: 'replacement output\n' }],
+        execution_count: 77
+      } as never);
+    });
+
+    let changesCursor = applied.changesCursor;
+    const replacementDeadline = Date.now() + 20_000;
+    for (;;) {
+      const changes = await service.notebookChanges({
+        notebookId,
+        cursor: changesCursor,
+        waitMs: 500
+      });
+      if (
+        changes.events.some(
+          (event) => event.kind === 'cell_replaced' && event.cellId === queued.cellId
+        )
+      ) {
+        break;
+      }
+      changesCursor = changes.nextCursor;
+      if (Date.now() > replacementDeadline) {
+        throw new Error('same-id replacement did not cross the RTC boundary');
+      }
+    }
+
+    const finished = await settle(job.executionId, 30_000);
+    expect(finished.cells[0]?.state).toBe('succeeded');
+    expect(finished.cells[1]).toMatchObject({
+      state: 'not_sent',
+      notSentReason: 'cell_replaced'
+    });
+    const replacement = await service.notebookRead({
+      notebookId,
+      view: 'cells',
+      cellIds: [queued.cellId!]
+    });
+    expect(replacement.cells[0]).toMatchObject({
+      source: 'print("must not run")',
+      executionCount: 77
+    });
+    const replacementOutputs = await service.notebookRead({
+      notebookId,
+      view: 'outputs',
+      cellIds: [queued.cellId!]
+    });
+    expect(replacementOutputs.cells[0]?.outputs[0]?.output).toMatchObject({
+      output_type: 'stream',
+      text: 'replacement output\n'
+    });
+
+    remote.connection.dispose();
+    remote.notebook.dispose();
+    await service.sessionClose({ sessionId: session.sessionId });
+    await apiFetchOk(
+      { baseUrl: stand.baseUrl, token: stand.token },
+      `/api/kernels/${kernelId}`,
+      { method: 'DELETE' },
+      [204, 404]
+    );
+  }, 120_000);
+
   it('binds a kernel, executes, pages outputs and reads a snapshot', async () => {
     const session = await service.sessionOpen({});
     const counter = new Counter();
@@ -477,6 +704,32 @@ describe('kernels and execution', () => {
     counter.take(started.nextRequestId);
     const kernelId = started.kernelId!;
 
+    // A second working session acquires another lease on the same kernel.
+    // It must be able to reacquire after the first handle restarts that kernel.
+    const mirrorSession = await service.sessionOpen({});
+    const mirrorCounter = new Counter();
+    const mirror = await service.notebookOpen({
+      sessionId: mirrorSession.sessionId,
+      path: created.notebook.path
+    });
+    const rerunTarget = applied.results[1]!;
+    const initialMirrorRun = await service.notebookExecute({
+      notebookId: mirror.notebook.notebookId,
+      requestId: mirrorCounter.value,
+      cells: [
+        {
+          cellId: rerunTarget.cellId!,
+          expectedSourceRevision: rerunTarget.sourceRevision!
+        }
+      ],
+      waitMs: 30_000
+    });
+    mirrorCounter.take(initialMirrorRun.nextRequestId);
+    const initialMirrorResult = TERMINAL.has(initialMirrorRun.state)
+      ? initialMirrorRun
+      : await settle(initialMirrorRun.executionId);
+    expect(initialMirrorResult.state).toBe('succeeded');
+
     const job = await service.notebookExecute({
       notebookId,
       requestId: counter.value,
@@ -517,6 +770,24 @@ describe('kernels and execution', () => {
       second.notSentReason
     );
 
+    const afterRestart = await service.notebookExecute({
+      notebookId: mirror.notebook.notebookId,
+      requestId: mirrorCounter.value,
+      cells: [
+        {
+          cellId: rerunTarget.cellId!,
+          expectedSourceRevision: rerunTarget.sourceRevision!
+        }
+      ],
+      waitMs: 30_000
+    });
+    mirrorCounter.take(afterRestart.nextRequestId);
+    const afterRestartResult = TERMINAL.has(afterRestart.state)
+      ? afterRestart
+      : await settle(afterRestart.executionId);
+    expect(afterRestartResult.state).toBe('succeeded');
+
+    await service.sessionClose({ sessionId: mirrorSession.sessionId });
     const closed = await service.sessionClose({ sessionId: session.sessionId });
     expect(closed.kernelsLeftRunning).toBe(true);
     const kernels = await apiFetchOk({ baseUrl: stand.baseUrl, token: stand.token }, '/api/kernels');
@@ -529,7 +800,7 @@ describe('kernels and execution', () => {
     );
   }, 180_000);
 
-  it('a kernel that disappears from the server ends the job as unknown', async () => {
+  it('a graceful external kernel shutdown may provide interruption evidence', async () => {
     const session = await service.sessionOpen({});
     const counter = new Counter();
     const created = await service.notebookCreate({
@@ -573,7 +844,7 @@ describe('kernels and execution', () => {
     });
     counter.take(job.nextRequestId);
 
-    // Somebody else kills the kernel; the watchdog notices it is gone.
+    // Another client requests a graceful shutdown through Jupyter's API.
     await apiFetchOk(
       { baseUrl: stand.baseUrl, token: stand.token },
       `/api/kernels/${kernelId}`,
@@ -582,11 +853,87 @@ describe('kernels and execution', () => {
     );
 
     const finished = await settle(job.executionId, 30_000);
-    expect(['unknown', 'failed']).toContain(finished.state);
-    expect(['unknown', 'aborted', 'failed']).toContain(finished.cells[0]!.state);
+    expect(['interrupted', 'unknown']).toContain(finished.state);
+    if (finished.state === 'interrupted') {
+      expect(finished.cells[0]).toMatchObject({
+        state: 'aborted',
+        abortedReason: 'interrupted'
+      });
+    } else {
+      expect(finished.cells[0]!.state).toBe('unknown');
+    }
 
     const status = await service.kernelStatus({ notebookId });
     expect(status.activeExecutionIds).toHaveLength(0);
+    await service.sessionClose({ sessionId: session.sessionId });
+  }, 180_000);
+
+  it('an abrupt kernel loss makes sent work unknown and terminates its queue', async () => {
+    const session = await service.sessionOpen({});
+    const counter = new Counter();
+    const created = await service.notebookCreate({
+      sessionId: session.sessionId,
+      requestId: counter.value,
+      directory: '',
+      name: nb('crash')
+    });
+    counter.take(created.nextRequestId);
+    const notebookId = created.notebook.notebookId;
+
+    const applied = await service.notebookApply({
+      notebookId,
+      requestId: counter.value,
+      operations: [
+        { op: 'add_cell', cellType: 'code', source: 'import os; os._exit(17)', position: 'end' },
+        { op: 'add_cell', cellType: 'code', source: 'print("must not run")', position: 'end' }
+      ]
+    });
+    counter.take(applied.nextRequestId);
+
+    const started = await service.kernelControl({
+      notebookId,
+      requestId: counter.value,
+      action: 'start',
+      expectedKernelId: null,
+      kernelName: 'python3'
+    });
+    counter.take(started.nextRequestId);
+    const kernelId = started.kernelId!;
+
+    const job = await service.notebookExecute({
+      notebookId,
+      requestId: counter.value,
+      cells: applied.results.map((result) => ({
+        cellId: result.cellId!,
+        expectedSourceRevision: result.sourceRevision!
+      })),
+      waitMs: 500
+    });
+    counter.take(job.nextRequestId);
+
+    const finished = await settle(job.executionId, 30_000);
+    expect(finished.state).toBe('unknown');
+    expect(finished.cells[0]!.state).toBe('unknown');
+    expect(finished.cells[1]).toMatchObject({
+      state: 'not_sent',
+      notSentReason: 'kernel_changed'
+    });
+
+    const status = await service.kernelStatus({ notebookId });
+    expect(status.activeExecutionIds).toHaveLength(0);
+    const cleanupDeadline = Date.now() + 20_000;
+    for (;;) {
+      const response = await apiFetch(
+        { baseUrl: stand.baseUrl, token: stand.token },
+        `/api/kernels/${kernelId}`,
+        { method: 'DELETE' }
+      );
+      if (response.status === 204 || response.status === 404) break;
+      if (response.status !== 500 || Date.now() > cleanupDeadline) {
+        throw new Error(`could not stop crashed kernel: ${String(response.status)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
     await service.sessionClose({ sessionId: session.sessionId });
   }, 180_000);
 });

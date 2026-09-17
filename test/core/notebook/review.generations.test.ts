@@ -1,8 +1,7 @@
 /**
- * Adversarial review: SPEC.md §8 output-area generations and §12
- * "Shared execution" / "Outputs".
+ * Output-area generation and shared-execution coverage.
  *
- * Two attack surfaces:
+ * Two boundaries:
  *
  * 1. the self-attribution of a generation's own writes. Yjs runs deep
  *    observers when the OUTERMOST transaction ends, so a caller that groups
@@ -149,6 +148,98 @@ describe('review: races around a live generation (SPEC.md §8)', () => {
     });
     expect(sink.isCurrent()).toBe(true);
     expect(sink.appendOutput(stream('ours'))).toBe(true);
+    wire.dispose();
+    local.dispose();
+    remote.dispose();
+  });
+
+  it('a peer reserialising the same output state does not steal the generation', () => {
+    const local = reviewPeer(11, reviewBook([reviewCode('c1', 'print(1)')]));
+    const remote = reviewPeer(22);
+    const wire = new Wire(local.notebook.ydoc, remote.notebook.ydoc);
+    wire.setAuto(true);
+    const sink = local.model.beginExecutionGeneration('c1')!;
+    expect(sink.appendOutput(stream('line 1\n'))).toBe(true);
+
+    const remoteCell = remote.notebook.getCell(0) as unknown as { getOutputs(): unknown[] };
+    writeOutputs(remote.notebook, 0, remoteCell.getOutputs());
+
+    expect(sink.isCurrent()).toBe(true);
+    expect(sink.updateOutput(0, stream('line 1\nline 2\n'))).toBe(true);
+    expect(local.model.finishExecution(sink, { count: 1 })).toBe(true);
+    const finished = local.model.readOutputs(['c1']).cells[0]!;
+    expect((finished.outputs[0]!.output as { text: string }).text).toBe('line 1\nline 2\n');
+    expect(finished.executionCount).toBe(1);
+    expect(finished.executionState).toBe('idle');
+    wire.dispose();
+    local.dispose();
+    remote.dispose();
+  });
+
+  it('a clear sharing an outer transaction with a sink write still revokes it', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'print(1)')]));
+    const sink = peer.model.beginExecutionGeneration('c1')!;
+    expect(sink.appendOutput(stream('line 1\n'))).toBe(true);
+
+    peer.notebook.ydoc.transact(() => {
+      expect(sink.appendStream(0, 'line 2\n')).toBe(true);
+      const revision = peer.model.summary().cells[0]!.outputsRevision!;
+      peer.model.apply([{ op: 'clear_outputs', cellId: 'c1', expectedOutputsRevision: revision }]);
+    });
+
+    expect(sink.isCurrent()).toBe(false);
+    expect(sink.appendOutput(stream('late'))).toBe(false);
+    expect(peer.model.finishExecution(sink, { count: 1 })).toBe(false);
+    expect(peer.model.readOutputs(['c1']).cells[0]!.outputs).toHaveLength(0);
+    peer.dispose();
+  });
+
+  it('an unclaimed stream append in the sink transaction revokes it', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'print(1)')]));
+    const sink = peer.model.beginExecutionGeneration('c1')!;
+    expect(sink.appendOutput(stream('a'))).toBe(true);
+    const cell = peer.notebook.getCell(0) as unknown as {
+      youtputs: { get(index: number): { get(key: string): { insert(index: number, text: string): void; length: number } } };
+    };
+
+    peer.notebook.ydoc.transact(() => {
+      expect(sink.appendStream(0, 'b')).toBe(true);
+      const sharedText = cell.youtputs.get(0).get('text');
+      sharedText.insert(sharedText.length, 'FOREIGN');
+    });
+
+    expect(sink.isCurrent()).toBe(false);
+    expect(sink.appendOutput(stream('late'))).toBe(false);
+    expect(peer.model.finishExecution(sink, { count: 1 })).toBe(false);
+    peer.dispose();
+  });
+
+  it('a queued remote stream delta delivered in the sink transaction revokes it', () => {
+    const local = reviewPeer(11, reviewBook([reviewCode('c1', 'print(1)')]));
+    const remote = reviewPeer(22);
+    const wire = new Wire(local.notebook.ydoc, remote.notebook.ydoc);
+    const sink = local.model.beginExecutionGeneration('c1')!;
+    expect(sink.appendOutput(stream('line 1\n'))).toBe(true);
+    wire.deliver();
+
+    const remoteCell = remote.notebook.getCell(0) as unknown as {
+      youtputs: {
+        get(index: number): {
+          get(key: string): { insert(index: number, text: string): void; length: number };
+        };
+      };
+    };
+    const remoteText = remoteCell.youtputs.get(0).get('text');
+    remoteText.insert(remoteText.length, 'foreign\n');
+
+    local.notebook.ydoc.transact(() => {
+      expect(sink.appendStream(0, 'line 2\n')).toBe(true);
+      wire.deliver();
+    });
+
+    expect(sink.isCurrent()).toBe(false);
+    expect(sink.appendOutput(stream('late'))).toBe(false);
+    expect(local.model.finishExecution(sink, { count: 1 })).toBe(false);
     wire.dispose();
     local.dispose();
     remote.dispose();

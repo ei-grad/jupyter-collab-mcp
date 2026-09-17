@@ -13,6 +13,7 @@
  * integration tests instead.
  */
 
+import type { IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import * as decoding from 'lib0/decoding';
@@ -65,6 +66,8 @@ export class FakeRtcServer {
    * this fixture only records it.
    */
   readonly seenAuthorizations: Array<string | null> = [];
+  /** Complete handshake headers, for non-Authorization credential tests. */
+  readonly seenHeaders: IncomingHttpHeaders[] = [];
   /** Save request ids received, in order. */
   readonly saveRequests: number[] = [];
   /** Accepted (not immediately closed) connections. */
@@ -74,6 +77,7 @@ export class FakeRtcServer {
     this.#wss = wss;
     this.#saveStatus = options.saveStatus ?? 'success';
     this.#wss.on('connection', (socket, request) => {
+      this.seenHeaders.push(request.headers);
       this.#onConnection(socket, request.url ?? '/', request.headers.authorization ?? null);
     });
   }

@@ -199,9 +199,10 @@ const EXECUTION_CELL = obj(
     cell_deleted: bool(),
     output_incomplete: bool('Output budget hit; the kernel was NOT interrupted.'),
     outputs: arr(OUTPUT_ENTRY),
+    outputs_reset: bool('true when outputs replace the state represented by the request cursor, including an empty clear.'),
     outputs_truncated: bool()
   },
-  ['cell_id', 'state', 'source_revision', 'source_changed', 'cell_deleted', 'output_incomplete', 'outputs', 'outputs_truncated']
+  ['cell_id', 'state', 'source_revision', 'source_changed', 'cell_deleted', 'output_incomplete', 'outputs', 'outputs_reset', 'outputs_truncated']
 );
 
 const EXECUTION_VIEW: Record<string, JsonSchema> = {

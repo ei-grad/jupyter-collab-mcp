@@ -26,6 +26,8 @@ import type {
  */
 export interface KernelCellRecord extends CellExecutionRecord {
   readonly outputAreaLost: boolean;
+  /** Monotonic version of the mutable output list returned by execution_get. */
+  readonly outputVersion: number;
   /** CRDT identity captured at send time, from the pre-send re-check. */
   readonly identityToken?: string;
 }
@@ -57,11 +59,14 @@ export interface MutableCell {
   cellDeleted: boolean;
   outputIncomplete: boolean;
   outputAreaLost: boolean;
+  outputVersion: number;
   generation?: number;
   executionCount?: number | null;
   notSentReason?: NotSentReason;
   abortedReason?: CellExecutionRecord['abortedReason'];
   identityToken?: string;
+  /** Failed acceptance check for legacy callers that did not supply identity. */
+  acceptanceFailure?: NotSentReason;
 }
 
 /** Mutable twin of {@link ExecutionJob}, plus queue and waiter state. */
@@ -95,7 +100,8 @@ export function newCell(cellId: string, sourceRevision: SourceRevision): Mutable
     sourceChanged: false,
     cellDeleted: false,
     outputIncomplete: false,
-    outputAreaLost: false
+    outputAreaLost: false,
+    outputVersion: 0
   };
 }
 
@@ -111,6 +117,7 @@ export function snapshotCell(cell: MutableCell): KernelCellRecord {
     cellDeleted: cell.cellDeleted,
     outputIncomplete: cell.outputIncomplete,
     outputAreaLost: cell.outputAreaLost,
+    outputVersion: cell.outputVersion,
     ...(cell.msgId === undefined ? {} : { msgId: cell.msgId }),
     ...(cell.generation === undefined ? {} : { generation: cell.generation }),
     ...(cell.executionCount === undefined ? {} : { executionCount: cell.executionCount }),

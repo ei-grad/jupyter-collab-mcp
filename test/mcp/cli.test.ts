@@ -1,5 +1,5 @@
-import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,11 +7,14 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import { isCoreError } from '../../src/core/index.js';
-import { CLI_USAGE, loadCliConfig } from '../../src/mcp/index.js';
+import { CLI_USAGE, loadCliConfig, runMainCli } from '../../src/mcp/index.js';
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const CLI = join(ROOT, 'src/mcp/cli.ts');
 const FAKE = join(ROOT, 'test/mcp/fake-service.ts');
+const PACKAGE_VERSION = (
+  JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as { version: string }
+).version;
 
 describe('loadCliConfig', () => {
   it('builds the implicit "default" profile from JUPYTER_URL + JUPYTER_TOKEN', () => {
@@ -119,6 +122,57 @@ async function converse(requests: unknown[], timeoutMs = 25_000): Promise<{ stdo
 }
 
 describe('the cli child process', () => {
+  it('runs when invoked through an installed-package bin symlink', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'jcm-bin-'));
+    const executable = join(directory, 'jupyter-collab-mcp');
+    symlinkSync(CLI, executable);
+    try {
+      const run = spawnSync(
+        process.execPath,
+        [join(ROOT, 'node_modules/tsx/dist/cli.mjs'), executable, '--version'],
+        { cwd: ROOT, encoding: 'utf8' }
+      );
+      expect(run.status).toBe(0);
+      expect(run.stdout).toBe('');
+      expect(run.stderr.trim()).toBe(PACKAGE_VERSION);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the declared version with --http without loading HTTP configuration', () => {
+    const run = spawnSync(
+      process.execPath,
+      [join(ROOT, 'node_modules/tsx/dist/cli.mjs'), CLI, '--http', '--version'],
+      { cwd: ROOT, encoding: 'utf8' }
+    );
+    expect(run.status).toBe(0);
+    expect(run.stdout).toBe('');
+    expect(run.stderr.trim()).toBe(PACKAGE_VERSION);
+  });
+
+  it('dispatches --http through the HTTP runtime seam', async () => {
+    let started = 0;
+    let closed = 0;
+    const handle = await runMainCli({
+      argv: ['--http'],
+      env: {},
+      installSignalHandlers: false,
+      stderr: { write: () => true } as unknown as NodeJS.WritableStream,
+      startHttp: async () => {
+        started++;
+        return {
+          close: async () => {
+            closed++;
+          }
+        };
+      }
+    });
+    expect(started).toBe(1);
+    await handle.close();
+    expect(closed).toBe(1);
+  });
+
   it(
     'writes JSON-RPC and nothing else to stdout, and diagnostics to stderr',
     async () => {

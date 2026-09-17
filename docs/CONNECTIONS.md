@@ -107,8 +107,9 @@ different Hub user servers.
 
 "Native client" below means Claude Code or a Codex host directly connected to
 the MCP. Local stdio also applies to Claude Desktop. Hosted connector means the
-cloud path from the previous table. HTTP options require a future HTTP adapter
-for this project; the table does not imply that they are already implemented.
+cloud path from the previous table. HTTP options use the main executable's
+optional authenticated `--http` mode; the table still includes deployment
+combinations that have not all been validated end to end.
 
 | ID | MCP client → MCP | MCP → Jupyter | Reachability and use |
 | --- | --- | --- | --- |
@@ -166,11 +167,10 @@ without a separate service lifecycle.
 
 ## 4. Client configuration examples
 
-These examples document a future service. Client-side fields were checked
-against sources; launcher paths, hostnames, and secret names are proposed
-values. They must not be run until the corresponding launcher/server exists.
-This document neither publishes a package named `jupyter-collab-mcp` nor
-recommends installing an unknown package of that name through `npx`.
+These examples mix the implemented package CLI with deployment-specific
+launcher paths, hostnames, and secret names. Proposed launchers must not be used
+until the corresponding executable and server exist; the npm-based local stdio
+configuration in the root README is the supported package entry point.
 
 ### Codex: stdio and any reachable Jupyter
 
@@ -313,11 +313,11 @@ are not a sufficient contract.
 | Servers | `server_list` returns only profiles authorized for the principal; no shared credentials belonging to another user |
 | Pools | A connection pool does not combine different upstream identities merely by URL/kernel ID |
 | Retry | Verify the principal before lookup, then apply `(application session, request_id)` and the operation/target/payload digest from SPEC; another user's request ID does not reveal a result |
-| Session creation | HTTP requires retryable `session_open` with a caller creation ID in a separate owner-bound namespace, before the session and its request-ID sequence exist |
+| Session creation | Current HTTP mode preserves the stdio `session_open` contract without a creation ID; a lost response must not be retried blindly |
 | Lifecycle | Explicit close plus a bounded lease for abandoned idle sessions; HTTP disconnect is not close |
 | Active work | An idle lease does not destroy an active job; its retention has a separate bounded budget and visible status |
 | Restart | When worker state is lost, old handles expire; jobs are not retried automatically |
-| Token refresh | Refreshing a token for the same verified principal preserves access to that principal's session; changing the principal does not |
+| Token refresh | Every exact credential generation owns a separate worker; a new token does not inherit old handles, while an old still-valid grant retains its own worker |
 
 Core request IDs form a sequence within a working session, with a bounded
 result cache and retention of the high-water mark of accepted numbers as
@@ -331,10 +331,11 @@ computation itself need not finish before the next tool call when its execution
 handle has already been returned. Independent sessions and reads may proceed in
 parallel.
 
-The HTTP creation ID for `session_open` belongs to a different namespace: its
-bounded retention and expiration must be explicitly defined by the HTTP adapter
-before creation is described as retry-safe. An HTTP transport request ID does
-not substitute for either application ID.
+The current HTTP mode has no separate creation ID for `session_open`, so a lost
+creation response is not retry-safe. Adding one would require a different
+namespace with explicitly bounded retention and expiration. An HTTP transport
+request ID does not substitute for that application ID or for the core request
+sequence.
 
 Do not use legacy `Mcp-Session-Id` as identity or an ownership basis. The
 2026-07-28 revision does not create it; the GET/DELETE legacy session endpoint
@@ -626,21 +627,22 @@ validation before hosted Claude is configured.
 
 ## 9. Upstream profile contract
 
-The proposed fields below define future configuration for this server; the CLI
-is not yet implemented. Profiles are created by the user/deployment operator;
-tools select only an authorized `server_id`.
+The fields below are the JSON profile contract accepted by
+`jupyter-collab-mcp --config`. Profiles are created by the deployment operator;
+tools select only an authorized `server_id`. Fields marked reserved are parsed
+but are not currently used for requests or lifecycle operations.
 
 | Field | Purpose |
 | --- | --- |
 | `id`, `kind` | Stable name and `standalone` / `jupyterhub` |
-| `api_base_url` | Final server API base with the full prefix and no trailing `/api` |
-| `ws_base_url?` | Explicit authorized WebSocket base; normally derived from the API base |
-| `browser_base_url?` | Address of the same server reachable by the user; not used for API requests |
-| `credential_ref` | Downstream secret reference, not the token value |
-| `hub_api_base_url?` | Separate Hub control API URL, needed only for authorized lifecycle functions |
-| `hub_user`, `hub_server_name?` | Target Hub server bound to the verified principal |
-| `hub_credential_ref?` | Control API credential; may refer to the same secret if its scopes are sufficient |
-| `tls_ca_ref?`, `proxy_auth_ref?` | Explicit trust/additional proxy-auth configuration; not disabled TLS |
+| `apiBaseUrl` | Final server API base with the full prefix and no trailing `/api` |
+| `wsBaseUrl?` | Explicit authorized WebSocket base; normally derived from the API base |
+| `browserBaseUrl?` | Address of the same server reachable by the user; not used for API requests |
+| `credentialRef` | `env:` or `file:` downstream secret reference, not the token value |
+| `hubApiBaseUrl?` | Reserved; separate Hub control API URL is not yet supported |
+| `hubUser`, `hubServerName?` | Target Hub server bound to the verified principal |
+| `hubCredentialRef?` | Reserved; separate Hub control credentials are not yet supported |
+| `tlsCaRef?`, `proxyAuthRef?` | Reserved; custom trust and proxy authentication are not yet supported |
 
 Minimal examples without secrets:
 
@@ -648,9 +650,9 @@ Minimal examples without secrets:
 {
   "id": "remote-via-forward",
   "kind": "standalone",
-  "api_base_url": "http://127.0.0.1:18888/",
-  "browser_base_url": "http://127.0.0.1:18888/",
-  "credential_ref": "env:JUPYTER_SERVER_TOKEN"
+  "apiBaseUrl": "http://127.0.0.1:18888/",
+  "browserBaseUrl": "http://127.0.0.1:18888/",
+  "credentialRef": "env:JUPYTER_SERVER_TOKEN"
 }
 ```
 
@@ -658,11 +660,11 @@ Minimal examples without secrets:
 {
   "id": "hub-research",
   "kind": "jupyterhub",
-  "api_base_url": "https://hub.example.org/jhub/user/alice/research/",
-  "browser_base_url": "https://hub.example.org/jhub/user/alice/research/",
-  "credential_ref": "secret:alice-hub-access",
-  "hub_user": "alice",
-  "hub_server_name": "research"
+  "apiBaseUrl": "https://hub.example.org/jhub/user/alice/research/",
+  "browserBaseUrl": "https://hub.example.org/jhub/user/alice/research/",
+  "credentialRef": "file:/run/secrets/alice-hub-access",
+  "hubUser": "alice",
+  "hubServerName": "research"
 }
 ```
 

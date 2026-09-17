@@ -27,7 +27,7 @@
  * @module
  */
 
-import { KernelConnection, type Kernel, type ServerConnection } from '@jupyterlab/services';
+import { KernelAPI, KernelConnection, type Kernel, type ServerConnection } from '@jupyterlab/services';
 import type { KernelChannelState, KernelExecutionStatus } from '../core/types.js';
 import { coreError } from '../core/errors.js';
 import { DisplayRegistry } from './display-registry.js';
@@ -102,6 +102,7 @@ function now(): string {
 /** A live kernel connection with one receiver (SPEC.md §4, §8). */
 export class KernelClient {
   readonly #kernel: Kernel.IKernelConnection;
+  readonly #serverSettings: ServerConnection.ISettings;
   /** Every observer of one `execute_request`, keyed by its header id. */
   readonly #routes = new Map<string, Set<ExecutionRoute>>();
   readonly #changeListeners = new Set<(event: KernelChangedEvent) => void>();
@@ -114,6 +115,7 @@ export class KernelClient {
   #disposed = false;
 
   constructor(options: KernelClientOptions) {
+    this.#serverSettings = options.serverSettings;
     const model: Kernel.IModel = { id: options.kernelId, name: options.kernelName ?? 'python3' };
     const connectionOptions: Kernel.IKernelConnection.IOptions = {
       model,
@@ -229,7 +231,12 @@ export class KernelClient {
   /** `POST /api/kernels/<id>/restart`; invalidates in-flight work. */
   async restart(): Promise<void> {
     this.#emitChange('restarting');
-    await this.#kernel.restart();
+    // KernelConnection.restart() clears an in-flight automatic kernel-info
+    // future while the connection is still live. In @jupyterlab/services
+    // 7.6.3 that rejection escapes an internal fire-and-forget promise. The
+    // service invalidates and replaces this client after a successful restart,
+    // so use the same REST operation without mutating the unsafe connection.
+    await KernelAPI.restartKernel(this.kernelId, this.#serverSettings);
   }
 
   /** `DELETE /api/kernels/<id>`; invalidates in-flight work. */

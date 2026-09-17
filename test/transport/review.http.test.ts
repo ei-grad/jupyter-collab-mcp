@@ -1,9 +1,4 @@
-/**
- * Adversarial review of `src/jupyter/http.ts` and `src/jupyter/server-client.ts`.
- *
- * Focus: SPEC.md §11 ("Credentials do not appear in stdout, logs, exception
- * messages ...") and the SPEC.md §9 error contract. Only new files are added.
- */
+/** Transport credential-redaction and injected-policy coverage. */
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { isCoreError, type ResolvedServer } from '../../src/core/index.js';
@@ -35,7 +30,7 @@ function wire(error: unknown): string {
   return JSON.stringify(error.toJSON());
 }
 
-describe('FINDING: parseJsonBody puts an unredacted body into the MCP error payload', () => {
+describe('parseJsonBody credential redaction', () => {
   it('SPEC.md §11: credentials must not reach exception messages', async () => {
     // A 200 with a non-JSON body is the one path that reaches `parseJsonBody`
     // instead of `mapHttpStatus`. A proxy or a Jupyter login page in front of
@@ -59,7 +54,7 @@ describe('FINDING: parseJsonBody puts an unredacted body into the MCP error payl
     expect(wire(error)).not.toContain(TOKEN);
   });
 
-  it('contrast: the same body behind an error status IS redacted', async () => {
+  it('redacts a response body behind an error status', async () => {
     stub = await startHttpStub((_req, res) => {
       res.writeHead(500, { 'content-type': 'text/html' });
       res.end(`<html>oops <a href="/x?token=${TOKEN}">t</a></html>`);
@@ -70,15 +65,13 @@ describe('FINDING: parseJsonBody puts an unredacted body into the MCP error payl
       () => new Error('should have thrown'),
       (reason: unknown) => reason
     );
-    // mapHttpStatus() runs redactCredentials over the body excerpt; the two
-    // sibling helpers disagree, which is what makes the case above a defect.
     expect(wire(error)).not.toContain(TOKEN);
     expect(wire(error)).toContain('token=<redacted>');
   });
 });
 
-describe('FINDING: serverSettings() ignores the injected fetch implementation', () => {
-  it('the kernel layer would bypass any transport policy configured for REST', async () => {
+describe('serverSettings injected fetch implementation', () => {
+  it('uses the transport policy configured for REST', async () => {
     stub = await startHttpStub((_req, res) => sendJson(res, 200, {}));
     const calls: string[] = [];
     const fetchImpl: typeof fetch = async (input, init) => {
@@ -90,11 +83,8 @@ describe('FINDING: serverSettings() ignores the injected fetch implementation', 
     await client.status();
     expect(calls).toHaveLength(1);
 
-    // `ServerClient.serverSettings()` hands `@jupyterlab/services` the *global*
-    // fetch, not `this.#fetch`. Anything the profile needs on the wire (a proxy
-    // agent, a pinned CA - docs/CONNECTIONS.md §9 tls_ca_ref/proxy_auth_ref)
-    // would silently apply to REST and not to kernels.
-    expect(client.serverSettings().fetch).toBe(fetchImpl);
+    await client.serverSettings().fetch(`${stub.baseUrl}/api/status`);
+    expect(calls).toHaveLength(2);
   });
 });
 

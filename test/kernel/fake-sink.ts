@@ -11,6 +11,7 @@ import type { NbOutput, OutputSink, SharedExecutionState } from '../../src/core/
 export type SinkCall =
   | { readonly method: 'setOutputs'; readonly outputs: NbOutput[] }
   | { readonly method: 'appendOutput'; readonly output: NbOutput }
+  | { readonly method: 'appendStream'; readonly index: number; readonly text: string }
   | { readonly method: 'updateOutput'; readonly index: number; readonly output: NbOutput }
   | { readonly method: 'clearOutputs' }
   | { readonly method: 'setExecutionCount'; readonly executionCount: number | null }
@@ -26,7 +27,8 @@ export class FakeSink implements OutputSink {
 
   constructor(
     readonly cellId: string,
-    readonly generation: number
+    readonly generation: number,
+    readonly identityToken: string = `id:${cellId}`
   ) {}
 
   isCurrent(): boolean {
@@ -48,6 +50,16 @@ export class FakeSink implements OutputSink {
     if (!this.current) return false;
     this.outputs.push(output);
     this.calls.push({ method: 'appendOutput', output });
+    return true;
+  }
+
+  appendStream(index: number, text: string): boolean {
+    if (!this.current) return false;
+    const output = this.outputs[index];
+    if (output?.output_type !== 'stream') return false;
+    const previous = typeof output.text === 'string' ? output.text : output.text.join('');
+    this.outputs[index] = { ...output, text: previous + text };
+    this.calls.push({ method: 'appendStream', index, text });
     return true;
   }
 
@@ -88,18 +100,29 @@ export class FakeSink implements OutputSink {
  */
 export class FakeSinkFactory {
   readonly sinks = new Map<string, FakeSink[]>();
+  readonly identities = new Map<string, string>();
   /** Cells that "no longer exist"; the factory returns `null` for them. */
   readonly missing = new Set<string>();
 
-  begin = (cellId: string): FakeSink | null => {
+  begin = (cellId: string, expectedIdentityToken?: string): FakeSink | null => {
     if (this.missing.has(cellId)) return null;
+    const identityToken = this.identities.get(cellId) ?? `id:${cellId}`;
+    this.identities.set(cellId, identityToken);
+    if (expectedIdentityToken !== undefined && expectedIdentityToken !== identityToken) return null;
     const history = this.sinks.get(cellId) ?? [];
     for (const previous of history) previous.current = false;
-    const sink = new FakeSink(cellId, history.length + 1);
+    const generation = history.filter((entry) => entry.identityToken === identityToken).length + 1;
+    const sink = new FakeSink(cellId, generation, identityToken);
     history.push(sink);
     this.sinks.set(cellId, history);
     return sink;
   };
+
+  /** Replace or reuse an id with a distinct shared-cell identity. */
+  replace(cellId: string, identityToken: string): void {
+    for (const previous of this.sinks.get(cellId) ?? []) previous.current = false;
+    this.identities.set(cellId, identityToken);
+  }
 
   /** Most recent sink of a cell. */
   latest(cellId: string): FakeSink | undefined {

@@ -26,8 +26,10 @@ export {
   normalizeBaseUrl,
   normalizeContentsPath,
   roomName,
+  validateBaseUrl,
   validateNotebookName
 } from './paths.js';
+export type { BaseUrlRole } from './paths.js';
 
 export { httpRequest, isSafeMethod, mapHttpStatus, mapTransportError, parseJsonBody } from './http.js';
 export type { HttpRequestOptions, HttpResponse } from './http.js';

@@ -1,14 +1,16 @@
-/**
- * Adversarial review of `src/kernel/output-reducer.ts`, kept as a regression
- * suite: the routing guard and the cost of the stream-merge rule.
- */
+/** Output routing and stream-merge resource-limit coverage. */
 
 import { describe, expect, it } from 'vitest';
 import { DisplayRegistry } from '../../src/kernel/display-registry.js';
 import type { JupyterMessage } from '../../src/kernel/messages.js';
 import { createExecutionReducer } from '../../src/kernel/output-reducer.js';
 
-const AREA = { notebookId: 'nb_rev', cellId: 'c1', generation: 1 } as const;
+const AREA = {
+  notebookId: 'nb_rev',
+  cellId: 'c1',
+  identityToken: 'id:c1',
+  generation: 1
+} as const;
 
 function reducer(maxOutputBytes?: number): ReturnType<typeof createExecutionReducer> {
   return createExecutionReducer({
@@ -62,26 +64,31 @@ describe('routing guard', () => {
 });
 
 describe('stream merge cost (SPEC §8 "One long computation does not block ...")', () => {
-  it('merging consecutive stream chunks stays linear in the output size', () => {
+  it('emits only delta-sized effects while the accumulated output grows', () => {
     const chunk = `${'x'.repeat(80)}\n`;
-    const run = (n: number): number => {
-      const r = reducer();
-      const msg = streamMsg('REQ', chunk);
-      const started = performance.now();
-      for (let i = 0; i < n; i += 1) r.feed(msg);
-      return performance.now() - started;
-    };
+    const count = 3_000;
+    const r = reducer();
+    const msg = streamMsg('REQ', chunk);
+    let deliveredTextBytes = 0;
+    for (let index = 0; index < count; index += 1) {
+      const effects = r.feed(msg);
+      expect(effects).toHaveLength(1);
+      const effect = effects[0]!;
+      if (effect.kind === 'append') {
+        expect(effect.output.output_type).toBe('stream');
+        deliveredTextBytes += chunk.length;
+      } else {
+        expect(effect.kind).toBe('appendStream');
+        if (effect.kind === 'appendStream') deliveredTextBytes += effect.text.length;
+      }
+    }
 
-    run(200); // warm up the JIT
-    const small = run(1500);
-    const large = run(3000);
-
-    // Doubling the number of chunks must not quadruple the work. The original
-    // `handleStream` re-serialised the whole accumulated text twice per
-    // message (`sizeOf(merged) - sizeOf(last)`), which cost O(bytes^2):
-    // measured on this machine, 1000 chunks 66ms, 2000 283ms, 4000 1.2s,
-    // 8000 4.9s, 16000 19.4s - for only 1.3 MB of stdout, far below
-    // DEFAULT_MAX_OUTPUT_BYTES (4 MiB). Only the new chunk is measured now.
-    expect(large / Math.max(small, 0.001)).toBeLessThan(3);
-  }, 30_000);
+    expect(deliveredTextBytes).toBe(count * chunk.length);
+    const output = r.state.outputs[0];
+    expect(output?.output_type).toBe('stream');
+    if (output?.output_type === 'stream') {
+      const text = typeof output.text === 'string' ? output.text : output.text.join('');
+      expect(text.length).toBe(count * chunk.length);
+    }
+  });
 });

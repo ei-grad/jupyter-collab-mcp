@@ -37,7 +37,7 @@ function outputs(count: number): NbOutput[] {
   return list;
 }
 
-function snapshotOf(collected: NbOutput[], state = 'succeeded'): JobSnapshot {
+function snapshotOf(collected: NbOutput[], state = 'succeeded', outputVersion = 0): JobSnapshot {
   return {
     cursor: 7,
     job: {
@@ -60,6 +60,7 @@ function snapshotOf(collected: NbOutput[], state = 'succeeded'): JobSnapshot {
           cellDeleted: false,
           outputIncomplete: false,
           outputAreaLost: false,
+          outputVersion,
           executionCount: 3
         }
       ]
@@ -84,14 +85,19 @@ function recordFor(store: OutputStore): ExecutionRecord {
 
 describe('the execution cursor', () => {
   it('round-trips the registry position and the delivered counts', () => {
-    const cursor = makeExecutionCursor(12, [3, 0, 7]);
-    expect(parseExecutionCursor(cursor, 3)).toEqual({ registryCursor: 12, delivered: [3, 0, 7] });
+    const positions = [
+      { version: 4, delivered: 3 },
+      { version: 0, delivered: 0 },
+      { version: 9, delivered: 7 }
+    ];
+    const cursor = makeExecutionCursor(12, positions);
+    expect(parseExecutionCursor(cursor, 3)).toEqual({ registryCursor: 12, positions });
   });
 
   it('handles a job with no cells', () => {
     expect(parseExecutionCursor(makeExecutionCursor(1, []), 0)).toEqual({
       registryCursor: 1,
-      delivered: []
+      positions: []
     });
   });
 
@@ -105,9 +111,18 @@ describe('the execution cursor', () => {
       return 'no-error';
     };
     expect(code('pg_x.0', 1)).toBe('CURSOR_EXPIRED');
-    expect(code(makeExecutionCursor(1, [0, 0]), 1)).toBe('CURSOR_EXPIRED');
+    expect(
+      code(
+        makeExecutionCursor(1, [
+          { version: 0, delivered: 0 },
+          { version: 0, delivered: 0 }
+        ]),
+        1
+      )
+    ).toBe('CURSOR_EXPIRED');
     expect(code('exc_x.0', 1)).toBe('CURSOR_EXPIRED');
     expect(code('exc_1.a', 1)).toBe('CURSOR_EXPIRED');
+    expect(code('exc_9007199254740992.0:0', 1)).toBe('CURSOR_EXPIRED');
   });
 });
 
@@ -201,16 +216,30 @@ describe('buildExecutionView', () => {
     expect(full.cells[0]?.outputs.map((entry) => entry.index)).toEqual([0, 1, 2, 3, 4]);
 
     const parsed = parseExecutionCursor(full.cursor, 1);
-    expect(parsed.delivered).toEqual([5]);
+    expect(parsed.positions).toEqual([{ version: 0, delivered: 5 }]);
 
     const next = buildExecutionView(recordFor(store), snapshot, {
       limits: DEFAULT_SERVICE_LIMITS,
-      delivered: parsed.delivered,
+      positions: parsed.positions,
       waitTimedOut: false,
       outputs: store
     });
     expect(next.cells[0]?.outputs).toHaveLength(0);
-    expect(parseExecutionCursor(next.cursor, 1).delivered).toEqual([5]);
+    expect(parseExecutionCursor(next.cursor, 1).positions).toEqual([
+      { version: 0, delivered: 5 }
+    ]);
+  });
+
+  it('rejects a delivered position past the current output version', () => {
+    const store = new OutputStore('sess_1', 1024 * 1024);
+    expect(() =>
+      buildExecutionView(recordFor(store), snapshotOf(outputs(1), 'succeeded', 3), {
+        limits: DEFAULT_SERVICE_LIMITS,
+        positions: [{ version: 3, delivered: 2 }],
+        waitTimedOut: false,
+        outputs: store
+      })
+    ).toThrowError(/past the current output state/u);
   });
 
   it('the byte budget cuts the list and says so', () => {
@@ -225,6 +254,45 @@ describe('buildExecutionView', () => {
     expect(cell.outputs.length).toBeLessThan(20);
     expect(cell.outputsTruncated).toBe(true);
     // The cursor stops where the answer stopped, so nothing is skipped.
-    expect(parseExecutionCursor(view.cursor, 1).delivered).toEqual([cell.outputs.length]);
+    expect(parseExecutionCursor(view.cursor, 1).positions).toEqual([
+      { version: 0, delivered: cell.outputs.length }
+    ]);
+  });
+
+  it('returns a mutable output again as a replacement after its version changes', () => {
+    const store = new OutputStore('sess_1', 1024 * 1024);
+    const first = buildExecutionView(recordFor(store), snapshotOf(outputs(1), 'succeeded', 1), {
+      limits: DEFAULT_SERVICE_LIMITS,
+      waitTimedOut: false,
+      outputs: store
+    });
+    const appended: NbOutput[] = [
+      { output_type: 'stream', name: 'stdout', text: 'line 0\nsecond\n' }
+    ];
+    const next = buildExecutionView(recordFor(store), snapshotOf(appended, 'succeeded', 2), {
+      limits: DEFAULT_SERVICE_LIMITS,
+      positions: parseExecutionCursor(first.cursor, 1).positions,
+      waitTimedOut: false,
+      outputs: store
+    });
+    expect(next.cells[0]?.outputsReset).toBe(true);
+    expect(next.cells[0]?.outputs.map((entry) => entry.output)).toEqual(appended);
+  });
+
+  it('reports an empty replacement when a later clear removes delivered outputs', () => {
+    const store = new OutputStore('sess_1', 1024 * 1024);
+    const first = buildExecutionView(recordFor(store), snapshotOf(outputs(2), 'succeeded', 1), {
+      limits: DEFAULT_SERVICE_LIMITS,
+      waitTimedOut: false,
+      outputs: store
+    });
+    const cleared = buildExecutionView(recordFor(store), snapshotOf([], 'succeeded', 2), {
+      limits: DEFAULT_SERVICE_LIMITS,
+      positions: parseExecutionCursor(first.cursor, 1).positions,
+      waitTimedOut: false,
+      outputs: store
+    });
+    expect(cleared.cells[0]?.outputs).toEqual([]);
+    expect(cleared.cells[0]?.outputsReset).toBe(true);
   });
 });

@@ -43,10 +43,12 @@ export interface ChangesPage {
 
 interface Pending {
   readonly cellId: string;
-  revisions: ChangeRevisions;
+  revisions: ChangeRevisionsSource;
   origin: 'local' | 'remote';
   dueAt: number;
 }
+
+type ChangeRevisionsSource = ChangeRevisions | (() => ChangeRevisions);
 
 /** Default ring size (SPEC.md §9: "10,000 events in the notebook journal"). */
 export const DEFAULT_JOURNAL_LIMIT = 10_000;
@@ -105,7 +107,11 @@ export class ChangeJournal {
    * Published immediately when the cell has not published within the window,
    * otherwise merged into the pending record and published by the timer.
    */
-  recordOutputs(cellId: string, revisions: ChangeRevisions, origin: 'local' | 'remote'): void {
+  recordOutputs(
+    cellId: string,
+    revisions: ChangeRevisionsSource,
+    origin: 'local' | 'remote'
+  ): void {
     const now = this.#now();
     const last = this.#lastPublished.get(cellId);
     const existing = this.#pending.get(cellId);
@@ -212,12 +218,17 @@ export class ChangeJournal {
 
   #emitOutputs(
     cellId: string,
-    revisions: ChangeRevisions,
+    revisions: ChangeRevisionsSource,
     origin: 'local' | 'remote',
     at: number
   ): void {
     const kind: ChangeKind = 'outputs_changed';
-    this.publish({ kind, cellId, revisions, origin });
+    this.publish({
+      kind,
+      cellId,
+      revisions: typeof revisions === 'function' ? revisions() : revisions,
+      origin
+    });
     this.#lastPublished.set(cellId, at);
   }
 

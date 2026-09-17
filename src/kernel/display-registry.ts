@@ -22,6 +22,8 @@ export interface OutputAreaRef {
   /** Notebook handle that owns the cell; display ids never cross notebooks. */
   readonly notebookId: string;
   readonly cellId: string;
+  /** Immutable identity of the shared cell object behind this coordinate. */
+  readonly identityToken: string;
   /** Output-area generation the reference was taken for. */
   readonly generation: number;
 }
@@ -34,7 +36,12 @@ export interface DisplayTarget extends OutputAreaRef {
 
 /** True when two references name the same output area. */
 export function sameOutputArea(a: OutputAreaRef, b: OutputAreaRef): boolean {
-  return a.notebookId === b.notebookId && a.cellId === b.cellId && a.generation === b.generation;
+  return (
+    a.notebookId === b.notebookId &&
+    a.cellId === b.cellId &&
+    a.identityToken === b.identityToken &&
+    a.generation === b.generation
+  );
 }
 
 /** Default cap on distinct display ids kept per kernel (SPEC.md §9 limits). */
@@ -100,8 +107,13 @@ export class DisplayRegistry {
    * Called when that generation is replaced or cleared: the indices it
    * recorded no longer mean anything (SPEC.md §8, output-area generations).
    */
-  forgetGeneration(notebookId: string, cellId: string, generation: number): void {
-    const area: OutputAreaRef = { notebookId, cellId, generation };
+  forgetGeneration(
+    notebookId: string,
+    cellId: string,
+    identityToken: string,
+    generation: number
+  ): void {
+    const area: OutputAreaRef = { notebookId, cellId, identityToken, generation };
     for (const [displayId, list] of this.#targets) {
       const kept = list.filter((t) => !sameOutputArea(t, area));
       if (kept.length === list.length) continue;

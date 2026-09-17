@@ -92,15 +92,25 @@ Never run notebook code with a shell tool instead: it would be invisible.
   the user (or another agent) changed the cell. Re-read, decide again, then
   re-apply with the new revision. Do not force the old text back.
 - `NOT_READY` is retryable; `RTC_SESSION_REJECTED`, `RTC_CONFLICT`,
-  `FILE_ID_CHANGED` mean this replica is dead - open the notebook again and
-  start from a fresh read. `HANDLE_EXPIRED` after a server restart: open a new
-  session/notebook, never replay code.
+  `FILE_ID_CHANGED` mean this replica is dead. Do not call `notebook_open`
+  immediately: the same session would reuse the terminal handle. First let
+  every execution on that handle reach a terminal state with `execution_get`,
+  then call `notebook_close`; do not force-close or interrupt active work merely
+  to recover. Open the notebook again only after the close, require a new
+  `notebook_id` in `ready` state, and start from a fresh read. If the old handle
+  is already expired, skip its close. `HANDLE_EXPIRED` after a server restart:
+  open a new session/notebook, never replay code.
 - Job state `unknown` or `OPERATION_UNCERTAIN`: the request was sent and the
   confirmation was lost. Check the notebook and the kernel (`kernel_status`,
   `notebook_read view: outputs`) and tell the user what you found. Do not
   re-run the cell on your own.
 - `notebook_save {notebook_id}` returns `save_status` and
-  `revision_persistence`; `skipped` and `timeout` are not success.
+  `revision_persistence`; `skipped` and `timeout` are not success. Every open
+  MCP replica advertises `autosave: true`, which keeps Jupyter collaboration
+  autosave enabled even when another participant advertises `autosave: false`.
+  Keep the handle open until the requested save or autosave opportunity has
+  completed, and never present autosave as confirmation of a particular
+  revision.
 
 ## 6. Closing vs interrupting vs restarting vs shutting down
 
@@ -163,7 +173,7 @@ Tell the user the server is up and let them configure the token themselves.
  "wait_ms":2000}
 // -> execution_id "ex_1", state "running", next_request_id "3"
 // 5. execution_get {"execution_id":"ex_1","cursor":"...","wait_ms":5000}
-//    -> state "ok" | "failed", outputs, output_id for the plot
+//    -> state "succeeded" | "failed", outputs, output_id for the plot
 // 6. notebook_changes {"notebook_id":"nb_A","cursor":"c7"} to see what the
 //    user did meanwhile; notebook_save {"notebook_id":"nb_A"} if asked.
 ```

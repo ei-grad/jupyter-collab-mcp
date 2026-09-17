@@ -93,10 +93,12 @@ an invented partial payload. Hosts without resource support can use the same
 ### Response size
 
 The budget is 64 KiB per response (`ServiceLimits.responseMaxBytes`). If the
-payload does not fit, `boundPayload` reduces it in a fixed order: first remove
-inline payloads that have an `output_id`, then halve the longest list. The
-result is always marked `response_truncated: true` and includes `read_more`
-instructions. The text block is truncated on a code-point boundary.
+payload does not fit, `boundPayload` first removes inline payloads that have an
+`output_id`, then shortens only a page whose returned cursor can be moved to
+the last retained item. The final size check includes `response_truncated` and
+`read_more`. A scalar or non-pageable collection that still cannot fit returns
+`RESOURCE_LIMIT` instead of an oversized or lossy success. The text block is
+truncated on a code-point boundary.
 
 ## CLI
 
@@ -104,6 +106,7 @@ instructions. The text block is truncated on a code-point boundary.
 jupyter-collab-mcp [--config <file.json>] [--discover]
                    [--user-name <name>] [--user-color <#rrggbb>]
                    [--log-level silent|error|warn|info|debug]
+jupyter-collab-mcp --http
 ```
 
 The order in `runCli()` is fixed: call `installStdoutGuard()` **first**, before
@@ -116,6 +119,11 @@ the legacy era. stdout carries MCP only; all diagnostics go to stderr.
 `default` profile. `--config` accepts `ServiceConfigInput`
 (`{servers, discovery, limits, awarenessUser}`). Tokens never appear in tool
 arguments, responses, or resource URIs; profiles store only `credentialRef`.
+
+`--http` selects the authenticated hosted mode documented in
+`gateway/README.md`. It uses the same executable and starts one isolated stdio
+worker per verified credential generation; its configuration comes only from
+`JUPYTER_MCP_*` environment variables.
 
 `service.shutdown(reason)` is called on `SIGINT`, `SIGTERM`, and stdin EOF. If
 it misses the five-second deadline, the process exits anyway. Kernels are never

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { NbOutput } from '../../../src/core/index.js';
 import {
@@ -157,6 +157,39 @@ describe('output generations (SPEC.md §8)', () => {
     expect(sink.updateOutput(-1, stdout('nope'))).toBe(false);
     const outputs = sink.getOutputs() as { text: string }[];
     expect(outputs.map((output) => output.text)).toEqual(['one', 'TWO']);
+  });
+
+  it('extends a stream through its existing Y.Text instead of replacing the output', () => {
+    const peer = makePeer(notebookWith([codeCell('a', 'x')]));
+    cleanups.push(() => peer.dispose());
+    const sink = peer.model.beginExecutionGeneration('a')!;
+    sink.appendOutput(stdout('line 1\n'));
+    const cell = codeCellAt(peer.notebook, 0);
+    const sharedOutput = cell.youtputs.get(0);
+    const sharedText = sharedOutput.get('text');
+
+    expect(sink.appendStream(0, 'line 2\n')).toBe(true);
+    expect(cell.youtputs.get(0)).toBe(sharedOutput);
+    expect(cell.youtputs.get(0).get('text')).toBe(sharedText);
+    expect(sharedText.toString()).toBe('line 1\nline 2\n');
+  });
+
+  it('does not materialise the full output for each coalesced stream delta', () => {
+    const peer = makePeer(
+      notebookWith([codeCell('a', 'x')]),
+      { outputsCoalesceMs: 60_000 }
+    );
+    cleanups.push(() => peer.dispose());
+    const sink = peer.model.beginExecutionGeneration('a')!;
+    sink.appendOutput(stdout(''));
+    const cell = codeCellAt(peer.notebook, 0);
+    const getOutputs = vi.spyOn(cell, 'getOutputs');
+
+    for (let index = 0; index < 2_000; index += 1) {
+      expect(sink.appendStream(0, 'x')).toBe(true);
+    }
+
+    expect(getOutputs).not.toHaveBeenCalled();
   });
 
   it('finishExecution writes the count and idle together, and only while current', () => {

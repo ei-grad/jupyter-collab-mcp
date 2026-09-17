@@ -9,6 +9,7 @@
  * - `core/notebook`   - the shared notebook model over `@jupyter/ydoc`;
  * - `jupyter`         - HTTP client, RTC connection and the stdout guard;
  * - `kernel`          - kernel messaging, the output reducer and job queue;
+ * - `service`         - the stateful `CollabService` implementation;
  * - `mcp`             - the MCP stdio adapter over `CollabService`.
  *
  * The layering of SPEC.md §1 still holds: `core` knows nothing about MCP, and
@@ -21,6 +22,8 @@ export * from './core/index.js';
 export * from './core/notebook/index.js';
 export * from './jupyter/index.js';
 export * from './kernel/index.js';
+export { createCollabService, DEFAULT_OUTPUT_STORE_BYTES } from './service/index.js';
+export type { CollabServiceOptions } from './service/index.js';
 export * from './mcp/index.js';
 
 /**

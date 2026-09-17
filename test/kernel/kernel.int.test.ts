@@ -278,7 +278,12 @@ describe('job control', () => {
     for (const [index, code] of ['raise ValueError("first")', 'print("second")'].entries()) {
       const sent = kernel.requestExecute(code, { cellId: `pipelined_${index}` });
       const reducer = createExecutionReducer({
-        area: { notebookId: NOTEBOOK.notebookId, cellId: `pipelined_${index}`, generation: 1 },
+        area: {
+          notebookId: NOTEBOOK.notebookId,
+          cellId: `pipelined_${index}`,
+          identityToken: `id:pipelined_${index}`,
+          generation: 1
+        },
         msgId: sent.msgId,
         displays: kernel.displays
       });

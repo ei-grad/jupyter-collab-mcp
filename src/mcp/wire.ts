@@ -134,8 +134,18 @@ export interface BoundedPayload {
   readonly readMore?: string;
 }
 
-/** Array members that may be shortened, in the order they are tried. */
-const PAGEABLE_ARRAYS = ['cells', 'entries', 'events', 'resources', 'servers', 'running', 'results'];
+/** A payload cannot be reduced without losing data that has no continuation. */
+export class WireBudgetError extends Error {
+  readonly byteSize: number;
+  readonly maxBytes: number;
+
+  constructor(byteSize: number, maxBytes: number) {
+    super(`the structured response is ${byteSize} bytes, above the ${maxBytes}-byte response budget`);
+    this.name = 'WireBudgetError';
+    this.byteSize = byteSize;
+    this.maxBytes = maxBytes;
+  }
+}
 
 function isObject(value: WireValue): value is WireObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -156,7 +166,9 @@ function dropInlinedOutputs(value: WireValue): { value: WireValue; dropped: numb
     if (Array.isArray(node)) return node.map(walk);
     if (!isObject(node)) return node;
     const next: WireObject = {};
-    for (const [key, child] of Object.entries(node)) next[key] = walk(child);
+    for (const [key, child] of Object.entries(node)) {
+      next[key] = OPAQUE_KEYS.has(key) ? child : walk(child);
+    }
     const hasSnapshot = isObject(next['snapshot'] ?? null) || typeof next['output_id'] === 'string';
     if (hasSnapshot && (next['output'] !== undefined || next['text_preview'] !== undefined)) {
       delete next['output'];
@@ -169,27 +181,87 @@ function dropInlinedOutputs(value: WireValue): { value: WireValue; dropped: numb
   return { value: walk(value), dropped };
 }
 
-function shortenArrays(payload: WireObject): boolean {
-  let longestKey: string | undefined;
-  let longest = 1;
-  for (const key of PAGEABLE_ARRAYS) {
-    const candidate = payload[key];
-    if (Array.isArray(candidate) && candidate.length > longest) {
-      longest = candidate.length;
-      longestKey = key;
+/**
+ * Shorten only pages whose continuation can be moved to the last item kept:
+ * journal sequences, indexed notebook cells, and offset-based directory or
+ * resource pages. Other arrays are deliberately not shortened here because
+ * their opaque cursor may already point past the whole page.
+ */
+function shortenRecoverableArray(payload: WireObject): boolean {
+  const candidate = payload['events'];
+  if (Array.isArray(candidate) && candidate.length > 1) {
+    const kept = candidate.slice(0, Math.max(1, Math.floor(candidate.length / 2)));
+    const last = kept[kept.length - 1];
+    if (last !== undefined && isObject(last) && Number.isSafeInteger(last['sequence'])) {
+      payload['events'] = kept;
+      payload['next_cursor'] = `chg_${String(last['sequence'])}`;
+      payload['truncated'] = true;
+      return true;
     }
   }
-  if (longestKey === undefined) {
-    // Nothing at the top level: try one level down (e.g. `summary.cells`).
-    for (const child of Object.values(payload)) {
-      if (isObject(child) && shortenArrays(child)) return true;
+
+  const cells = payload['cells'];
+  const pageCursorKey =
+    typeof payload['page_cursor'] === 'string'
+      ? 'page_cursor'
+      : typeof payload['next_cursor'] === 'string'
+        ? 'next_cursor'
+        : undefined;
+  if (Array.isArray(cells) && cells.length > 1 && pageCursorKey !== undefined) {
+    const kept = cells.slice(0, Math.max(1, Math.floor(cells.length / 2)));
+    const last = kept[kept.length - 1];
+    const cursor = payload[pageCursorKey];
+    if (last !== undefined && isObject(last) && Number.isSafeInteger(last['index']) && typeof cursor === 'string') {
+      const dot = cursor.lastIndexOf('.');
+      if (cursor.startsWith('pg_') && dot > 3) {
+        payload['cells'] = kept;
+        payload[pageCursorKey] = `${cursor.slice(0, dot + 1)}${String(Number(last['index']) + 1)}`;
+        payload['truncated'] = true;
+        return true;
+      }
     }
-    return false;
   }
-  const array = payload[longestKey] as WireValue[];
-  payload[longestKey] = array.slice(0, Math.max(1, Math.floor(array.length / 2)));
-  payload['truncated'] = true;
-  return true;
+
+  for (const key of ['entries', 'resources']) {
+    const array = payload[key];
+    const cursor = payload['next_cursor'];
+    if (!Array.isArray(array) || array.length <= 1 || typeof cursor !== 'string') continue;
+    const match = /^dir_(0|[1-9][0-9]*)$/.exec(cursor);
+    if (match === null) continue;
+    const kept = array.slice(0, Math.max(1, Math.floor(array.length / 2)));
+    const pageEnd = Number(match[1]);
+    payload[key] = kept;
+    payload['next_cursor'] = `dir_${String(pageEnd - array.length + kept.length)}`;
+    payload['truncated'] = true;
+    return true;
+  }
+
+  for (const [key, child] of Object.entries(payload)) {
+    if (OPAQUE_KEYS.has(key)) continue;
+    if (!isObject(child)) continue;
+    const previousChildCursor =
+      typeof child['page_cursor'] === 'string'
+        ? child['page_cursor']
+        : typeof child['next_cursor'] === 'string'
+          ? child['next_cursor']
+          : undefined;
+    if (!shortenRecoverableArray(child)) continue;
+    const childCursor =
+      typeof child['page_cursor'] === 'string'
+        ? child['page_cursor']
+        : typeof child['next_cursor'] === 'string'
+          ? child['next_cursor']
+          : undefined;
+    if (
+      previousChildCursor !== undefined &&
+      payload['next_cursor'] === previousChildCursor &&
+      childCursor !== undefined
+    ) {
+      payload['next_cursor'] = childCursor;
+    }
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -197,13 +269,14 @@ function shortenArrays(payload: WireObject): boolean {
  *
  * 1. inlined output payloads that have an `output_id` are dropped - they are
  *    read with `output_read` or the matching `jupyter-output:` resource;
- * 2. the longest pageable list is halved, repeatedly;
+ * 2. a recognized journal, notebook-cell, directory, or resource page is
+ *    halved and its cursor is moved to the last item actually retained;
  * 3. whatever survives is marked `response_truncated` with a `read_more` note.
  *
- * Step 2 can only shrink a list the service already paginates, so a caller
- * that needs everything re-reads with smaller `limits` and the returned
- * cursor. Nothing is ever silently discarded: the payload always says that it
- * was cut.
+ * Arrays without a continuation known to this layer are never sliced. If
+ * dropping recoverable outputs and safely paging journal events is not enough,
+ * {@link WireBudgetError} makes the tool return a bounded `RESOURCE_LIMIT`
+ * error instead of silently losing records or exceeding the advertised cap.
  */
 export function boundPayload(payload: WireObject, maxBytes: number): BoundedPayload {
   if (jsonByteSize(payload) <= maxBytes) return { payload, truncated: false };
@@ -215,16 +288,23 @@ export function boundPayload(payload: WireObject, maxBytes: number): BoundedPayl
     reasons.push(`${stripped.dropped} output payload(s) omitted — read them with output_read(output_id) or the jupyter-output: resource`);
   }
 
-  let guard = 64;
-  while (jsonByteSize(current) > maxBytes && guard-- > 0) {
-    if (!shortenArrays(current)) break;
-    if (!reasons.includes('list shortened — repeat the call with smaller limits and the returned cursor')) {
-      reasons.push('list shortened — repeat the call with smaller limits and the returned cursor');
-    }
+  if (stripped.dropped > 0) {
+    current['response_truncated'] = true;
+    current['read_more'] = reasons.join('; ');
   }
 
-  current['response_truncated'] = true;
-  const readMore = reasons.length > 0 ? reasons.join('; ') : 'response exceeded the byte budget — repeat the call with smaller limits';
-  current['read_more'] = readMore;
+  let guard = 64;
+  while (jsonByteSize(current) > maxBytes && guard-- > 0) {
+    if (!shortenRecoverableArray(current)) break;
+    if (!reasons.includes('page shortened — continue with the returned cursor')) {
+      reasons.push('page shortened — continue with the returned cursor');
+    }
+    current['response_truncated'] = true;
+    current['read_more'] = reasons.join('; ');
+  }
+
+  const byteSize = jsonByteSize(current);
+  if (byteSize > maxBytes) throw new WireBudgetError(byteSize, maxBytes);
+  const readMore = reasons.join('; ');
   return { payload: current, truncated: true, readMore };
 }

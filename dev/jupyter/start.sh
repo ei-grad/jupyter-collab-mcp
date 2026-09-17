@@ -38,7 +38,10 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 
-cd "$HERE"
+# SQLiteYStore resolves its database path against the server process cwd.
+# Keep every stand's persistence under its port-specific runtime directory so
+# independently assigned ports cannot contend for one database.
+cd "$RUNTIME"
 
 : > "$LOGFILE"
 nohup uv run --project "$HERE" jupyter lab \

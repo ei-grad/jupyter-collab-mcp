@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { boundPayload, boundText, camelKey, fromWire, jsonByteSize, snakeKey, toWire } from '../../src/mcp/index.js';
+import {
+  WireBudgetError,
+  boundPayload,
+  boundText,
+  camelKey,
+  fromWire,
+  jsonByteSize,
+  snakeKey,
+  toWire
+} from '../../src/mcp/index.js';
 import type { WireObject } from '../../src/mcp/wire.js';
 
 describe('key naming', () => {
@@ -93,20 +102,29 @@ describe('boundPayload', () => {
     expect(bounded.readMore).toContain('output_read');
   });
 
-  it('halves a long list rather than exceeding the budget', () => {
+  it('refuses to slice a list whose omitted records have no usable cursor', () => {
     const payload = {
       entries: Array.from({ length: 200 }, (_unused, index) => ({ path: `f${String(index)}`, note: 'x'.repeat(100) }))
     } as unknown as WireObject;
-    const bounded = boundPayload(payload, 2048);
-    expect(jsonByteSize(bounded.payload)).toBeLessThanOrEqual(2048);
-    expect(bounded.payload['response_truncated']).toBe(true);
-    expect((bounded.payload['entries'] as unknown[]).length).toBeLessThan(200);
+    expect(() => boundPayload(payload, 2048)).toThrow(WireBudgetError);
   });
 
   it('never mutates the payload it was given', () => {
     const payload = { entries: Array.from({ length: 100 }, () => ({ note: 'x'.repeat(100) })) } as unknown as WireObject;
     const before = JSON.stringify(payload);
-    boundPayload(payload, 512);
+    expect(() => boundPayload(payload, 512)).toThrow(WireBudgetError);
+    expect(JSON.stringify(payload)).toBe(before);
+  });
+
+  it('never treats arrays inside notebook metadata as pageable protocol fields', () => {
+    const payload = {
+      notebook_metadata: {
+        events: Array.from({ length: 50 }, (_unused, sequence) => ({ sequence, note: 'x'.repeat(30) }))
+      },
+      next_cursor: 'chg_50'
+    } as unknown as WireObject;
+    const before = JSON.stringify(payload);
+    expect(() => boundPayload(payload, 600)).toThrow(WireBudgetError);
     expect(JSON.stringify(payload)).toBe(before);
   });
 });

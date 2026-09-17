@@ -46,7 +46,7 @@ import type {
   SessionCloseRequest,
   SessionOpenRequest
 } from '../core/index.js';
-import { TOOL_SPECS } from './schemas.js';
+import { TOOL_SPECS, TOOL_SPECS_BY_NAME } from './schemas.js';
 import type { ToolSpec } from './schemas.js';
 import {
   DEFAULT_RESPONSE_MAX_BYTES,
@@ -54,7 +54,8 @@ import {
   boundText,
   fromWire,
   jsonByteSize,
-  toWire
+  toWire,
+  WireBudgetError
 } from './wire.js';
 import type { WireObject, WireValue } from './wire.js';
 
@@ -266,8 +267,9 @@ interface ExtractedContent {
 }
 
 /**
- * Walk a wire payload, lift image payloads into MCP `image` content and add a
- * `resource_link` for every snapshot that stays behind an `output_id`.
+ * Visit protocol output entries, lift image payloads into MCP `image` content
+ * and add a `resource_link` for every snapshot that stays behind an
+ * `output_id`.
  *
  * An image that becomes a content block is removed from `structuredContent`
  * and marked `delivered_as: "image"`, so its base64 is not repeated in the
@@ -275,21 +277,18 @@ interface ExtractedContent {
  * `output_id`: the bytes are read with `output_read` or the
  * `jupyter-output:` resource.
  */
-function extractOutputContent(payload: WireObject, options: ResolvedOptions): ExtractedContent {
+function extractOutputContent(tool: string, payload: WireObject, options: ResolvedOptions): ExtractedContent {
   const blocks: ContentBlock[] = [];
   let images = 0;
   let links = 0;
   const seenUris = new Set<string>();
 
-  const walk = (node: WireValue): WireValue => {
-    if (Array.isArray(node)) return node.map(walk);
+  const extractEntry = (node: WireValue): WireValue => {
     if (!isObject(node)) return node;
+    const looksLikeOutputEntry = typeof node['output_type'] === 'string' && typeof node['index'] === 'number';
+    if (!looksLikeOutputEntry) return node;
 
-    const next: WireObject = {};
-    for (const [key, child] of Object.entries(node)) next[key] = walk(child);
-
-    const looksLikeOutputEntry = typeof next['output_type'] === 'string' && typeof next['index'] === 'number';
-    if (!looksLikeOutputEntry) return next;
+    const next: WireObject = { ...node };
 
     const snapshot = isObject(next['snapshot']) ? next['snapshot'] : undefined;
     const image = inlineImage(next['output']);
@@ -321,7 +320,17 @@ function extractOutputContent(payload: WireObject, options: ResolvedOptions): Ex
     return next;
   };
 
-  return { payload: walk(payload) as WireObject, blocks };
+  if (!['notebook_read', 'notebook_execute', 'execution_get'].includes(tool)) {
+    return { payload, blocks };
+  }
+
+  const cells = payload['cells'];
+  if (!Array.isArray(cells)) return { payload, blocks };
+  const mappedCells = cells.map((cell) => {
+    if (!isObject(cell) || !Array.isArray(cell['outputs'])) return cell;
+    return { ...cell, outputs: cell['outputs'].map(extractEntry) };
+  });
+  return { payload: { ...payload, cells: mappedCells }, blocks };
 }
 
 // ---------------------------------------------------------------------------
@@ -675,8 +684,45 @@ function registerTool(
 function buildResult(tool: string, result: unknown, options: ResolvedOptions): CallToolResult {
   const wire = toWire(result);
   const base: WireObject = typeof wire === 'object' && wire !== null && !Array.isArray(wire) ? wire : { result: wire };
-  const extracted = extractOutputContent(base, options);
-  const bounded = boundPayload(extracted.payload, options.responseMaxBytes);
+  const extracted = extractOutputContent(tool, base, options);
+  let bounded;
+  try {
+    bounded = boundPayload(extracted.payload, options.responseMaxBytes);
+  } catch (error) {
+    if (!(error instanceof WireBudgetError)) throw error;
+    const executionId =
+      typeof extracted.payload['execution_id'] === 'string'
+        ? extracted.payload['execution_id']
+        : undefined;
+    const requestAccepted =
+      typeof extracted.payload['request_accepted'] === 'boolean'
+        ? extracted.payload['request_accepted']
+        : undefined;
+    const nextRequestId =
+      typeof extracted.payload['next_request_id'] === 'string' ||
+      extracted.payload['next_request_id'] === null
+        ? extracted.payload['next_request_id']
+        : undefined;
+    throw coreError(
+      'RESOURCE_LIMIT',
+      `${tool} cannot fit one recoverable result in the response budget; retry with smaller limits or a narrower cell selection`,
+      {
+        details: {
+          byte_size: error.byteSize,
+          max_bytes: error.maxBytes,
+          ...(executionId === undefined ? {} : { execution_id: executionId }),
+          ...(requestAccepted === undefined ? {} : { request_accepted: requestAccepted }),
+          ...(nextRequestId === undefined ? {} : { next_request_id: nextRequestId })
+        },
+        sideEffects:
+          TOOL_SPECS_BY_NAME.get(tool)?.readOnly === true
+            ? 'none'
+            : requestAccepted === true
+              ? 'applied'
+              : 'unknown'
+      }
+    );
+  }
   const text = boundText(renderText(tool, bounded.payload), options.responseMaxBytes).text;
   return {
     content: [{ type: 'text', text }, ...extracted.blocks],
@@ -685,11 +731,11 @@ function buildResult(tool: string, result: unknown, options: ResolvedOptions): C
 }
 
 function registerOutputResources(server: McpServer, service: CollabService, options: ResolvedOptions): void {
-  const listSnapshots = async (): Promise<{
+  const listSnapshots = async (cursor?: string): Promise<{
     resources: { uri: string; name: string; mimeType: string; description: string }[];
     nextCursor?: string;
   }> => {
-    const listed = await service.listOutputResources();
+    const listed = await service.listOutputResources(cursor);
     return {
       resources: listed.resources.map((entry) => ({
         uri: entry.uri,
@@ -748,7 +794,7 @@ function registerOutputResources(server: McpServer, service: CollabService, opti
   // an answer carries is the long one and `{output_id}` does not span "/".
   server.registerResource(
     'jupyter-output',
-    new ResourceTemplate(OUTPUT_URI_TEMPLATE, { list: listSnapshots }),
+    new ResourceTemplate(OUTPUT_URI_TEMPLATE, { list: () => listSnapshots() }),
     metadata,
     readSnapshot
   );
@@ -757,5 +803,11 @@ function registerOutputResources(server: McpServer, service: CollabService, opti
     new ResourceTemplate(OUTPUT_URI_TEMPLATE_SESSION, { list: undefined }),
     metadata,
     readSnapshot
+  );
+  // McpServer's resource-template aggregation drops the page cursor. Install
+  // the protocol handler explicitly so `resources/list` preserves the
+  // service's continuation contract across both stdio and HTTP transports.
+  server.server.setRequestHandler('resources/list', (request) =>
+    listSnapshots(request.params?.cursor)
   );
 }

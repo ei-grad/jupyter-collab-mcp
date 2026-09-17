@@ -11,9 +11,9 @@
  *
  * The module also owns the `execution_get` cursor. A job's cell list is fixed
  * at submission, so the cursor is simply the registry change counter plus the
- * number of outputs already delivered per cell - which is exactly what
- * SPEC.md §9 asks for: "Reading the remainder of an unchanged large output
- * must not retransmit parts already returned."
+ * output-state version and the number of entries delivered from that version.
+ * A mutable stream, display update or clear starts a new version; pagination
+ * within an unchanged version still never retransmits an entry.
  *
  * @module
  */
@@ -139,20 +139,28 @@ export function watchJob(record: ExecutionRecord, stopped: () => boolean): void 
 
 const CURSOR_PREFIX = 'exc_';
 
-/** Build the cursor of an answer: registry position plus delivered counts. */
+/** One cell position encoded in an execution cursor. */
+export interface ExecutionOutputPosition {
+  readonly version: number;
+  readonly delivered: number;
+}
+
+/** Build the cursor of an answer: registry position plus per-cell positions. */
 export function makeExecutionCursor(
   registryCursor: number,
-  delivered: readonly number[]
+  positions: readonly ExecutionOutputPosition[]
 ): ExecutionCursor {
-  return `${CURSOR_PREFIX}${registryCursor}.${delivered.join('-')}` as ExecutionCursor;
+  return `${CURSOR_PREFIX}${registryCursor}.${positions
+    .map(({ version, delivered }) => `${version}:${delivered}`)
+    .join('-')}` as ExecutionCursor;
 }
 
 /** What one parsed execution cursor says. */
 export interface ParsedExecutionCursor {
   /** Registry change counter the previous answer was taken at. */
   readonly registryCursor: number;
-  /** Outputs already delivered, per cell, in job order. */
-  readonly delivered: readonly number[];
+  /** Output version and entries already delivered, per cell, in job order. */
+  readonly positions: readonly ExecutionOutputPosition[];
 }
 
 /**
@@ -174,15 +182,21 @@ export function parseExecutionCursor(value: string, cellCount: number): ParsedEx
   if (dot < 0) return fail();
   const head = body.slice(0, dot);
   if (!/^(0|[1-9][0-9]*)$/.test(head)) return fail();
+  const registryCursor = Number(head);
+  if (!Number.isSafeInteger(registryCursor)) return fail();
   const counts = body.slice(dot + 1);
   const parts = counts === '' ? [] : counts.split('-');
   if (parts.length !== cellCount) return fail();
-  const delivered: number[] = [];
+  const positions: ExecutionOutputPosition[] = [];
   for (const part of parts) {
-    if (!/^(0|[1-9][0-9]*)$/.test(part)) return fail();
-    delivered.push(Number(part));
+    const match = /^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$/.exec(part);
+    if (match === null) return fail();
+    const version = Number(match[1]);
+    const delivered = Number(match[2]);
+    if (!Number.isSafeInteger(version) || !Number.isSafeInteger(delivered)) return fail();
+    positions.push({ version, delivered });
   }
-  return { registryCursor: Number(head), delivered };
+  return { registryCursor, positions };
 }
 
 // ---------------------------------------------------------------------------
@@ -193,8 +207,8 @@ export function parseExecutionCursor(value: string, cellCount: number): ParsedEx
 export interface ExecutionViewOptions {
   readonly limits: ServiceLimits;
   readonly requested?: ResponseLimits | undefined;
-  /** Outputs already delivered per cell; `null` returns everything. */
-  readonly delivered?: readonly number[] | null;
+  /** Output version and delivered position per cell; `null` returns everything. */
+  readonly positions?: readonly ExecutionOutputPosition[] | null;
   readonly waitTimedOut: boolean;
   readonly outputs: OutputStore;
 }
@@ -276,6 +290,7 @@ export function toOutputEntry(
 function cellView(
   cell: KernelCellRecord,
   from: number,
+  outputsReset: boolean,
   budget: { remaining: number; maxOutputBytes: number },
   address: { notebookId: string; executionId: string },
   store: OutputStore
@@ -309,6 +324,7 @@ function cellView(
     cellDeleted: cell.cellDeleted,
     outputIncomplete: cell.outputIncomplete,
     outputs: entries,
+    outputsReset,
     outputsTruncated: truncated
   };
 }
@@ -323,13 +339,27 @@ export function buildExecutionView(
   const budget = { remaining: limits.maxBytes, maxOutputBytes: limits.maxOutputBytes };
   const address = { notebookId: record.notebookId, executionId: record.executionId };
   const cells: ExecutionCellView[] = [];
-  const deliveredNow: number[] = [];
+  const positions: ExecutionOutputPosition[] = [];
   snapshot.job.cells.forEach((cell, position) => {
-    const from = options.delivered?.[position] ?? 0;
-    const view = cellView(cell, Math.min(from, cell.outputsCollected.length), budget, address, options.outputs);
+    const previous = options.positions?.[position];
+    const sameVersion = previous?.version === cell.outputVersion;
+    if (sameVersion && previous.delivered > cell.outputsCollected.length) {
+      throw coreError('CURSOR_EXPIRED', 'the execution cursor is past the current output state', {
+        details: { cell_id: cell.cellId }
+      });
+    }
+    const from = sameVersion ? previous.delivered : 0;
+    const view = cellView(
+      cell,
+      Math.min(from, cell.outputsCollected.length),
+      previous !== undefined && !sameVersion,
+      budget,
+      address,
+      options.outputs
+    );
     cells.push(view);
     const last = view.outputs.length === 0 ? from : view.outputs[view.outputs.length - 1]!.index + 1;
-    deliveredNow.push(Math.max(from, last));
+    positions.push({ version: cell.outputVersion, delivered: Math.max(from, last) });
   });
   return {
     executionId: record.executionId,
@@ -342,7 +372,7 @@ export function buildExecutionView(
     createdAt: snapshot.job.createdAt,
     ...(snapshot.job.finishedAt === undefined ? {} : { finishedAt: snapshot.job.finishedAt }),
     ...(snapshot.job.reason === undefined ? {} : { reason: snapshot.job.reason }),
-    cursor: makeExecutionCursor(snapshot.cursor, deliveredNow),
+    cursor: makeExecutionCursor(snapshot.cursor, positions),
     waitTimedOut: options.waitTimedOut,
     lifetime: {
       scope: 'until_session_close',

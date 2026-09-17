@@ -386,6 +386,14 @@ describe('ExecutionRegistry: output area ownership and waiting', () => {
     const woken = await pending;
     expect(woken.cursor).toBeGreaterThan(immediate.cursor);
     expect(woken.job.cells[0]?.outputsCollected).toHaveLength(1);
+    expect(woken.job.cells[0]?.outputVersion).toBe(1);
+
+    request.deliver(fx.stream(request.msgId, 'stdout', ' tock'));
+    const appended = registry.get(id)!;
+    expect(appended.job.cells[0]?.outputsCollected).toEqual([
+      { output_type: 'stream', name: 'stdout', text: 'tick tock' }
+    ]);
+    expect(appended.job.cells[0]?.outputVersion).toBe(2);
 
     kernel.completeLast(1);
     await flush();

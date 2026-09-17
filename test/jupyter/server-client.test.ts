@@ -140,7 +140,8 @@ describe('ServerClient happy paths', () => {
     const settings = client.serverSettings();
     expect(settings.baseUrl).toBe(`${server.baseUrl}/user/alice/`);
     expect(settings.wsUrl).toBe(`${server.baseUrl.replace('http', 'ws')}/user/alice/`);
-    expect(settings.appendToken).toBe(true);
+    expect(settings.appendToken).toBe(false);
+    expect(settings.token).toBe('');
     // The same settings object is reused, so the kernel layer shares one config.
     expect(client.serverSettings()).toBe(settings);
 

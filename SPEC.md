@@ -140,15 +140,23 @@ explicitly reopens the document; unfinished code is not automatically retried.
 Creation-tool descriptions and responses state lifetimes: sessions/notebooks
 last until explicitly closed or the process exits; executions and their output
 resources last until the working session closes. An unusable RTC handle retains
-diagnostics until close, but no longer permits writes. Active handles are not
-evicted to admit new ones. This is application policy, and `HANDLE_EXPIRED` is
-its code, not an MCP protocol code.
+diagnostics until close, but no longer permits writes. Reopening the same file
+in that working session still returns the existing handle, including a terminal
+one; recovery therefore closes the terminal handle before opening and waiting
+for a new ready replica. Active execution must first reach a terminal result or
+be abandoned by an explicit caller decision. Active handles are not evicted to
+admit new ones. This is application policy, and `HANDLE_EXPIRED` is its code,
+not an MCP protocol code.
 [MCP: Stateful Tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#stateful-tools)
 
 The kernel request queue is shared by all handles in this process with the same
 `server_id + kernel_id`. It orders only this client's requests: a browser and
 other processes may use the same kernel. The client does not promise an
-independent variable namespace or a global execution lock.
+independent variable namespace or a global execution lock. Invalidating a
+shared connection must make a later acquisition independent of every lease on
+the invalidated connection. A handle with an invalidated lease reacquires
+before its next kernel operation; releasing an old lease must not close its
+replacement.
 
 `notebook_close` releases its RTC connection. `session_close` closes the
 session's notebooks and subscriptions. By default, both refuse to close during
@@ -300,7 +308,7 @@ v5.0.2, transitions are determined by these signals:
 | --- | --- |
 | Network loss of the WebSocket without a terminal signal | `ready → reconnecting → syncing → ready`; retain the replica, verify the same fileId, and await a new synchronization |
 | 1003, JSON `reason: unknown_session` or `version_mismatch` | `failed`, error `RTC_SESSION_REJECTED`; disable auto-reconnect and never resynchronize this Y.Doc |
-| 1003, `initialization_error`, or an unknown/unparseable reason | `failed`, `RTC_INITIALIZATION_FAILED`; retain safe diagnostics and do not guess compatibility |
+| 1003, `initialization_error`, or an unknown/unparseable reason | `failed`, `RTC_INITIALIZATION_FAILED`; retain only recognized reason names in diagnostics and do not guess compatibility |
 | 4400 / 4404 | `failed`, respectively `RTC_BAD_REQUEST` / `NOTEBOOK_NOT_FOUND` |
 | 4500 | Bounded initialization retries; after exhausting the budget, `failed`, `RTC_INITIALIZATION_FAILED` |
 | RAW JSON `{"type":"conflict"}` | Emit `conflict`, then `failed` / `RTC_CONFLICT`; immediately stop sending updates and writing outputs to the shared document |
@@ -340,8 +348,10 @@ string ID treated as proof that the CRDT object was retained.
 Observers update the ID index, revisions, and change log from actual changes.
 Replacing a Y.Map, even with the same cell_id, invalidates old references,
 subscriptions, the output generation, and queued execution targets not yet
-sent. The queue also records local object identity and returns `CELL_REPLACED`
-when it changes. Unchanged content revisions remain valid; structural revisions
+sent. The queue captures local object identity when the job is accepted and
+checks it again before opening an output generation or sending code; replacing
+a cell with the same ID and source returns `CELL_REPLACED` without clearing its
+outputs or sending it. Unchanged content revisions remain valid; structural revisions
 and page cursors expire when structure changes. A change cursor remains valid
 while its sequence is retained in the log. RTC does not attribute each such
 edit to a specific external tool. A long-lived MCP client keeps the room alive:
@@ -364,6 +374,14 @@ no-replace check is not required.
 and obtains its `fileId` through the collaboration session. The room is not
 opened before a successful rename. If the server already chose the requested
 name, no additional rename is needed.
+
+After the first RTC synchronization of a file allocated by this exact
+`notebook_create`, its sole initial code cell is considered a server placeholder
+only if source and outputs are empty, metadata is empty or contains only the
+server-default `trusted=true`, `execution_count=null`, `execution_state=idle`,
+and no other nondefault fields exist. It is removed
+before the response, so the first added cell gets index 0. Any difference or
+more than one cell prohibits removal.
 
 Rename response 409 maps to `ALREADY_EXISTS`; 403 maps to
 `PERMISSION_DENIED`. After allocating an untitled file, both outcomes return
@@ -488,6 +506,10 @@ A kernel is bound through the Jupyter Sessions API to the selected notebook
 path. An existing session is reused; ambiguous bindings return a selection
 error. Reading or opening a notebook does not start a kernel. Start, switch,
 restart, interrupt, and shutdown are explicit `kernel_control` operations.
+Successful `start` and `switch` operations write the selected kernelspec
+(`name`, `display_name`, `language`) into shared notebook metadata. After
+`notebook_save`, it is present in the `.ipynb`; opening that path in JupyterLab
+uses the bound session without showing the kernel picker again.
 `notebook_execute` without a binding returns `KERNEL_NOT_BOUND` before changing
 outputs or sending code. `kernel_status` returns the binding, channel state
 (`connecting|connected|disconnected`), and separately observed execution status
@@ -558,6 +580,13 @@ Cell completion requires the matching `execute_reply` and IOPub `idle`, in
 either arrival order. The output handler must support `stream`,
 `execute_result`, `display_data`, `error`, `clear_output(wait)`, and
 `update_display_data` by `display_id`, preserving MIME bundles and metadata.
+Continued `stream` output appends as a delta to the existing shared `Y.Text`
+rather than replacing the output for each chunk. Identical RTC reserialization
+by a peer does not revoke the generation; differing outputs, execution count,
+or state do. After completion, an independent browser observer sees the entire
+stream, final count, and `idle`. Full revisions for a coalesced output event are
+computed only when it is published or forcibly flushed, exactly once for the
+last state; superseded pending chunks do not trigger full materialization.
 `transient.display_id` remains in the router and is not stored as an ordinary
 nbformat output field. The transport library handles binary kernel frames;
 unsupported comm messages must not break the stream.
@@ -565,7 +594,11 @@ unsupported comm messages must not break the stream.
 
 Late outputs after `idle` continue updating their output area until superseded
 by another execution, clear, delete, or close. Display IDs require routing
-across different executions by this client. Completion does not promise that
+across different executions by this client. Every display target includes the
+immutable shared-cell identity as well as notebook, cell ID, output generation,
+and index, so deleting or renaming a cell and reusing its ID and generation
+cannot redirect an old display update into the new cell or replace outputs
+collected for the new cell's execution. Completion does not promise that
 background threads will emit no later output.
 
 ### Races, interruption, and connection loss
@@ -586,6 +619,10 @@ background threads will emit no later output.
 - Losing the kernel connection after send yields `unknown` without sufficient
   result evidence. Reconnection alone does not prove completion. An
   `execute_request` is not retried automatically.
+- A graceful kernel shutdown may return an explicit abort/interruption reply
+  for the request before the channels close. Only that request-correlated
+  evidence permits `interrupted`; abrupt process loss without it remains
+  `unknown`, and later queued cells remain `not_sent`.
 - If RTC is lost while the kernel runs, bounded output collection continues in
   memory and delivery is unconfirmed. Later cells are not sent until recovery.
   After reconnect, outputs are applied only to the same live output area when
@@ -598,7 +635,9 @@ background threads will emit no later output.
   same kernel_id does not prove process continuity, work remains `unknown` and
   is not retried. This client's restart/switch requires the expected
   `kernel_id`; a changed binding returns `KERNEL_CHANGED`. Restart does not
-  clear outputs or run the entire notebook without a separate call.
+  clear outputs or run the entire notebook without a separate call. Restarting
+  while the automatic kernel-info handshake is pending must not create an
+  unhandled process-level rejection.
 
 The first version uses `allow_stdin=false`: calls requiring interactive input
 must fail clearly without hanging. The service performs no hidden code retries,
@@ -805,9 +844,9 @@ host resource support does not make the execution result inaccessible.
 
 Initial configurable limits are 100 cells per summary, 64 KiB of text per
 response, up to 30 seconds of waiting per tool call, 10,000 notebook-log events,
-32 open replicas, and 64 working sessions per process. These are design values,
-not measured limits. Input request and compact receipt sizes are also bounded
-and checked before effects; outputs are not copied into the replay registry.
+32 open replicas, and 64 working sessions per process. These design values make
+no claim about measured limits. Input request and compact receipt sizes are also
+bounded and checked before effects; outputs are not copied into the replay registry.
 Replicas, output buffers, and the deduplication registry have separate memory
 budgets. On exhaustion, new operations/handles fail with `RESOURCE_LIMIT`;
 active executions are not evicted, and completed receipts are released only
@@ -818,7 +857,24 @@ interrupted automatically.
 
 Page-read cursors are bound to a revision: structural changes between pages
 return `CURSOR_EXPIRED` to avoid missing or duplicating cells. Continuing an
-unchanged large output must not retransmit chunks already returned.
+unchanged large output must not retransmit chunks already returned. Text output
+chunks and their cursors must begin and end on UTF-8 code-point boundaries. If
+the next code point exceeds the requested byte budget, `output_read` returns
+`RESOURCE_LIMIT` without advancing the cursor.
+An `execution_get` cursor identifies both the mutable output-state version and
+the delivered position within that version for every cell. If an already
+delivered stream or display is updated, or the output area is cleared, the
+next response sets `outputs_reset: true` and returns the current replacement
+state (which may be an empty list). This remains observable after the job has
+entered a terminal state.
+
+The response byte limit applies to the final serialized `structuredContent`,
+including truncation markers and continuation instructions. The adapter may
+shorten an array only when it also moves the returned cursor to the last item
+actually included. If one indivisible field or an array without such a
+continuation cannot fit, the call returns `RESOURCE_LIMIT` instead of an
+oversized or silently lossy success; the error identifies the measured and
+configured sizes and retains an execution handle when one was accepted.
 
 ## 10. Observation and skill
 
@@ -901,6 +957,9 @@ Tool arguments never carry tokens. Credentials do not appear in stdout, logs,
 exception messages, notebook links, or resource URIs. In stdio, stdout is
 reserved for MCP and diagnostics use stderr. If WebSocket compatibility needs
 a token query, that URL is also redacted before logging.
+The installed package executable must start through the package manager's bin
+symlink and preserve the same `--help`, `--version`, stdio, and `--http`
+behavior as direct invocation of its target file.
 [MCP stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)
 
 Support token authentication and validated HTTPS; cookie/XSRF and
@@ -945,9 +1004,13 @@ browser test. Checking only a local `Y.Doc` or tool-response text is insufficien
 | Document data | Read/edit preserves unknown metadata, markdown attachments, and untouched outputs |
 | Tool coverage | Metadata operations validate revisions and preserve other keys; type changes/attachment writes are explicitly unsupported; a duplicate ID blocks only operations addressing it and batches containing them. Server ID changes during serialization update the index and old targets; an exact duplicate is not assumed removed from the shared array |
 | Create name | The standard manager supports name. An existing target returns ALREADY_EXISTS with the actual untitled path and side_effects=applied, without opening a room; likewise for 403 after creation. Successful rename opens the final path/fileId. Timeout does not retry; tests do not claim provider TOCTOU is absent |
-| Cursors and outputs | Open/read returns a valid changes_cursor without an event-loss window; long streams are coalesced and published sequences are immutable; output_read continues a snapshot, and resources/read plus empty resources/list work without subscriptions |
+| Create placeholder | A fresh notebook omits its sole initial code cell only when source/outputs/count/state are entirely default, metadata is empty or only `trusted=true`, and no other fields or cells exist |
+| Kernel metadata | After successful start/switch and save, kernelspec exists in the shared model and file; an open browser uses the session without another picker |
+| Cursors and outputs | Open/read returns a valid changes_cursor without an event-loss window; wire-level journal pages advance only through returned events; long streams append deltas to one shared output and an execution cursor observes append/display-replacement/clear after initial delivery, including post-terminal changes; browser write-back does not leave `[*]`, revision materializes once when publishing/flushing the final coalesced state, published sequences are immutable; output_read continues a snapshot, and resources/read plus empty resources/list work without subscriptions |
 | Limits | Large plots/output streams do not pollute every response; limits and expired cursors are explicit; input() does not hang |
 | Cleanup and credentials | Closing handles releases observers/sockets while preserving the kernel; startup/reconnect/error never expose tokens |
+| Test fixture isolation | Simultaneous disposable Jupyter stands use separate runtime and persistence state and can initialize RTC rooms independently |
+| Release tooling | A clean install with the pinned pnpm version accepts the tracked build-script permission for esbuild without interactive approval, ignored-build errors, or creating new configuration files |
 
 The benchmark compares cold open and warm read/edit on identical notebooks with
 100, 1,000, and 10,000 cells, separately for source and large outputs. It records
@@ -976,3 +1039,62 @@ execution is not claimed before browser integration tests. These checks refine
 the implementation without changing the primary decision: a long-lived
 JavaScript RTC client with explicit state ownership and MCP as its first
 interface.
+
+### External assertion headers
+
+An operator profile may select `auth: {type: "header", name: "X-Jupyter-Access-Token"}`
+with its existing `credentialRef`. The resolved value is sent verbatim in that
+header for REST, RTC, and kernel handshakes, never as Jupyter `Authorization`
+or a URL parameter. Omitted `auth` preserves Jupyter token authentication.
+Credential headers must not follow cross-origin redirects; WebSocket and kernel
+REST redirects are rejected. Credentials and their parser-generated fragments
+must not appear in diagnostic bodies, exception causes, or inspected errors.
+API, browser, and WebSocket base URLs are validated before discovery or
+`server_list` can expose them. They must use the protocol appropriate to their
+role and contain no user information, query, or fragment; a rejection does not
+repeat the rejected URL.
+
+All transports of one cached server client share a credential snapshot. Updating
+an environment variable or credential file requires restarting MCP; restarting
+invalidates MCP handles but does not stop server kernels.
+
+### Optional hosted HTTP transport
+
+The main executable's `--http` mode authenticates every tools and resources
+request and selects an operator-configured Jupyter server from the verified
+identity, never from a caller-supplied principal, URL, or credential. Its tool
+schemas, structured results, images, errors, and output resources preserve the
+stdio contract.
+It exposes a narrow OAuth proxy: dynamic client registration followed by an
+authorization-code grant with mandatory S256 PKCE and a trusted upstream OIDC
+login. Refresh, implicit, and device grants are unsupported. Registrations,
+transactions, one-time codes, and local access tokens are encrypted at rest;
+one-time values are consumed atomically and no record outlives the signed
+upstream ID token. Redirects are checked against current operator policy at
+registration, authorization, and callback time. Upstream OIDC discovery, JWKS,
+and token requests never follow redirects. An inconclusive identity-verification
+failure denies the request but does not destroy a still-live local grant.
+An identity derived from an email claim is accepted only when the signed
+`email_verified` claim is the boolean `true`. A false, missing, or malformed
+claim is rejected before a worker slot or process is allocated.
+
+A worker and its handles belong to one issuer, subject, Hub user, and assertion
+generation. Different principals or credential generations cannot use those
+handles. Concurrent valid grants retain independent workers; the HTTP host must
+not substitute one grant's newer assertion for another. HTTP disconnection must
+not evict workers. Signed expiry blocks new requests immediately, and expired
+workers are retired after active request leases finish. Worker cleanup leaves
+Jupyter kernels running and never replays an interrupted request. Retirement
+and shutdown attempt every owned worker independently; a failed close remains
+owned and quarantined for retry, never available for another lease; a
+replacement can be allocated only after the failed cleanup succeeds. A failed
+expiry sweep cannot skip worker or authentication cleanup during shutdown.
+
+Browser requests to the advertised MCP endpoint receive origin-specific CORS
+headers after origin validation. Its preflight advertises every header used by
+the Streamable HTTP transport, and authentication failures remain readable by
+the allowed browser origin.
+
+Global and per-principal capacity limits reject new workers without evicting
+existing ones. Credentials remain in private ephemeral files; subprocess
+arguments, environment, logs, and MCP responses do not contain the assertion.

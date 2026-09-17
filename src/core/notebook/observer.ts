@@ -70,6 +70,8 @@ interface CellTouch {
   source: boolean;
   metadata: boolean;
   outputs: boolean;
+  streamTextOnly: boolean;
+  streamText: string;
 }
 
 /** The document observers of one {@link NotebookModel}. */
@@ -130,8 +132,21 @@ export class NotebookObserver {
       const aspect = aspectFor(events[position]!, place.aspect);
       if (aspect === null) continue;
       const existing = touched.get(entry.identityToken);
-      const record = existing?.record ?? { source: false, metadata: false, outputs: false };
-      record[aspect] = true;
+      const record = existing?.record ?? {
+        source: false,
+        metadata: false,
+        outputs: false,
+        streamTextOnly: true,
+        streamText: ''
+      };
+      if (aspect === 'source') record.source = true;
+      else if (aspect === 'metadata') record.metadata = true;
+      else if (aspect === 'outputs') record.outputs = true;
+      if (aspect === 'outputs') {
+        const streamText = insertedStreamText(events[position]!);
+        if (streamText === null) record.streamTextOnly = false;
+        else record.streamText += streamText;
+      }
       touched.set(entry.identityToken, { entry, record });
     }
 
@@ -181,19 +196,21 @@ export class NotebookObserver {
       });
     }
     if (record.outputs) {
-      // Anything that wrote this output area other than its own sink takes the
-      // generation away from us (SPEC.md §8). The claim is per transaction:
-      // the sink's own write is still attributed to it when the caller opened
-      // the surrounding transaction.
-      if (!this.#host.generations.wroteIn(tr, cellId)) {
+      // A claimed stream-text transaction is the hot path and contains only
+      // the sink's delta. Every other transaction must leave the exact state
+      // remembered by the sink, including mixed writes in one outer transact.
+      const claimedStreamDelta =
+        record.streamTextOnly &&
+        this.#host.generations.claimedStreamDeltaMatches(tr, cellId, record.streamText);
+      if (!claimedStreamDelta && !this.#host.generations.matchesCurrentState(cellId)) {
         this.#host.generations.invalidate(cellId);
       }
       this.#host.journal.recordOutputs(
         cellId,
-        {
+        () => ({
           outputsRevision: outputsRevision(outputsOf(cell)),
           cellRevision: cellRevision(cellJson(cell))
-        },
+        }),
         origin
       );
     }
@@ -270,6 +287,21 @@ export class NotebookObserver {
     }
     return null;
   }
+}
+
+function insertedStreamText(event: Y.YEvent<Y.AbstractType<unknown>>): string | null {
+  if (event.path[event.path.length - 1] !== 'text') return null;
+  const delta = (event as { changes?: { delta?: Array<Record<string, unknown>> } }).changes?.delta;
+  if (!Array.isArray(delta)) return null;
+  let text = '';
+  for (const part of delta) {
+    if ('delete' in part || 'attributes' in part) return null;
+    if ('insert' in part) {
+      if (typeof part['insert'] !== 'string') return null;
+      text += part['insert'];
+    }
+  }
+  return text;
 }
 
 /** `keysChanged` of a `Y.YMapEvent`, or `undefined` for other event types. */

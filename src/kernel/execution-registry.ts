@@ -56,10 +56,13 @@ export interface NotebookRef {
   /** MCP working session that owns the job. */
   readonly sessionId: string;
 }
+
 /** One requested cell, addressed by id and pinned to a revision (§8). */
 export interface ExecutionCellRequest {
   readonly cellId: string;
   readonly sourceRevision: SourceRevision;
+  /** Immutable shared-cell identity captured when the job was accepted. */
+  readonly identityToken?: string;
 }
 
 /**
@@ -74,7 +77,11 @@ export type RevalidateResult =
   | { readonly ok: false; readonly code: NotSentReason };
 
 /** Provided by the notebook model; must not await inside. */
-export type Revalidate = (cellId: string, expected: SourceRevision) => RevalidateResult;
+export type Revalidate = (
+  cellId: string,
+  expected: SourceRevision,
+  expectedIdentityToken: string
+) => RevalidateResult;
 
 /** One accepted `notebook_execute` job (SPEC.md §8 "Jobs"). */
 export interface SubmitRequest {
@@ -110,6 +117,7 @@ interface OwnedArea {
   readonly sink: OutputSink;
   readonly job: JobRecord<SubmitRequest>;
   readonly cell: MutableCell;
+  reducer: ExecutionReducer | null;
 }
 
 /** A route kept alive after completion, for output from background threads. */
@@ -120,7 +128,12 @@ interface LateRoute {
 }
 
 function areaKey(area: OutputAreaRef): string {
-  return `${area.notebookId} ${area.cellId} ${area.generation}`;
+  return JSON.stringify([
+    area.notebookId,
+    area.cellId,
+    area.identityToken,
+    area.generation
+  ]);
 }
 
 /** Why a cell stopped without completion evidence (SPEC.md §8). */
@@ -200,7 +213,21 @@ export class ExecutionRegistry {
       stopOnError: request.stopOnError ?? true,
       createdAt: now(),
       state: 'queued',
-      cells: request.cells.map((cell) => newCell(cell.cellId, cell.sourceRevision)),
+      cells: request.cells.map((cell) => {
+        const record = newCell(cell.cellId, cell.sourceRevision);
+        if (cell.identityToken !== undefined) {
+          record.identityToken = cell.identityToken;
+        } else {
+          try {
+            const accepted = request.revalidate(cell.cellId, cell.sourceRevision, '');
+            if (accepted.ok) record.identityToken = accepted.identityToken;
+            else record.acceptanceFailure = accepted.code;
+          } catch {
+            // The pump repeats the callback and records its failure on the job.
+          }
+        }
+        return record;
+      }),
       cursor: 0,
       cancelRequested: false,
       waiters: new Set()
@@ -371,7 +398,21 @@ export class ExecutionRegistry {
         job.reason ??= 'kernel restarted, shut down or died before this cell was sent';
         break;
       }
-      const check = job.request.revalidate(cell.cellId, cell.sourceRevision);
+      const identityToken = cell.identityToken;
+      if (identityToken === undefined) {
+        const code =
+          cell.acceptanceFailure ??
+          (() => {
+            const check = job.request.revalidate(cell.cellId, cell.sourceRevision, '');
+            return check.ok ? 'cell_replaced' : check.code;
+          })();
+        cell.state = 'not_sent';
+        cell.notSentReason = code;
+        markRest(job, index + 1, 'stop_on_error');
+        job.reason = `target check failed for ${cell.cellId}: ${code}`;
+        break;
+      }
+      const check = job.request.revalidate(cell.cellId, cell.sourceRevision, identityToken);
       if (!check.ok) {
         cell.state = 'not_sent';
         cell.notSentReason = check.code;
@@ -380,20 +421,32 @@ export class ExecutionRegistry {
         break;
       }
       cell.sourceSnapshot = check.source;
-      cell.identityToken = check.identityToken;
-
-      const sink = job.request.getSink(cell.cellId);
-      if (sink === null) {
+      if (check.identityToken !== identityToken) {
         cell.state = 'not_sent';
-        cell.notSentReason = 'cell_not_found';
+        cell.notSentReason = 'cell_replaced';
+        markRest(job, index + 1, 'stop_on_error');
+        job.reason = `target check failed for ${cell.cellId}: cell_replaced`;
+        break;
+      }
+
+      const sink = job.request.getSink(cell.cellId, identityToken);
+      if (sink === null) {
+        const afterSink = job.request.revalidate(cell.cellId, cell.sourceRevision, identityToken);
+        cell.state = 'not_sent';
+        cell.notSentReason = afterSink.ok ? 'cell_not_found' : afterSink.code;
         cell.cellDeleted = true;
         markRest(job, index + 1, 'stop_on_error');
         job.reason = `output area of ${cell.cellId} could not be opened`;
         break;
       }
       this.#rememberArea(
-        { notebookId: job.notebookId, cellId: cell.cellId, generation: sink.generation },
-        { sink, job, cell }
+        {
+          notebookId: job.notebookId,
+          cellId: cell.cellId,
+          identityToken: sink.identityToken,
+          generation: sink.generation
+        },
+        { sink, job, cell, reducer: null }
       );
 
       const outcome = await this.#runCell(job, cell, sink);
@@ -459,6 +512,7 @@ export class ExecutionRegistry {
     const area: OutputAreaRef = {
       notebookId: job.notebookId,
       cellId: cell.cellId,
+      identityToken: sink.identityToken,
       generation: sink.generation
     };
     cell.generation = sink.generation;
@@ -492,7 +546,16 @@ export class ExecutionRegistry {
         buffered.push(msg);
         return;
       }
+      let outputChanged = false;
       for (const effect of reducer.feed(msg)) {
+        if (
+          effect.kind !== 'complete' &&
+          effect.kind !== 'setCount' &&
+          effect.kind !== 'setState' &&
+          sameOutputArea(effect.target, area)
+        ) {
+          outputChanged = true;
+        }
         this.#applyEffect(effect, cell, area);
         if (effect.kind === 'complete') {
           completed = true;
@@ -500,6 +563,7 @@ export class ExecutionRegistry {
         }
       }
       cell.outputsCollected = [...reducer.state.outputs];
+      if (outputChanged) cell.outputVersion += 1;
       cell.outputIncomplete = reducer.state.outputIncomplete;
       this.#bump(job);
       // After completion the route lives only for as long as the area it
@@ -525,6 +589,8 @@ export class ExecutionRegistry {
           ? {}
           : { maxOutputBytes: job.request.maxOutputBytes })
       });
+      const owned = this.#areas.get(areaKey(area));
+      if (owned !== undefined) owned.reducer = reducer;
       this.#bump(job);
       for (const msg of buffered.splice(0)) consume(msg);
 
@@ -586,7 +652,8 @@ export class ExecutionRegistry {
     // A throwing `revalidate` must not undo a decided outcome.
     let after: RevalidateResult;
     try {
-      after = job.request.revalidate(cell.cellId, cell.sourceRevision);
+      if (cell.identityToken === undefined) return;
+      after = job.request.revalidate(cell.cellId, cell.sourceRevision, cell.identityToken);
     } catch {
       return;
     }
@@ -620,6 +687,9 @@ export class ExecutionRegistry {
       case 'append':
         applied = sink.appendOutput(effect.output);
         break;
+      case 'appendStream':
+        applied = sink.appendStream(effect.target.index, effect.text);
+        break;
       case 'update':
         applied = sink.updateOutput(effect.target.index, effect.output);
         break;
@@ -644,7 +714,13 @@ export class ExecutionRegistry {
     // should report: `execution_get` on it must not keep answering with the
     // superseded MIME bundle (SPEC.md §12 "Outputs").
     if (!sameOutputArea(effect.target, own) && entry.cell !== cell) {
-      entry.cell.outputsCollected = sink.getOutputs();
+      if (effect.kind === 'update') {
+        entry.reducer?.replaceOutput(effect.target.index, effect.output);
+      }
+      if (entry.reducer !== null) {
+        entry.cell.outputsCollected = [...entry.reducer.state.outputs];
+      }
+      entry.cell.outputVersion += 1;
       this.#bump(entry.job);
     }
   }

@@ -12,7 +12,7 @@ The environment is disposable: all state resides in `.runtime/<PORT>/` and is no
 | `start.sh` | starts JupyterLab with RTC enabled and waits for `/api/status` |
 | `stop.sh` | stops the server using its PID file and removes a stale PID |
 | `probe.py` | checks REST, collaboration session, and the room WebSocket |
-| `.runtime/<PORT>/` | PID file, log, `base_url`, and the `root/` working directory |
+| `.runtime/<PORT>/` | PID file, log, `base_url`, SQLite YStore, and the `root/` working directory |
 
 ## Installation
 
@@ -43,6 +43,9 @@ The server listens only on `127.0.0.1`; no browser is opened
 (`--no-browser`, `ServerApp.open_browser=False`). Update checks and the
 JupyterLab news feed are disabled
 (`LabApp.check_for_updates_class=…NeverCheckForUpdate`, `LabApp.news_url=None`).
+Each server runs with `.runtime/<PORT>/` as its working directory, which keeps
+the current-directory-relative SQLite YStore isolated from stands on other
+ports.
 
 `start.sh` waits up to 90 seconds for `GET /api/status` to return 200 with the
 token, prints the `jupyter_server_ydoc` extension lines from

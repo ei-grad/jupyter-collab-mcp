@@ -79,6 +79,27 @@ describe('credential references', () => {
     expect(resolved.token).toBe('tok');
     expect(JSON.stringify(describeServer(PROFILE))).not.toContain('tok');
   });
+
+  it.each([
+    ['apiBaseUrl query', { apiBaseUrl: 'https://host.invalid/user/alice?token=url-secret' }],
+    ['apiBaseUrl userinfo', { apiBaseUrl: 'https://url-secret@host.invalid/user/alice' }],
+    ['wsBaseUrl query', { wsBaseUrl: 'wss://host.invalid/user/alice?token=url-secret' }],
+    ['wsBaseUrl userinfo', { wsBaseUrl: 'wss://url-secret@host.invalid/user/alice' }],
+    ['browserBaseUrl query', { browserBaseUrl: 'https://host.invalid/user/alice?token=url-secret' }],
+    ['browserBaseUrl userinfo', { browserBaseUrl: 'https://url-secret@host.invalid/user/alice' }]
+  ])('rejects a credential-bearing %s without echoing it', async (_name, change) => {
+    const registry = new ServerRegistry(
+      withDefaults({ servers: [{ ...PROFILE, ...change }] })
+    );
+    try {
+      await registry.list();
+      expect.fail('expected invalid server URL');
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'INVALID_ARGUMENT' });
+      expect(String(error)).not.toContain('url-secret');
+      expect(JSON.stringify(error)).not.toContain('url-secret');
+    }
+  });
 });
 
 describe('local runtime discovery', () => {
@@ -128,6 +149,20 @@ describe('local runtime discovery', () => {
     });
     // The second parses but has no URL to dial.
     expect(found).toHaveLength(0);
+  });
+
+  it.each([
+    'http://url-secret@localhost:8899/',
+    'http://localhost:8899/?token=url-secret'
+  ])('ignores a credential-bearing discovered URL', async (url) => {
+    const found = await discoverLocalServers({
+      env: { JUPYTER_RUNTIME_DIR: '/rt' },
+      listDir: () => ['jpserver-1.json'],
+      readFile: () => JSON.stringify({ url, port: 8899, token: 'runtime-secret' }),
+      runtimeDirCommand: async () => null
+    });
+    expect(found).toEqual([]);
+    expect(JSON.stringify(found)).not.toContain('url-secret');
   });
 
   it('adds the directory the Jupyter CLI reports', async () => {

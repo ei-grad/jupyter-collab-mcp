@@ -12,8 +12,8 @@ Verified protocol facts are in [spike/NOTES.md](../spike/NOTES.md).
 | `src/jupyter` | Transport: REST, document session, RTC connection, stdout guard | Does not interpret notebook contents |
 | `src/core/notebook` | Live notebook model over `YNotebook` | Does not send kernel messages |
 | `src/kernel` | Kernel protocol: output reducer, routing, job queue | Does not write directly to `Y.Doc` |
-| `src/core/registry` | Sessions, handles, `request_id` registry (later) | Does not parse JSON Schema |
-| `src/mcp` | Adapter: tool schemas, snake_case, response limits (later) | Contains no business logic |
+| `src/service` | Sessions, handles, kernel bindings, outputs, and `request_id` registry | Does not parse JSON Schema |
+| `src/mcp` | Adapter: tool schemas, snake_case, resources, and response limits | Contains no business logic |
 
 ### `src/core` (this module)
 
@@ -94,9 +94,9 @@ of MCP (§1) and allows revisions to be tested without a server.
   `sourceRevision`, and object identity). It records `CellExecutionRecord`;
   `not_sent` and `aborted` are strictly distinguished.
 
-### `src/core/registry` and `src/mcp` (later)
+### `src/service` and `src/mcp`
 
-`registry` holds working sessions, notebook/job handles, and the `request_id`
+`service` holds working sessions, notebook/job handles, and the `request_id`
 registry (`H`, up to 4096 receipts, `replayed`, `first_accepted_at`).
 `mcp` converts camelCase to the §9 schemas' snake_case, truncates responses to
 their limits, and converts `CoreError` into `isError: true` plus

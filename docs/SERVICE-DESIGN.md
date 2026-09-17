@@ -128,8 +128,9 @@ configured budget is clamped rather than rejected.
 
 **Decision: `@modelcontextprotocol/server` 2.0.0 (plus transitive
 `@modelcontextprotocol/core` 2.0.0), with `@modelcontextprotocol/client`
-2.0.0 in devDependencies for adapter integration tests.** The installed
-`@modelcontextprotocol/sdk` 1.30.0 is unsuitable for one blocking reason.
+2.0.0 as a runtime dependency for hosted worker connections.** The legacy
+`@modelcontextprotocol/sdk` 1.30.0 is unsuitable for one blocking reason and is
+not a dependency of this package.
 
 ### 7.1 Why not 1.30.0
 
@@ -266,12 +267,11 @@ raw-shape form (`{field: z.string()}`) in `registerTool` is marked
    `structuredContent` (verified). For §9 error responses, put
    `code`/`message`/`retryable`/`side_effects` in text and `_meta`,
    not in `structuredContent`, to avoid conflicting with the output schema.
-6. **`@modelcontextprotocol/sdk` 1.30.0 remains in `dependencies`** until
-   `src/mcp` is implemented against the new API; currently no file uses it.
-   Remove it in the same change as the adapter. There is no need to retain two
-   SDKs longer.
-7. `@modelcontextprotocol/client` is in **devDependencies**: it is used only
-   by tests and `.scratch` runs, not by the server at runtime.
+6. **`@modelcontextprotocol/sdk` 1.30.0 is not installed.** `src/mcp` uses the
+   2.0 server API, so retaining the legacy SDK would add unused runtime code
+   and a second protocol implementation.
+7. `@modelcontextprotocol/client` is a runtime dependency of authenticated HTTP
+   mode: each owner-bound worker connects to the canonical stdio server with it.
 
 ## 8. `notebook_execute` data flow through the facade
 

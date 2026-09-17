@@ -20,8 +20,8 @@
  */
 
 import { createRequire } from 'node:module';
-import { pathToFileURL } from 'node:url';
-import { readFileSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
 
 import type { CollabService, ServerProfile, ServiceConfig, ServiceConfigInput, ShutdownReason } from '../core/index.js';
@@ -37,6 +37,7 @@ export const CLI_USAGE = `jupyter-collab-mcp - MCP server for live JupyterLab no
 Usage: jupyter-collab-mcp [options]
 
 Options:
+  --http                 Serve authenticated MCP HTTP instead of stdio.
   --config <file.json>   Full configuration: {servers, discovery, limits, awarenessUser}.
   --discover             Allow servers found in the local Jupyter runtime directory.
   --user-name <name>     Awareness display name shown in JupyterLab.
@@ -221,6 +222,15 @@ export interface CliResult {
   close(reason?: ShutdownReason): Promise<void>;
 }
 
+export interface MainCliOptions extends CliOptions {
+  /** Test seam for the authenticated HTTP runtime. */
+  readonly startHttp?: (options: {
+    readonly env: NodeJS.ProcessEnv;
+    readonly installSignalHandlers: boolean;
+    readonly onerror: (error: Error) => void;
+  }) => Promise<{ close(): Promise<void> }>;
+}
+
 async function defaultCreateService(config: ServiceConfig, env: NodeJS.ProcessEnv): Promise<CollabService> {
   const modulePath = env['JUPYTER_COLLAB_MCP_SERVICE_MODULE'];
   if (modulePath !== undefined && modulePath !== '') {
@@ -252,7 +262,7 @@ async function defaultCreateService(config: ServiceConfig, env: NodeJS.ProcessEn
 export async function runCli(options: CliOptions = {}): Promise<CliResult> {
   // 1. stdout belongs to MCP from this line on (SPEC.md §11).
   const { installStdoutGuard } = await import('../jupyter/index.js');
-  installStdoutGuard();
+  const restoreConsole = installStdoutGuard();
 
   const env = options.env ?? process.env;
   const stderr = options.stderr ?? process.stderr;
@@ -337,19 +347,77 @@ export async function runCli(options: CliOptions = {}): Promise<CliResult> {
   return { close: async (reason: ShutdownReason = 'client_request') => close(reason) };
 }
 
+/** Select stdio or authenticated HTTP mode for the single public executable. */
+export async function runMainCli(options: MainCliOptions = {}): Promise<CliResult> {
+  const argv = options.argv ?? process.argv.slice(2);
+  const httpFlags = argv.filter((argument) => argument === '--http');
+  if (httpFlags.length === 0) return runCli(options);
+  if (httpFlags.length > 1) {
+    throw coreError('INVALID_ARGUMENT', '--http may be specified only once');
+  }
+
+  const remaining = argv.filter((argument) => argument !== '--http');
+  if (remaining.includes('--help') || remaining.includes('-h') || remaining.includes('--version')) {
+    return runCli({ ...options, argv: remaining });
+  }
+  if (remaining.length > 0) {
+    throw coreError(
+      'INVALID_ARGUMENT',
+      `HTTP mode is configured through JUPYTER_MCP_* variables; unsupported option ${remaining[0]}`
+    );
+  }
+
+  const { installStdoutGuard } = await import('../jupyter/index.js');
+  const restoreConsole = installStdoutGuard();
+  const env = options.env ?? process.env;
+  const stderr = options.stderr ?? process.stderr;
+  const onerror = (error: Error): void => {
+    stderr.write(`[error] gateway: ${redactCredentials(error.message)}\n`);
+  };
+  const startHttp =
+    options.startHttp ??
+    (async (httpOptions: {
+      readonly env: NodeJS.ProcessEnv;
+      readonly installSignalHandlers: boolean;
+      readonly onerror: (error: Error) => void;
+    }) => {
+      const { runGatewayFromEnv } = await import('../gateway/bootstrap.js');
+      return runGatewayFromEnv(httpOptions);
+    });
+  try {
+    const running = await startHttp({
+      env,
+      installSignalHandlers: options.installSignalHandlers !== false,
+      onerror
+    });
+    return {
+      close: async () => {
+        try {
+          await running.close();
+        } finally {
+          restoreConsole();
+        }
+      }
+    };
+  } catch (error) {
+    restoreConsole();
+    throw error;
+  }
+}
+
 /** `true` when this module is the process entry point. */
 function isEntryPoint(): boolean {
   const entry = process.argv[1];
   if (entry === undefined) return false;
   try {
-    return import.meta.url === pathToFileURL(resolvePath(entry)).href;
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolvePath(entry));
   } catch {
     return false;
   }
 }
 
 if (isEntryPoint()) {
-  runCli().catch((thrown: unknown) => {
+  runMainCli().catch((thrown: unknown) => {
     const error = toCoreError(thrown);
     process.stderr.write(`[error] ${error.code}: ${redactCredentials(error.message)}\n`);
     process.exit(2);

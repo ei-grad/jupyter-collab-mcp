@@ -21,7 +21,7 @@ import type { ErrorCode } from '../core/index.js';
 
 /** Parsed body of a 1003 close (`jupyter_server_ydoc` sends JSON). */
 export interface SessionRejection {
-  readonly reason: string;
+  readonly reason: 'unknown_session' | 'version_mismatch' | 'initialization_error';
   readonly sessionId?: string;
   readonly reloadable?: boolean;
 }
@@ -48,7 +48,7 @@ export const CLOSE_NOT_FOUND = 4404;
 /** Server-side initialization error; retried within a budget. */
 export const CLOSE_INTERNAL = 4500;
 
-/** Parse the JSON body of a 1003 close, tolerating anything else. */
+/** Parse only recognized fields from the JSON body of a 1003 close. */
 export function parseSessionRejection(reason: string): SessionRejection | null {
   if (reason.length === 0) return null;
   let payload: unknown;
@@ -59,9 +59,13 @@ export function parseSessionRejection(reason: string): SessionRejection | null {
   }
   if (typeof payload !== 'object' || payload === null) return null;
   const record = payload as Record<string, unknown>;
-  if (typeof record['reason'] !== 'string') return null;
+  if (
+    record['reason'] !== 'unknown_session' &&
+    record['reason'] !== 'version_mismatch' &&
+    record['reason'] !== 'initialization_error'
+  ) return null;
   const rejection: {
-    reason: string;
+    reason: SessionRejection['reason'];
     sessionId?: string;
     reloadable?: boolean;
   } = { reason: record['reason'] };
@@ -73,8 +77,9 @@ export function parseSessionRejection(reason: string): SessionRejection | null {
 /**
  * Map a close frame onto the SPEC.md §6 transition table.
  *
- * `reason` is the raw close reason; for 1003 it carries JSON. Nothing here is
- * pattern-matched on frame bytes - only on the code and that JSON.
+ * `reason` is the raw close reason; for 1003 it carries JSON. Only the fixed
+ * protocol reason names above may reach diagnostics; arbitrary server text is
+ * treated as unparseable and never reflected.
  */
 export function classifyClose(code: number, reason: string): CloseDisposition {
   if (code === CLOSE_UNSUPPORTED_DATA) {

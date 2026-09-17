@@ -21,6 +21,7 @@
 import type { YCodeCell, YNotebook } from '@jupyter/ydoc';
 import type * as Y from 'yjs';
 
+import { outputsRevision } from '../revision.js';
 import type { NbOutput, OutputSink, SharedExecutionState } from '../types.js';
 import type { CellIndex } from './cell-index.js';
 import type { ChangeJournal } from './journal.js';
@@ -41,6 +42,8 @@ export interface GenerationHost {
    * Returns `false` and writes nothing when the generation is stale.
    */
   write(generation: OutputGeneration, fn: (cell: YCodeCell) => void): boolean;
+  /** Append a stream delta and attribute its exact text to the Yjs transaction. */
+  appendStream(generation: OutputGeneration, index: number, text: string): boolean;
 }
 
 /**
@@ -56,6 +59,10 @@ export class OutputGeneration implements OutputSink {
   invalidated = false;
 
   readonly #host: GenerationHost;
+  #rememberedState = false;
+  #expectedOutputs: NbOutput[] = [];
+  #executionCount: number | null = null;
+  #executionState: SharedExecutionState = 'idle';
 
   constructor(host: GenerationHost, cellId: string, identityToken: string, generation: number) {
     this.#host = host;
@@ -78,7 +85,7 @@ export class OutputGeneration implements OutputSink {
   /** Replace the whole output area. */
   setOutputs(outputs: NbOutput[]): boolean {
     const normalised = outputs.map(normalizeOutput);
-    return this.#host.write(this, (cell) => {
+    return this.#writeOutputs(normalised, (cell) => {
       cell.setOutputs(normalised as unknown as Parameters<YCodeCell['setOutputs']>[0]);
     });
   }
@@ -86,7 +93,7 @@ export class OutputGeneration implements OutputSink {
   /** Append one output. */
   appendOutput(output: NbOutput): boolean {
     const normalised = normalizeOutput(output);
-    return this.#host.write(this, (cell) => {
+    return this.#writeOutputs([...this.#expectedOutputs, normalised], (cell) => {
       const at = cell.youtputs.length;
       cell.updateOutputs(at, at, [normalised] as unknown as Parameters<
         YCodeCell['updateOutputs']
@@ -94,25 +101,72 @@ export class OutputGeneration implements OutputSink {
     });
   }
 
-  /**
-   * Replace the output at `index` - `update_display_data` and `stream`
-   * coalescing. An index outside the current range is not applied.
-   */
+  /** Append a kernel stream delta to the existing shared Y.Text. */
+  appendStream(index: number, text: string): boolean {
+    const cell = this.#host.cellFor(this);
+    if (cell === null) return false;
+    if (!Number.isInteger(index) || index < 0 || index >= cell.youtputs.length) return false;
+    const current = this.#expectedOutputs[index];
+    if (current === undefined) return false;
+    const stream = streamValue(current);
+    if (stream === null) return false;
+    const expected = [...this.#expectedOutputs];
+    expected[index] = {
+      output_type: 'stream',
+      name: stream.name === 'stderr' ? 'stderr' : 'stdout',
+      text: stream.text + text
+    };
+    const previous = this.#expectedOutputs;
+    this.#expectedOutputs = expected;
+    const applied = this.#host.appendStream(this, index, text);
+    if (!applied) this.#expectedOutputs = previous;
+    return applied;
+  }
+
+  /** Replace one output, primarily for `update_display_data`. */
   updateOutput(index: number, output: NbOutput): boolean {
     const cell = this.#host.cellFor(this);
     if (cell === null) return false;
     if (!Number.isInteger(index) || index < 0 || index >= cell.youtputs.length) return false;
     const normalised = normalizeOutput(output);
-    return this.#host.write(this, (live) => {
+    const expected = [...this.#expectedOutputs];
+    expected[index] = normalised;
+    return this.#writeOutputs(expected, (live) => {
       live.updateOutputs(index, index + 1, [normalised] as unknown as Parameters<
         YCodeCell['updateOutputs']
       >[2]);
     });
   }
 
+  /** Remember the exact output/prompt state produced by this generation. */
+  rememberState(cell: YCodeCell): void {
+    this.#rememberedState = true;
+    this.#executionCount = cell.execution_count;
+    this.#executionState = cell.executionState;
+  }
+
+  /** Whether a foreign transaction left the generation's state unchanged. */
+  matchesRememberedState(cell: YCodeCell): boolean {
+    return (
+      this.#rememberedState &&
+      outputsRevision(this.#expectedOutputs) ===
+        outputsRevision(cell.getOutputs() as unknown as NbOutput[]) &&
+      this.#executionCount === cell.execution_count &&
+      this.#executionState === cell.executionState
+    );
+  }
+
+  #writeOutputs(outputs: NbOutput[], fn: (cell: YCodeCell) => void): boolean {
+    const previous = this.#expectedOutputs;
+    this.#expectedOutputs = outputs;
+    const applied = this.#host.write(this, fn);
+    if (!applied) this.#expectedOutputs = previous;
+    return applied;
+  }
+
   /** `clear_output`. */
   clearOutputs(): boolean {
-    return this.#host.write(this, (cell) => {
+    return this.#writeOutputs([], (cell) => {
       cell.clearOutputs();
     });
   }
@@ -168,34 +222,23 @@ export class GenerationRegistry implements GenerationHost {
   readonly #host: GenerationRegistryHost;
   readonly #active = new Map<string, OutputGeneration>();
   readonly #counter = new Map<string, number>();
-  /**
-   * Which generation wrote which cell inside a given Yjs transaction.
-   *
-   * A transient "currently writing" flag cannot be used: Yjs runs deep
-   * observers when the **outermost** transaction ends, which is after the flag
-   * would have been restored if the caller opened that transaction itself. The
-   * observer would then see the generation's own clear/append as a foreign
-   * write and revoke the generation (SPEC.md §8) - silently killing an
-   * execution that grouped its IOPub writes to cut RTC traffic. Keying the
-   * claim on the transaction object survives until the observers run, and the
-   * `WeakMap` needs no cleanup because a transaction is short-lived.
-   */
-  readonly #claims = new WeakMap<Y.Transaction, Map<string, OutputGeneration>>();
-
+  /** Exact stream text appended by sinks inside each transaction and cell. */
+  readonly #streamClaims = new WeakMap<Y.Transaction, Map<string, string>>();
   constructor(host: GenerationRegistryHost) {
     this.#host = host;
   }
 
-  /**
-   * Did the still-current generation of `cellId` write it in this transaction?
-   *
-   * The observer uses it to tell "our own sink wrote" from "somebody took the
-   * output area over", which is the difference between keeping and dropping
-   * the generation (SPEC.md §8).
-   */
-  wroteIn(transaction: Y.Transaction, cellId: string): boolean {
-    const claimed = this.#claims.get(transaction)?.get(cellId);
-    return claimed !== undefined && this.#active.get(cellId) === claimed;
+  /** Whether the transaction's complete stream delta is exactly sink-owned. */
+  claimedStreamDeltaMatches(transaction: Y.Transaction, cellId: string, text: string): boolean {
+    return this.#streamClaims.get(transaction)?.get(cellId) === text;
+  }
+
+  /** True when a peer only reserialised the state last written by our sink. */
+  matchesCurrentState(cellId: string): boolean {
+    const generation = this.#active.get(cellId);
+    if (generation === undefined) return false;
+    const cell = this.cellFor(generation);
+    return cell !== null && generation.matchesRememberedState(cell);
   }
 
   /**
@@ -208,11 +251,14 @@ export class GenerationRegistry implements GenerationHost {
    * `null` when the cell does not exist, its id is ambiguous, or it is not a
    * code cell - the queue must then stop before sending anything.
    */
-  begin(cellId: string): OutputSink | null {
+  begin(cellId: string, expectedIdentityToken?: string): OutputSink | null {
     if (this.#host.isDisposed()) return null;
     const entries = this.#host.index.all(cellId);
     if (entries.length !== 1) return null;
     const entry = entries[0]!;
+    if (expectedIdentityToken !== undefined && entry.identityToken !== expectedIdentityToken) {
+      return null;
+    }
     const cell = resolveCell(this.#host.notebook, entry);
     if (!isCodeCell(cell)) return null;
 
@@ -303,19 +349,45 @@ export class GenerationRegistry implements GenerationHost {
     return true;
   }
 
+  appendStream(
+    generation: OutputGeneration,
+    index: number,
+    text: string
+  ): boolean {
+    const cell = this.cellFor(generation);
+    if (cell === null) return false;
+    this.#host.ydoc.transact((transaction) => {
+      this.#host.markLocalTransaction(transaction);
+      const claims = this.#streamClaims.get(transaction);
+      if (claims === undefined) {
+        this.#streamClaims.set(transaction, new Map([[generation.cellId, text]]));
+      } else {
+        claims.set(generation.cellId, (claims.get(generation.cellId) ?? '') + text);
+      }
+      cell.appendStreamOutput(index, text);
+      const live = this.cellFor(generation);
+      if (live !== null) generation.rememberState(live);
+    }, this.#host.origin);
+    return true;
+  }
+
   /** One transaction with the connection's origin, attributed to `generation`. */
   #transact(generation: OutputGeneration, fn: () => void): void {
     this.#host.ydoc.transact((transaction) => {
       this.#host.markLocalTransaction(transaction);
-      const claimed = this.#claims.get(transaction);
-      if (claimed === undefined) {
-        this.#claims.set(transaction, new Map([[generation.cellId, generation]]));
-      } else {
-        claimed.set(generation.cellId, generation);
-      }
       fn();
+      const cell = this.cellFor(generation);
+      if (cell !== null) generation.rememberState(cell);
     }, this.#host.origin);
   }
+}
+
+function streamValue(output: NbOutput): { name: string; text: string } | null {
+  if (output.output_type !== 'stream') return null;
+  return {
+    name: output.name,
+    text: typeof output.text === 'string' ? output.text : output.text.join('')
+  };
 }
 
 /**

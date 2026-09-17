@@ -1,12 +1,4 @@
-/**
- * Adversarial review: SPEC.md §12 "Identity and ranges", "External writes",
- * "Cursors and outputs" and "Tool coverage".
- *
- * SPEC.md §12 "External writes": "disappeared IDs, replacement Y.Maps with the
- * same ID, and reordering invalidate the corresponding targets/cursors/output
- * generations." SPEC.md §10: "notebook_changes returns a bounded event journal:
- * additions/removals and source/metadata/output edits ...".
- */
+/** Identity, external-write, cursor, and change-journal coverage. */
 
 import { describe, expect, it } from 'vitest';
 import type * as Y from 'yjs';

@@ -11,10 +11,11 @@ count, reads plots and tracebacks, and follows what the user changed
 meanwhile. One long-lived process holds the sessions, the replicas and the
 kernel bindings; every tool call is an ordinary request/response.
 
-Status: the RTC client, the notebook model and the execution layer are
-implemented and covered by unit, integration and end-to-end tests; the MCP
-adapter is being assembled on top of them. See [SPEC.md](SPEC.md) and
-[docs/STATUS.md](docs/STATUS.md).
+Status: the RTC client, notebook model, execution layer, stateful service and
+18-tool MCP adapter are implemented. Unit, integration, acceptance and
+end-to-end suites cover the package; remaining limitations are tracked in
+[docs/STATUS.md](docs/STATUS.md) and the normative behavior is in
+[SPEC.md](SPEC.md).
 
 ## Requirements
 
@@ -108,7 +109,7 @@ Output snapshots are also exposed as `jupyter-output:` MCP resources
   `side_effects: none|applied|unknown`. A Python error is not a tool error -
   it is a job in state `failed`.
 - **Closing never stops a kernel**, and cancelling a job never interrupts one.
-- Limits are configurable defaults, not measured capacities: 100 cells per
+- Limits use configurable defaults and make no capacity claim: 100 cells per
   summary, 64 KiB of text per response, 30 s of wait per call, 10 000 journal
   events, 32 replicas and 64 sessions per process.
 
@@ -134,4 +135,42 @@ pnpm build              # tsc -p tsconfig.build.json -> dist/
 - [docs/PUBLISHING.md](docs/PUBLISHING.md) - release process
 - [skill/SKILL.md](skill/SKILL.md) - the agent skill
 
-MIT © 2026 Lilia Grigoreva
+For a server that validates an external assertion directly, configure a profile
+in the JSON file passed to `--config`:
+
+```json
+{
+  "servers": [{
+    "id": "work",
+    "kind": "jupyterhub",
+    "apiBaseUrl": "http://127.0.0.1:8888/user/example/",
+    "auth": {"type": "header", "name": "X-Jupyter-Access-Token"},
+    "credentialRef": "file:/run/secrets/jupyter-access-jwt"
+  }]
+}
+```
+
+The header carries the raw credential on REST, collaboration, and kernel
+connections. Its meaning and validation belong to the server. This does not
+perform a Hub OAuth exchange or authenticate a separate external proxy gate.
+Use HTTPS for remote servers; the loopback example is for a local tunnel.
+Existing profiles default to Jupyter token authentication. Credentials are read
+once per server client; after rotating a credential file, restart MCP. Restarting
+loses MCP sessions and handles but does not stop Jupyter kernels.
+
+## Optional hosted HTTP mode
+
+The main executable's optional [HTTP mode](gateway/README.md) exposes the same
+tools and output resources over authenticated MCP HTTP. It uses OIDC and
+encrypted Redis token storage, with an isolated Node worker for each verified
+principal and credential generation. Existing stdio installations do not need
+HTTP mode or Redis.
+
+The HTTP mode's [configuration and lifecycle contract](gateway/DESIGN.md) covers
+identity mapping, fixed Jupyter routing, credential expiry, worker limits, and
+handle ownership. Build its non-root container from this repository with
+`docker build -f gateway/Dockerfile --target tested -t jupyter-mcp-http:local .`.
+
+## License
+
+[MIT](LICENSE)

@@ -17,7 +17,7 @@ export type { CollabServiceOptions } from './service.js';
 export { ServerRegistry, describeServer } from './server-registry.js';
 export type { ServerEntry, ServerRegistryOptions } from './server-registry.js';
 
-export { resolveCredential, resolveServer } from './credentials.js';
+export { resolveCredential, resolveServer, validateServerProfile } from './credentials.js';
 export type { CredentialSources } from './credentials.js';
 
 export { discoverLocalServers, jupyterRuntimeDir, runtimeDirCandidates } from './discovery.js';

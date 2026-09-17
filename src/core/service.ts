@@ -724,6 +724,11 @@ export interface ExecutionCellView {
   readonly outputIncomplete: boolean;
   /** Bounded outputs collected for this cell, in order. */
   readonly outputs: readonly OutputEntry[];
+  /**
+   * `true` when these entries replace the output state represented by the
+   * request cursor. This also reports a clear as an empty replacement.
+   */
+  readonly outputsReset: boolean;
   /** `true` when {@link outputs} was cut by the response budget. */
   readonly outputsTruncated: boolean;
 }

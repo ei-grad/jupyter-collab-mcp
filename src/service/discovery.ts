@@ -27,7 +27,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ServerProfile } from '../core/index.js';
-import { deriveWsBaseUrl, normalizeBaseUrl } from '../jupyter/paths.js';
+import { deriveWsBaseUrl, validateBaseUrl } from '../jupyter/paths.js';
 
 /** Injection points; the defaults touch the real filesystem. */
 export interface DiscoveryEnvironment {
@@ -164,7 +164,7 @@ function toProfile(
   if (typeof descriptor.url !== 'string' || descriptor.url.length === 0) return null;
   let apiBaseUrl: string;
   try {
-    apiBaseUrl = normalizeBaseUrl(new URL(descriptor.url).toString());
+    apiBaseUrl = validateBaseUrl(descriptor.url, 'http', 'discovered API base URL');
   } catch {
     return null;
   }

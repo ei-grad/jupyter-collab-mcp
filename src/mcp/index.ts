@@ -1,9 +1,9 @@
 /**
  * MCP adapter (SPEC.md §9).
  *
- * `src/core/service.ts` defines the contract; this module is the only place
- * that knows about MCP at all. Everything below `src/core/` stays usable
- * without it, so a CLI can later be built on the same long-lived process
+ * `src/core/service.ts` defines the contract; this module owns the canonical
+ * stdio adapter. The hosted gateway proxies MCP without moving protocol
+ * concerns below `src/core/`, so the core remains usable independently
  * (SPEC.md §1).
  *
  * - `schemas.ts` - the snake_case input/output schemas of the 18 tools;
@@ -29,9 +29,10 @@ export {
   fromWire,
   jsonByteSize,
   snakeKey,
-  toWire
+  toWire,
+  WireBudgetError
 } from './wire.js';
 export type { BoundedPayload, WireObject, WireValue } from './wire.js';
 
-export { CLI_USAGE, loadCliConfig, runCli } from './cli.js';
-export type { CliOptions, CliResult, LoadedCliConfig } from './cli.js';
+export { CLI_USAGE, loadCliConfig, runCli, runMainCli } from './cli.js';
+export type { CliOptions, CliResult, LoadedCliConfig, MainCliOptions } from './cli.js';

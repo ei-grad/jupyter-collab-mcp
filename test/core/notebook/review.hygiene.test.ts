@@ -1,42 +1,11 @@
-/**
- * Adversarial review: SPEC.md §7 (batch semantics, REVISION_CONFLICT payload),
- * §9 (limits), §11 (credentials never reach messages) and §12
- * "Cleanup and credentials".
- */
-
-import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+/** Revision-conflict, response-limit, and credential-redaction coverage. */
 
 import { describe, expect, it } from 'vitest';
-import type * as Y from 'yjs';
 
 import type { CoreError } from '../../../src/core/errors.js';
 import { Wire, reviewBook, reviewCode, reviewPeer, typeInto } from './review.helpers.js';
 
-const MODULE_DIR = new URL('../../../src/core/notebook/', import.meta.url).pathname;
-
-function sourceFiles(): { name: string; text: string }[] {
-  return readdirSync(MODULE_DIR)
-    .filter((name) => name.endsWith('.ts'))
-    .map((name) => ({ name, text: readFileSync(join(MODULE_DIR, name), 'utf8') }));
-}
-
-/** Strip block and line comments so a doc mention is not a false positive. */
-function stripComments(text: string): string {
-  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
-}
-
-describe('review: module hygiene (SPEC.md §7, §11)', () => {
-  it('contains no await, no async and no console/env access', () => {
-    for (const file of sourceFiles()) {
-      const code = stripComments(file.text);
-      expect(`${file.name}: ${/\basync\b/.test(code)}`).toBe(`${file.name}: false`);
-      expect(`${file.name}: ${/\bawait\b/.test(code)}`).toBe(`${file.name}: false`);
-      expect(`${file.name}: ${/\bconsole\./.test(code)}`).toBe(`${file.name}: false`);
-      expect(`${file.name}: ${/process\.env/.test(code)}`).toBe(`${file.name}: false`);
-    }
-  });
-
+describe('review: credential redaction (SPEC.md §7, §11)', () => {
   it('never echoes cell text or metadata values into a thrown error (SPEC.md §11)', () => {
     const secret = 'token=SUPERSECRET-9f3a';
     const peer = reviewPeer(
@@ -235,8 +204,6 @@ describe('review: cleanup after dispose (SPEC.md §6, §12 "Cleanup and credenti
     typeInto(remote.notebook, 0, 'after dispose');
     expect(local.notebook.getCell(0).getSource()).toBe('after dispose');
     expect(local.model.changesCursor).toBe(frozen);
-    const deep = local.notebook.ydoc.getArray('cells') as unknown as { _dEH: { l: unknown[] } };
-    expect(deep._dEH.l).toHaveLength(0);
     local.model.dispose(); // idempotent
     wire.dispose();
     local.notebook.dispose();

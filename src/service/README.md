@@ -7,7 +7,7 @@ handles, jobs, output snapshots, and the `request_id` registry. Nothing here
 knows about MCP.
 
 ```
-src/mcp (later)        →  CollabService                    ← this module
+src/mcp                →  CollabService                    ← this module
                           ├── ServerRegistry               profiles, credentials, discovery
                           ├── SessionRegistry              working sessions, limits
                           │   └── WorkingSession            ledger + lock + outputs + handles
@@ -16,8 +16,9 @@ src/mcp (later)        →  CollabService                    ← this module
                           └── OutputStore                   immutable snapshots, output_read/resources
 ```
 
-There is one entry point: `createCollabService(config, options?)`. Everything
-else is exported for tests and for a future HTTP adapter.
+There is one entry point: `createCollabService(config, options?)`, exported
+from the package root. Lower-level service classes remain exported for focused
+tests and transport adapters.
 
 ## Files
 
@@ -39,14 +40,14 @@ else is exported for tests and for a future HTTP adapter.
 
 Everything runs under the session lock, in this order:
 
-1. validate arguments, handle, limits, kernel binding, and cell targets
-   **before** creating a receipt; the number is not consumed
-   (`request_accepted: false`);
-2. `RequestLedger.begin`: if the number is in the registry and the payload
+1. `RequestLedger.preflight`: if the number is in the registry and the payload
    matches, replay; a different payload gives `REQUEST_ID_CONFLICT`; if the
    number is absent and `<= H`, return `REQUEST_ID_EXPIRED`; if it is
    `> H + 1`, return `REQUEST_OUT_OF_ORDER`;
-3. for number `H + 1`, validate request size and reserve receipt space, then
+2. only for number `H + 1`, validate arguments, handle, limits, kernel binding,
+   and cell targets **before** creating a receipt; the number is not consumed
+   (`request_accepted: false`);
+3. validate request size and reserve receipt space, then
    create the receipt and increment `H` **before the first effect**;
 4. perform the effect. Any error after step 3 returns
    `request_accepted: true`.
@@ -56,10 +57,11 @@ a thrown `CoreError` (`next_request_id`, `request_accepted`,
 `first_accepted_at`), so a read-only call always restores the counter (§10
 item 3).
 
-For `notebook_apply`, the operation batch is planned twice: once before the
-receipt (`planOperations` is pure and changes nothing), so `CELL_NOT_FOUND`,
-`REVISION_CONFLICT`, and `MATCH_NOT_*` do not consume a number, and once inside
-`NotebookModel.apply`.
+For a new `notebook_apply`, the operation batch is planned twice: once before
+the receipt (`planOperations` is pure and changes nothing), so
+`CELL_NOT_FOUND`, `REVISION_CONFLICT`, and `MATCH_NOT_*` do not consume a
+number, and once inside `NotebookModel.apply`. An existing exact receipt is
+replayed before planning against state changed by the first call.
 
 For `notebook_execute`, the receipt stores **a reference to the job**, not its
 result; outputs are not copied into the replay registry (§9). If a stored result
@@ -77,6 +79,8 @@ returns the existing handle; concurrent opens are coalesced through
 `notebook_close`/`session_close` are idempotent for their own handle (bounded
 tombstone), reject with `EXECUTION_ACTIVE` by default, and **never** shut down
 the kernel. `force` abandons the job, which becomes `unknown`.
+Close and shutdown fence every asynchronous stage of a pending open. A handle
+that becomes ready after its session closed is disposed instead of registered.
 
 ## Kernel
 
@@ -86,8 +90,9 @@ call: zero sessions → `KERNEL_NOT_BOUND`, more than one →
 `KernelHub.acquire(server_id, kernel_id)`. There is one `KernelClient` and one
 `ExecutionRegistry` per kernel, so all process handles share a queue (§4).
 
-`kernel_control` requires `expected_kernel_id` and checks it **before** the
-receipt. A mismatch gives `KERNEL_CHANGED` without consuming a number.
+For a new request, `kernel_control` requires `expected_kernel_id` and checks it
+**before** the receipt. An exact retry replays before rechecking the binding; a
+new mismatch gives `KERNEL_CHANGED` without consuming a number.
 `interrupt`/`restart` use the kernel connection when one is available (the same
 request sent by the browser, whose effect our client observes); `shutdown`
 deletes the Jupyter session; `switch` applies a session `PATCH`. After
@@ -119,6 +124,12 @@ evicted snapshot gives `HANDLE_EXPIRED`.
 The URI is `jupyter-output://<session_id>/<output_id>`; the short form
 `jupyter-output:<output_id>` is also accepted. Neither form contains
 credentials.
+
+An execution cursor records the output-list version and delivered entry count
+for each cell. Pagination continues within an unchanged version. A stream
+append, display replacement, or clear creates a new version, so the next
+`execution_get` returns `outputs_reset: true` with the current replacement
+state even after the job itself is terminal.
 
 ## Budgets
 

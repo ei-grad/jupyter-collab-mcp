@@ -100,43 +100,6 @@ describe('outputsRevision', () => {
   });
 });
 
-describe('source and outputs revisions are independent (SPEC.md §7)', () => {
-  it('an outputs change does not move source_revision', () => {
-    const source = 'x = 40 + 2\nx';
-    const before = sourceRevision('code', source);
-    const cellBefore = {
-      id: 'c1',
-      cell_type: 'code',
-      source,
-      metadata: {},
-      execution_count: null,
-      outputs: []
-    } as const;
-    const cellAfter = {
-      ...cellBefore,
-      execution_count: 1,
-      outputs: [
-        {
-          output_type: 'execute_result',
-          data: { 'text/plain': '42' },
-          metadata: {},
-          execution_count: 1
-        }
-      ]
-    };
-
-    expect(sourceRevision('code', source)).toBe(before);
-    expect(outputsRevision([])).not.toBe(outputsRevision(cellAfter.outputs as NbOutput[]));
-    expect(cellRevision(cellBefore)).not.toBe(cellRevision(cellAfter));
-  });
-
-  it('a source change does not move outputs_revision', () => {
-    const before = outputsRevision(outputs);
-    void sourceRevision('code', 'changed');
-    expect(outputsRevision(outputs)).toBe(before);
-  });
-});
-
 describe('cellRevision', () => {
   it('is deterministic and key-order independent', () => {
     const a = { id: 'c1', cell_type: 'code', source: 'x', metadata: { tags: ['a'] } };

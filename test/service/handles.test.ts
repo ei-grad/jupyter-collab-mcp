@@ -29,13 +29,14 @@ interface Rig {
   readonly handles: NotebookHandle[];
   /** Resolves the next open only when the test says so. */
   gate: (() => void) | null;
+  readonly reachedGate: Promise<void>;
 }
 
 function makeRig(
   options: {
     files?: readonly string[];
     limits?: Record<string, number>;
-    slowOpen?: boolean;
+    slowStage?: 'status' | 'contents' | 'collaboration' | 'replica';
   } = {}
 ): Rig {
   const server = makeFakeServer({
@@ -46,23 +47,51 @@ function makeRig(
   });
   const opens: NotebookHandleInit[] = [];
   const handles: NotebookHandle[] = [];
+  let markReached: (() => void) | null = null;
+  const reachedGate = new Promise<void>((resolve) => {
+    markReached = resolve;
+  });
+  const waitAtGate = async (): Promise<void> => {
+    markReached?.();
+    await new Promise<void>((resolve) => {
+      rig.gate = resolve;
+    });
+  };
   const rig: Rig = {
     server,
     opens,
     handles,
     gate: null,
+    reachedGate,
     service: createCollabService(
       { servers: [PROFILE], ...(options.limits === undefined ? {} : { limits: options.limits }) },
       {
-        fetchImpl: server.fetchImpl,
+        fetchImpl: async (input, init) => {
+          const url = new URL(typeof input === 'string' ? input : input.toString());
+          const method = (init?.method ?? 'GET').toUpperCase();
+          if (options.slowStage === 'status' && method === 'GET' && url.pathname === '/api/status') {
+            await waitAtGate();
+          }
+          if (
+            options.slowStage === 'contents' &&
+            method === 'GET' &&
+            url.pathname === '/api/contents/a.ipynb'
+          ) {
+            await waitAtGate();
+          }
+          if (
+            options.slowStage === 'collaboration' &&
+            method === 'PUT' &&
+            url.pathname === '/api/collaboration/session/a.ipynb'
+          ) {
+            await waitAtGate();
+          }
+          return server.fetchImpl(input, init);
+        },
         guardStdout: false,
         openHandle: async (init) => {
           opens.push(init);
-          if (options.slowOpen === true) {
-            await new Promise<void>((resolve) => {
-              rig.gate = resolve;
-            });
-          }
+          if (options.slowStage === 'replica') await waitAtGate();
           const { handle } = makeFakeHandle(init);
           handles.push(handle);
           return handle;
@@ -158,6 +187,17 @@ describe('working sessions', () => {
     await rig.service.sessionOpen({});
     expect(await codeOf(() => rig.service.sessionOpen({}))).toBe('RESOURCE_LIMIT');
   });
+
+  it('shutdown fences session_open while server status is pending', async () => {
+    const rig = rigFor({ slowStage: 'status' });
+    const pending = rig.service.sessionOpen({});
+    await rig.reachedGate;
+
+    await rig.service.shutdown('client_request');
+    rig.gate?.();
+
+    expect(await codeOf(() => pending)).toBe('HANDLE_EXPIRED');
+  });
 });
 
 describe('notebook handles', () => {
@@ -172,7 +212,7 @@ describe('notebook handles', () => {
   });
 
   it('concurrent opens of one document coalesce into one operation', async () => {
-    const rig = rigFor({ slowOpen: true });
+    const rig = rigFor({ slowStage: 'replica' });
     const session = await rig.service.sessionOpen({});
     const a = rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
     const b = rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
@@ -184,6 +224,34 @@ describe('notebook handles', () => {
     expect(first.notebook.notebookId).toBe(second.notebook.notebookId);
     expect([first.reused, second.reused].filter(Boolean)).toHaveLength(1);
   });
+
+  for (const stage of ['contents', 'collaboration', 'replica'] as const) {
+    it(`session_close fences an open paused in the ${stage} stage`, async () => {
+      const rig = rigFor({ limits: { maxOpenNotebooks: 1 }, slowStage: stage });
+      const session = await rig.service.sessionOpen({});
+      const pending = rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
+      await rig.reachedGate;
+
+      await rig.service.sessionClose({ sessionId: session.sessionId });
+      rig.gate?.();
+
+      expect(await codeOf(() => pending)).toBe('HANDLE_EXPIRED');
+      expect(rig.handles.every((handle) => handle.closed)).toBe(true);
+    });
+
+    it(`shutdown fences an open paused in the ${stage} stage`, async () => {
+      const rig = rigFor({ slowStage: stage });
+      const session = await rig.service.sessionOpen({});
+      const pending = rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
+      await rig.reachedGate;
+
+      await rig.service.shutdown('client_request');
+      rig.gate?.();
+
+      expect(await codeOf(() => pending)).toBe('HANDLE_EXPIRED');
+      expect(rig.handles.every((handle) => handle.closed)).toBe(true);
+    });
+  }
 
   it('NOTEBOOK_NOT_FOUND for a path the server does not have', async () => {
     const rig = rigFor();
@@ -247,6 +315,75 @@ describe('notebook handles', () => {
     expect(second.notebook.notebookId).not.toBe(first.notebook.notebookId);
     expect(second.reused).toBe(false);
     expect(rig.opens).toHaveLength(2);
+  });
+});
+
+describe('output snapshots', () => {
+  it('pages text only on UTF-8 boundaries and rejects an insufficient budget without advancing', async () => {
+    const rig = rigFor();
+    const session = await rig.service.sessionOpen({});
+    const opened = await rig.service.notebookOpen({
+      sessionId: session.sessionId,
+      path: 'a.ipynb'
+    });
+    const text = '😀¢€😀';
+    const cellId = opened.summary.cells[0]!.cellId;
+    const cell = rig.handles[0]!.notebook.getCell(0) as unknown as {
+      setOutputs(outputs: unknown[]): void;
+    };
+    cell.setOutputs([{ output_type: 'stream', name: 'stdout', text }]);
+    const outputs = await rig.service.notebookRead({
+      notebookId: opened.notebook.notebookId,
+      view: 'outputs',
+      cellIds: [cellId],
+      limits: { maxBytes: 1 }
+    });
+    const snapshot = outputs.cells[0]!.outputs[0]!.snapshot!;
+
+    let insufficient: unknown;
+    try {
+      await rig.service.outputRead({ outputId: snapshot.outputId, limits: { maxBytes: 1 } });
+    } catch (error) {
+      insufficient = error;
+    }
+    expect(isCoreError(insufficient) && insufficient.code).toBe('RESOURCE_LIMIT');
+    expect(isCoreError(insufficient) ? insufficient.details : undefined).toMatchObject({
+      byte_offset: 0,
+      required_bytes: 4,
+      max_bytes: 1
+    });
+    expect(
+      await codeOf(() =>
+        rig.service.outputRead({
+          outputId: snapshot.outputId,
+          cursor: 'oc_1' as never,
+          limits: { maxBytes: 4 }
+        })
+      )
+    ).toBe('CURSOR_EXPIRED');
+
+    const chunks: string[] = [];
+    const byteLengths: number[] = [];
+    let deliveredBytes = 0;
+    let cursor: string | undefined;
+    do {
+      const chunk = await rig.service.outputRead({
+        outputId: snapshot.outputId,
+        ...(cursor === undefined ? {} : { cursor: cursor as never }),
+        limits: { maxBytes: 4 }
+      });
+      expect(chunk.byteOffset).toBe(deliveredBytes);
+      expect(chunk.data).not.toContain('�');
+      chunks.push(chunk.data);
+      const chunkBytes = Buffer.byteLength(chunk.data, 'utf8');
+      byteLengths.push(chunkBytes);
+      deliveredBytes += chunkBytes;
+      cursor = chunk.nextCursor;
+    } while (cursor !== undefined);
+
+    expect(chunks.join('')).toBe(text);
+    expect(byteLengths).toEqual([4, 2, 3, 4]);
+    expect(deliveredBytes).toBe(Buffer.byteLength(text, 'utf8'));
   });
 });
 

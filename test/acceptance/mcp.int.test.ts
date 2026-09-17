@@ -225,6 +225,17 @@ describe('Create name (SPEC §12)', () => {
     );
     expect(stat.status).toBe(200);
   }, 120_000);
+
+  it('removes the pristine server placeholder from a fresh notebook', async () => {
+    const created = await mcp.call('notebook_create', {
+      session_id: main.id,
+      request_id: main.counter.value,
+      directory: '',
+      name: nb('placeholder')
+    });
+    main.counter.take(created);
+    expect(obj(created['summary'])['cell_count']).toBe(0);
+  });
 });
 
 describe('Reopening / Separate conversations (SPEC §12)', () => {
@@ -382,7 +393,7 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
     const summary = obj(page['summary']);
     expect(list(summary['cells'])).toHaveLength(1);
     expect(summary['truncated']).toBe(true);
-    expect(Number(summary['cell_count'])).toBeGreaterThanOrEqual(3);
+    expect(Number(summary['cell_count'])).toBeGreaterThanOrEqual(2);
     const cursor = str(page['next_cursor']);
     expect(cursor.length).toBeGreaterThan(0);
 
@@ -514,19 +525,8 @@ describe('Retries / Replay and call ordering (SPEC §12)', () => {
   }, 120_000);
 });
 
-/**
- * Known defect, kept executable so the fix is provable.
- *
- * `it.fails` passes while the body throws: resending an identical
- * `notebook_apply` under the same `request_id` must replay the receipt
- * (SPEC §9, §12 "Retries"), but every operation except `add_cell` carries an
- * expected revision, and the batch is planned against the replica *before*
- * the ledger is consulted - so the resend answers REVISION_CONFLICT instead.
- * When this test starts failing, the ordering was fixed: delete `.fails` and
- * keep the assertions.
- */
-describe('Retries: known ordering defect', () => {
-  it.fails('resending an identical revision-bearing apply replays instead of conflicting', async () => {
+describe('Retries: revision-bearing operations', () => {
+  it('resending an identical revision-bearing apply replays instead of conflicting', async () => {
     const session = await openSession('acceptance-replay-defect');
     const created = await mcp.call('notebook_create', {
       session_id: session.id,
@@ -536,15 +536,21 @@ describe('Retries: known ordering defect', () => {
     });
     session.counter.take(created);
     const notebookId = str(obj(created['notebook'])['notebook_id']);
+    const added = await mcp.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: session.counter.value,
+      operations: [{ op: 'add_cell', cell_type: 'raw', source: 'delete me', position: 'end' }]
+    });
+    session.counter.take(added);
+    const target = obj(list(added['results'])[0]);
     const payload = {
       notebook_id: notebookId,
       request_id: session.counter.value,
       operations: [
         {
-          op: 'set_notebook_metadata',
-          expected_notebook_metadata_revision: str(obj(created['summary'])['notebook_metadata_revision']),
-          key: 'replay_defect',
-          value: 1
+          op: 'delete_cell',
+          cell_id: str(target['cell_id']),
+          expected_cell_revision: str(target['cell_revision'])
         }
       ]
     };
@@ -701,13 +707,17 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
   }, 60_000);
 
   it('kernel_control start binds a kernel', async () => {
-    const started = await mcp.call('kernel_control', {
+    const payload = {
       notebook_id: docId,
       request_id: main.counter.value,
       action: 'start',
       expected_kernel_id: null,
       kernel_name: 'python3'
-    });
+    };
+    const started = await mcp.call('kernel_control', payload);
+    const replay = await mcp.call('kernel_control', payload);
+    expect(replay['replayed']).toBe(true);
+    expect(replay['kernel_id']).toBe(started['kernel_id']);
     main.counter.take(started);
     const effects = obj(started['effects']);
     expect(effects['kernel_started']).toBe(true);
@@ -730,6 +740,68 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     // The websocket to the kernel is opened lazily; it is connected by the
     // time the first run finishes (asserted in the execution scenario).
     expect(['connecting', 'connected']).toContain(str(status['channel_state']));
+  }, 60_000);
+
+  it('replays switch and shutdown after each action changes the binding', async () => {
+    const session = await openSession('acceptance-kernel-replay');
+    const created = await mcp.call('notebook_create', {
+      session_id: session.id,
+      request_id: session.counter.value,
+      directory: '',
+      name: nb('kernel-replay')
+    });
+    session.counter.take(created);
+    const notebookId = str(obj(created['notebook'])['notebook_id']);
+    const started = await mcp.call('kernel_control', {
+      notebook_id: notebookId,
+      request_id: session.counter.value,
+      action: 'start',
+      expected_kernel_id: null,
+      kernel_name: 'python3'
+    });
+    session.counter.take(started);
+    startedKernels.add(str(started['kernel_id']));
+
+    const switchPayload = {
+      notebook_id: notebookId,
+      request_id: session.counter.value,
+      action: 'switch',
+      expected_kernel_id: started['kernel_id'],
+      kernel_name: 'python3'
+    };
+    const switched = await mcp.call('kernel_control', switchPayload);
+    const switchReplay = await mcp.call('kernel_control', switchPayload);
+    expect(switchReplay['replayed']).toBe(true);
+    expect(switchReplay['kernel_id']).toBe(switched['kernel_id']);
+    session.counter.take(switched);
+    startedKernels.add(str(switched['kernel_id']));
+
+    const shutdownPayload = {
+      notebook_id: notebookId,
+      request_id: session.counter.value,
+      action: 'shutdown',
+      expected_kernel_id: switched['kernel_id']
+    };
+    const stopped = await mcp.call('kernel_control', shutdownPayload);
+    const shutdownReplay = await mcp.call('kernel_control', shutdownPayload);
+    expect(stopped['kernel_id']).toBeNull();
+    expect(shutdownReplay['replayed']).toBe(true);
+    expect(shutdownReplay['kernel_id']).toBeNull();
+    await mcp.call('session_close', { session_id: session.id });
+  }, 120_000);
+
+  it('persists the selected kernelspec in notebook metadata', async () => {
+    const live = await mcp.call('notebook_read', { notebook_id: docId, view: 'cells' });
+    expect(obj(obj(live['notebook_metadata'])['kernelspec'])['name']).toBe('python3');
+
+    const saved = await mcp.call('notebook_save', { notebook_id: docId, timeout_ms: 20_000 });
+    expect(saved['save_status']).toBe('success');
+    const stored = await apiFetchOk(
+      { baseUrl: stand.baseUrl, token: stand.token },
+      `/api/contents/${docPath}?content=1`
+    );
+    const content = obj(stored.json<{ content?: unknown }>().content);
+    expect(obj(obj(content['metadata'])['kernelspec'])['name']).toBe('python3');
   }, 60_000);
 
   it('runs a printing + PNG cell, waits for succeeded and delivers the image out of band', async () => {
@@ -933,13 +1005,17 @@ describe('Interruption and cancellation (SPEC §12)', () => {
     const kernelId = str(started['kernel_id']);
     startedKernels.add(kernelId);
 
-    const job = await mcp.call('notebook_execute', {
+    const executionPayload = {
       notebook_id: notebookId,
       request_id: session.counter.value,
       cells,
       stop_on_error: false,
       wait_ms: 500
-    });
+    };
+    const job = await mcp.call('notebook_execute', executionPayload);
+    const replay = await mcp.call('notebook_execute', executionPayload);
+    expect(replay['replayed']).toBe(true);
+    expect(replay['execution_id']).toBe(job['execution_id']);
     session.counter.take(job);
     const executionId = str(job['execution_id']);
     // Still running when the wait ended - the answer is bounded, the job is

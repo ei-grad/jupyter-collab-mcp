@@ -18,7 +18,7 @@ import {
   type ResolvedServer,
   type ServerProfile
 } from '../core/index.js';
-import { deriveWsBaseUrl, normalizeBaseUrl } from '../jupyter/paths.js';
+import { deriveWsBaseUrl, validateBaseUrl } from '../jupyter/paths.js';
 
 /** Everything the resolver may read; injected so tests need no real files. */
 export interface CredentialSources {
@@ -78,17 +78,54 @@ export function resolveCredential(ref: CredentialRef, sources: CredentialSources
   );
 }
 
+/** Validate and normalize every externally supplied URL on a server profile. */
+export function validateServerProfile(
+  profile: ServerProfile
+): ServerProfile & { readonly wsBaseUrl: string } {
+  const apiBaseUrl = validateBaseUrl(profile.apiBaseUrl, 'http', 'API base URL');
+  const wsBaseUrl = validateBaseUrl(
+    profile.wsBaseUrl ?? deriveWsBaseUrl(apiBaseUrl),
+    'websocket',
+    'WebSocket base URL'
+  );
+  const browserBaseUrl =
+    profile.browserBaseUrl === undefined
+      ? undefined
+      : validateBaseUrl(profile.browserBaseUrl, 'http', 'browser base URL');
+  return {
+    ...profile,
+    apiBaseUrl,
+    wsBaseUrl,
+    ...(browserBaseUrl === undefined ? {} : { browserBaseUrl })
+  };
+}
+
 /** Profile plus its resolved credential, ready for `src/jupyter`. */
 export function resolveServer(
   profile: ServerProfile,
   sources: CredentialSources = {}
 ): ResolvedServer {
-  const apiBaseUrl = normalizeBaseUrl(profile.apiBaseUrl);
-  const wsBaseUrl = normalizeBaseUrl(profile.wsBaseUrl ?? deriveWsBaseUrl(apiBaseUrl));
+  const validated = validateServerProfile(profile);
+  const apiBaseUrl = validated.apiBaseUrl;
+  const wsBaseUrl = validated.wsBaseUrl;
+  const auth = validated.auth;
+  if (auth !== undefined && (auth === null || !['token', 'header'].includes(auth.type))) {
+    throw coreError('INVALID_ARGUMENT', 'unsupported authentication type');
+  }
+  if (auth?.type === 'header' &&
+      (typeof auth.name !== 'string' || !/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(auth.name) ||
+       /^(authorization|proxy-authorization|cookie|host|connection|upgrade|content-.*|transfer-encoding|sec-websocket-.*)$/i.test(auth.name))) {
+    throw coreError('INVALID_ARGUMENT', 'invalid authentication header name');
+  }
+  const credential = resolveCredential(validated.credentialRef, sources);
+  if ((auth?.type === 'header' && !credential) || /[^\x20-\x7e]/.test(credential)) {
+    throw coreError('AUTH_REQUIRED', 'credential is not a valid authentication header value');
+  }
   return {
-    profile,
+    profile: validated,
     apiBaseUrl,
     wsBaseUrl,
-    token: resolveCredential(profile.credentialRef, sources)
+    token: auth?.type === 'header' ? '' : credential,
+    ...(auth?.type === 'header' ? { authHeaders: { [auth.name]: credential } } : {})
   };
 }

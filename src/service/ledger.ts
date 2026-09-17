@@ -143,18 +143,11 @@ export class RequestLedger {
   }
 
   /**
-   * Apply the SPEC.md §9 rules to one incoming number.
-   *
-   * @throws CoreError `INVALID_ARGUMENT` - not a canonical decimal number, or
-   * the session's range is exhausted.
-   * @throws CoreError `REQUEST_ID_CONFLICT` - known number, different payload.
-   * @throws CoreError `REQUEST_ID_EXPIRED` - unknown number `<= H`.
-   * @throws CoreError `REQUEST_OUT_OF_ORDER` - a number beyond `H + 1`.
-   * @throws CoreError `RESOURCE_LIMIT` - the request does not fit the input
-   * budget, or no receipt slot can be freed. Nothing ran and the number stays
-   * unused in every one of these cases.
+   * Resolve every request-number outcome that precedes mutable preconditions.
+   * `null` means exactly `H + 1`, so the caller may validate current state and
+   * then call {@link begin} to reserve and accept the operation.
    */
-  begin(request: BeginRequest): LedgerDecision {
+  preflight(request: BeginRequest): LedgerDecision | null {
     const parsed = parseRequestId(request.requestId);
     if (parsed === null) {
       throw coreError(
@@ -163,9 +156,9 @@ export class RequestLedger {
         { details: { request_id: request.requestId, next_request_id: this.nextRequestId } }
       );
     }
-    const digest = payloadDigest(request.tool, request.target, request.payload);
     const existing = this.#receipts.get(request.requestId);
     if (existing !== undefined) {
+      const digest = payloadDigest(request.tool, request.target, request.payload);
       if (existing.digest !== digest) {
         throw coreError(
           'REQUEST_ID_CONFLICT',
@@ -198,6 +191,26 @@ export class RequestLedger {
         { details: { request_id: request.requestId, next_request_id: this.nextRequestId } }
       );
     }
+    return null;
+  }
+
+  /**
+   * Apply the SPEC.md §9 rules to one incoming number.
+   *
+   * @throws CoreError `INVALID_ARGUMENT` - not a canonical decimal number, or
+   * the session's range is exhausted.
+   * @throws CoreError `REQUEST_ID_CONFLICT` - known number, different payload.
+   * @throws CoreError `REQUEST_ID_EXPIRED` - unknown number `<= H`.
+   * @throws CoreError `REQUEST_OUT_OF_ORDER` - a number beyond `H + 1`.
+   * @throws CoreError `RESOURCE_LIMIT` - the request does not fit the input
+   * budget, or no receipt slot can be freed. Nothing ran and the number stays
+   * unused in every one of these cases.
+   */
+  begin(request: BeginRequest): LedgerDecision {
+    const preflight = this.preflight(request);
+    if (preflight !== null) return preflight;
+    const parsed = parseRequestId(request.requestId)!;
+    const digest = payloadDigest(request.tool, request.target, request.payload);
 
     // -- step 4: preconditions and the memory reserve, still before any effect
     const requestBytes = Buffer.byteLength(JSON.stringify(request.payload) ?? 'null', 'utf8');

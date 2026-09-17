@@ -15,6 +15,7 @@ import {
   reconnectDelayMs,
   type RtcConnectionOptions
 } from '../../src/jupyter/rtc-connection.js';
+import { connect as connectMcp, metaError, type Harness } from '../mcp/harness.js';
 import { FakeRtcServer } from './helpers/fake-rtc-server.js';
 
 const FILE_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -291,6 +292,59 @@ describe('RtcConnection: close-code fixtures (SPEC.md §6 table)', () => {
     // budget 2 => attempts 1..3 are made, the third close is terminal.
     expect(server.seenRooms).toHaveLength(3);
   });
+
+  it.each([
+    {
+      name: 'token-authenticated',
+      credential: 'token-close-reason-secret',
+      options: { token: 'token-close-reason-secret' }
+    },
+    {
+      name: 'assertion-header-authenticated',
+      credential: 'assertion-close-reason-secret',
+      options: {
+        token: '',
+        authHeaders: { 'X-Jupyter-Access-Token': 'assertion-close-reason-secret' }
+      }
+    }
+  ])(
+    'does not expose a credential from a $name RTC failure through MCP',
+    async ({ credential, options }) => {
+      const server = await startServer();
+      server.planClose({ code: 1003, reason: JSON.stringify({ reason: credential }) });
+      const { connection } = makeConnection(server, options);
+      let terminal: unknown;
+      try {
+        await connection.connect(5_000);
+        expect.fail('expected RTC rejection');
+      } catch (error) {
+        terminal = error;
+      }
+      expectTerminal(terminal, 'RTC_INITIALIZATION_FAILED');
+      if ('authHeaders' in options) {
+        expect(server.seenHeaders[0]?.['x-jupyter-access-token']).toBe(credential);
+        expect(server.seenAuthorizations[0]).toBeNull();
+      } else {
+        expect(server.seenAuthorizations[0]).toBe(`token ${credential}`);
+      }
+
+      let mcp: Harness | undefined;
+      try {
+        mcp = await connectMcp({
+          fake: { failWith: { method: 'notebookOpen', error: terminal } }
+        });
+        const answer = await mcp.call('notebook_open', {
+          session_id: 'ses_1',
+          path: 'work/analysis.ipynb'
+        });
+        expect(answer.isError).toBe(true);
+        expect(metaError(answer)).toMatchObject({ code: 'RTC_INITIALIZATION_FAILED' });
+        expect(JSON.stringify(answer)).not.toContain(credential);
+      } finally {
+        await mcp?.close();
+      }
+    }
+  );
 });
 
 describe('RtcConnection: reconnect (SPEC.md §6, §12)', () => {

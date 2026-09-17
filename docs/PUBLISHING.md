@@ -1,7 +1,7 @@
 # Publishing the `jupyter-collab-mcp` package
 
-Public unscoped npm package, account **lipa88**, MIT license.
-The version is set in `package.json`; the first release is `0.1.0`.
+Public unscoped npm package, account **ei-grad**, MIT license.
+The version is set in `package.json`.
 
 ## 1. Tarball contents
 
@@ -22,6 +22,16 @@ Exactly five top-level entries are expected: `LICENSE`, `README.md`, `dist`,
 `pnpm build` must run first; otherwise an outdated `dist` will be included in
 the tarball.
 
+Install the generated tarball through npm and invoke its bin symlink. Calling
+`dist/mcp/cli.js` directly does not verify package-manager entry-point behavior:
+
+```sh
+package_file=$(npm pack --silent)
+install_dir=$(mktemp -d)
+npm install --prefix "$install_dir" --ignore-scripts "./$package_file"
+"$install_dir/node_modules/.bin/jupyter-collab-mcp" --version
+```
+
 ## 2. npm token: only in `~/.npmrc`
 
 The token is not stored in the repository and must not appear in `package.json`,
@@ -31,8 +41,8 @@ repository root.
 Interactively:
 
 ```sh
-npm login            # account lipa88, 2FA
-npm whoami           # must print lipa88
+npm login            # account ei-grad, 2FA
+npm whoami           # must print ei-grad
 ```
 
 Alternatively, put an automation token in the user-level file:
@@ -78,7 +88,8 @@ grep -rn '_authToken' . --exclude-dir=node_modules --exclude-dir=.git
 5. Tag and release:
 
    ```sh
-   git tag v0.1.0 && git push origin v0.1.0
+   version=$(node -p "require('./package.json').version")
+   git tag "v$version" && git push origin "v$version"
    ```
 
 ## 4. Verifying the published package
@@ -86,14 +97,16 @@ grep -rn '_authToken' . --exclude-dir=node_modules --exclude-dir=.git
 Use a clean cache to avoid picking up a local build:
 
 ```sh
-NPM_CONFIG_CACHE="$(mktemp -d)" npx -y jupyter-collab-mcp@0.1.0 --help
+version=$(node -p "require('./package.json').version")
+NPM_CONFIG_CACHE="$(mktemp -d)" npx -y "jupyter-collab-mcp@$version" --help
 ```
 
-Expected result: help text on stdout, exit status 0, no Jupyter request, and no
-token in the output. Inspect the registry tarball contents:
+Expected result: help text on stderr, an empty stdout, exit status 0, no
+Jupyter request, and no token in either stream. stdout remains reserved for MCP
+frames even for CLI help. Inspect the registry tarball contents:
 
 ```sh
-npm view jupyter-collab-mcp@0.1.0 dist.tarball files
+npm view "jupyter-collab-mcp@$version" dist.tarball files
 ```
 
 To verify it as an MCP server, add it to a client using the instructions in the
@@ -116,7 +129,7 @@ For Codex, either reference the file from `AGENTS.md` or copy it to
 
 ## 6. After the release
 
-- Run `npm deprecate jupyter-collab-mcp@0.1.0 "..."` if the release is broken;
+- Run `npm deprecate jupyter-collab-mcp@<version> "..."` if a release is broken;
   `npm unpublish` is available only for a limited period and breaks clients.
 - For the next version, bump `version`, update `docs/STATUS.md`, and update
   `skill/SKILL.md` if tool names or `request_id` semantics changed.

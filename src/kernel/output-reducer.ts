@@ -41,7 +41,12 @@
  */
 
 import type { NbErrorOutput, NbOutput, NbStreamOutput, SharedExecutionState } from '../core/types.js';
-import type { DisplayRegistry, DisplayTarget, OutputAreaRef } from './display-registry.js';
+import {
+  sameOutputArea,
+  type DisplayRegistry,
+  type DisplayTarget,
+  type OutputAreaRef
+} from './display-registry.js';
 import {
   contentBoolean,
   contentNumber,
@@ -59,6 +64,7 @@ export type ReducerStatus = 'running' | 'ok' | 'error' | 'aborted';
 /** Commands for an `OutputSink`, produced by {@link ExecutionReducer.feed}. */
 export type ReducerEffect =
   | { readonly kind: 'append'; readonly target: OutputAreaRef; readonly output: NbOutput }
+  | { readonly kind: 'appendStream'; readonly target: DisplayTarget; readonly text: string }
   | { readonly kind: 'update'; readonly target: DisplayTarget; readonly output: NbOutput }
   | { readonly kind: 'replace'; readonly target: OutputAreaRef; readonly outputs: readonly NbOutput[] }
   | { readonly kind: 'clear'; readonly target: OutputAreaRef }
@@ -128,6 +134,8 @@ export interface ExecutionReducerOptions {
 export interface ExecutionReducer {
   /** Consume one routed message and return the resulting sink commands. */
   feed(msg: JupyterMessage): ReducerEffect[];
+  /** Keep the owner's cache aligned with a cross-execution display update. */
+  replaceOutput(index: number, output: NbOutput): boolean;
   /** Current state snapshot. */
   readonly state: ReducerState;
 }
@@ -192,7 +200,12 @@ export function createExecutionReducer(options: ExecutionReducerOptions): Execut
     clearPending = false;
     outputs = [];
     outputBytes = 0;
-    displays.forgetGeneration(area.notebookId, area.cellId, area.generation);
+    displays.forgetGeneration(
+      area.notebookId,
+      area.cellId,
+      area.identityToken,
+      area.generation
+    );
     return true;
   }
 
@@ -233,9 +246,7 @@ export function createExecutionReducer(options: ExecutionReducerOptions): Execut
       const merged: NbStreamOutput = { output_type: 'stream', name, text: joinText(last.text) + text };
       outputs[outputs.length - 1] = merged;
       outputBytes += delta;
-      return [
-        { kind: 'update', target: { ...area, index: outputs.length - 1 }, output: merged }
-      ];
+      return [{ kind: 'appendStream', target: { ...area, index: outputs.length - 1 }, text }];
     }
     return addOutput({ output_type: 'stream', name, text }, undefined);
   }
@@ -253,11 +264,7 @@ export function createExecutionReducer(options: ExecutionReducerOptions): Execut
     const output = { output_type: 'display_data', ...body } as unknown as NbOutput;
     const effects: ReducerEffect[] = [];
     for (const target of displays.resolve(displayId)) {
-      if (
-        target.notebookId === area.notebookId &&
-        target.cellId === area.cellId &&
-        target.generation === area.generation
-      ) {
+      if (sameOutputArea(target, area)) {
         const previous = outputs[target.index];
         if (previous === undefined) continue;
         const delta = sizeOf(output) - sizeOf(previous);
@@ -296,7 +303,12 @@ export function createExecutionReducer(options: ExecutionReducerOptions): Execut
     outputs = [];
     outputBytes = 0;
     outputIncomplete = false;
-    displays.forgetGeneration(area.notebookId, area.cellId, area.generation);
+    displays.forgetGeneration(
+      area.notebookId,
+      area.cellId,
+      area.identityToken,
+      area.generation
+    );
     return [{ kind: 'clear', target: area }];
   }
 
@@ -379,6 +391,13 @@ export function createExecutionReducer(options: ExecutionReducerOptions): Execut
 
   return {
     feed,
+    replaceOutput(index: number, output: NbOutput): boolean {
+      const previous = outputs[index];
+      if (previous === undefined) return false;
+      outputs[index] = output;
+      outputBytes += sizeOf(output) - sizeOf(previous);
+      return true;
+    },
     get state(): ReducerState {
       const base = {
         area,

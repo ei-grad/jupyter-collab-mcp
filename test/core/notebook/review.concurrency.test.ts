@@ -1,24 +1,10 @@
-/**
- * Adversarial review: SPEC.md §12 "Concurrent edits" and "Document data".
- *
- * The point of interest is not convergence - Yjs guarantees that - but whether
- * an operation touches more of the shared document than SPEC.md §7 says it
- * does: "Untouched keys are preserved."
- */
+/** Concurrent-edit preservation and convergence coverage. */
 
 import { describe, expect, it } from 'vitest';
-import * as Y from 'yjs';
 
 import type { DeleteNotebookMetadataOperation, SetNotebookMetadataOperation } from '../../../src/core/types.js';
 import { Wire, reviewBook, reviewCode, reviewPeer, typeInto } from './review.helpers.js';
 
-/**
- * Both replicas already agree; then the browser changes metadata key `keepme`
- * while we delete the unrelated key `doomed`. `YNotebook.deleteMetadata` is
- * implemented as `metadata = {...}; delete metadata[key]; setMetadata(metadata)`
- * and the object form of `setMetadata` does `ymetadata.clear()` followed by a
- * `set` of every surviving key, so our delete rewrites keys we never named.
- */
 function raceNotebookMetadata(localClientId: number, remoteClientId: number): {
   merged: Record<string, unknown>;
 } {
@@ -53,43 +39,19 @@ function raceNotebookMetadata(localClientId: number, remoteClientId: number): {
   return { merged };
 }
 
-describe('review: delete_notebook_metadata rewrites keys it was not asked to touch', () => {
-  it('reverts a concurrent remote edit of an unrelated key when we hold the higher client id', () => {
+describe('review: delete_notebook_metadata preserves unrelated concurrent edits', () => {
+  it('preserves the edit when the deleting client has the higher client id', () => {
     const { merged } = raceNotebookMetadata(999, 1);
-    // The browser wrote {deep: 42}; our delete of an unrelated key put {deep: 1}
-    // back over it and both replicas converged on the stale value.
     expect(merged['doomed']).toBeUndefined();
     expect(merged['keepme']).toEqual({ deep: 42 });
   });
 
-  it('keeps the concurrent edit when the client ids happen to fall the other way', () => {
+  it('preserves the edit when the deleting client has the lower client id', () => {
     const { merged } = raceNotebookMetadata(1, 999);
     expect(merged['keepme']).toEqual({ deep: 42 });
   });
 
-  it('a per-key delete of the same key would not have touched the concurrent edit', () => {
-    // Counterfactual with identical client ids and timing, deleting the key
-    // straight out of the metadata Y.Map instead of through the model.
-    const local = reviewPeer(
-      999,
-      reviewBook([reviewCode('c1', 'x')], { keepme: { deep: 1 }, doomed: true })
-    );
-    const remote = reviewPeer(1);
-    const wire = new Wire(local.notebook.ydoc, remote.notebook.ydoc);
-    remote.notebook.ydoc.transact(() => {
-      remote.notebook.setMetadata('keepme', { deep: 42 });
-    });
-    local.notebook.ydoc.transact(() => {
-      (local.notebook.ymeta.get('metadata') as Y.Map<unknown>).delete('doomed');
-    });
-    wire.deliver();
-    expect(local.notebook.getMetadata()).toEqual({ keepme: { deep: 42 } });
-    wire.dispose();
-    local.dispose();
-    remote.dispose();
-  });
-
-  it('set_notebook_metadata is per-key and does not have the problem', () => {
+  it('set_notebook_metadata also preserves unrelated concurrent edits', () => {
     const local = reviewPeer(
       999,
       reviewBook([reviewCode('c1', 'x')], { keepme: { deep: 1 }, doomed: true })

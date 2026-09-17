@@ -16,6 +16,7 @@
 
 import { ServerConnection } from '@jupyterlab/services';
 import WebSocket from 'ws';
+import { authenticatedWebSocket } from './ws-auth.js';
 
 import { coreError, type ErrorCode, type ResolvedServer } from '../core/index.js';
 import { httpRequest, parseJsonBody } from './http.js';
@@ -192,6 +193,7 @@ export class ServerClient {
   readonly serverId: string;
 
   readonly #token: string;
+  readonly #authHeaders: Readonly<Record<string, string>> | undefined;
   readonly #fetch: typeof fetch;
   #settings: ServerConnection.ISettings | null = null;
 
@@ -200,6 +202,7 @@ export class ServerClient {
     this.wsBaseUrl = normalizeBaseUrl(server.wsBaseUrl);
     this.serverId = server.profile.id;
     this.#token = server.token;
+    this.#authHeaders = server.authHeaders === undefined ? undefined : Object.freeze({ ...server.authHeaders });
     this.#fetch = options.fetchImpl ?? fetch;
   }
 
@@ -315,27 +318,70 @@ export class ServerClient {
   /**
    * `@jupyterlab/services` settings for the kernel layer (SPEC.md §8).
    *
-   * `appendToken: true` puts the token into the kernel WebSocket query string -
-   * the one place where the protocol leaves no choice (SPEC.md §11); such a URL
-   * must be redacted before it is logged. `@types/ws` and the DOM `WebSocket`
-   * type do not line up, hence the cast (spike/NOTES.md §3.6).
+   * Credentials stay in handshake headers, including kernel reconnects.
    */
   serverSettings(): ServerConnection.ISettings {
     if (this.#settings === null) {
       this.#settings = ServerConnection.makeSettings({
         baseUrl: `${this.apiBaseUrl}/`,
         wsUrl: `${this.wsBaseUrl}/`,
-        token: this.#token,
-        appendToken: true,
-        WebSocket: WebSocket as unknown as typeof globalThis.WebSocket,
+        token: '',
+        appendToken: false,
+        WebSocket: authenticatedWebSocket(this.#token, WebSocket as unknown as typeof globalThis.WebSocket, this.#authHeaders),
         // The injected implementation, not the global one: whatever transport
         // policy a profile needs (docs/CONNECTIONS.md §9 `tls_ca_ref`,
         // `proxy_auth_ref`) must cover the kernel layer as well as REST.
-        fetch: this.#fetch as unknown as ServerConnection.ISettings['fetch']
+        fetch: this.#authenticatedFetch as unknown as ServerConnection.ISettings['fetch']
       });
     }
     return this.#settings;
   }
+
+  /** Internal snapshot shared by REST, RTC, and kernel connections. Never log. */
+  connectionAuth(): { token: string; authHeaders?: Readonly<Record<string, string>> } {
+    return { token: this.#token, ...(this.#authHeaders === undefined ? {} : { authHeaders: this.#authHeaders }) };
+  }
+
+  readonly #authenticatedFetch: typeof fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (new URL(request.url).origin !== new URL(this.apiBaseUrl).origin) {
+      throw coreError('NETWORK_ERROR', 'kernel request targets a different origin');
+    }
+    const headers = new Headers(request.headers);
+    headers.delete('Authorization');
+    for (const [name, value] of Object.entries(this.#authHeaders ?? { Authorization: `token ${this.#token}` })) {
+      headers.set(name, value);
+    }
+    // Refuse redirects before the underlying fetch can forward custom headers.
+    const scrub = (text: string): string =>
+      Object.values(this.#authHeaders ?? { token: this.#token }).reduce(
+        (value, secret) => secret ? value.replaceAll(secret, '<redacted>') : value, text
+      );
+    let response: Response;
+    try {
+      response = await this.#fetch(new Request(request, { headers, redirect: 'error' }));
+    } catch (error) {
+      throw new Error(scrub(error instanceof Error ? error.message : 'kernel request failed'));
+    }
+    if (!response.ok) {
+      return new Response(scrub(await response.text()), {
+        status: response.status, statusText: scrub(response.statusText), headers: response.headers
+      });
+    }
+    // JSON.parse embeds input fragments in SyntaxError messages. The kernel
+    // library consumes response.json() directly, outside our REST error mapper.
+    const parseJson = response.json.bind(response);
+    Object.defineProperty(response, 'json', {
+      value: async () => {
+        try {
+          return await parseJson();
+        } catch {
+          throw coreError('INTERNAL_ERROR', 'kernel server returned an unreadable JSON response');
+        }
+      }
+    });
+    return response;
+  };
 
   /**
    * `PATCH /api/contents/<from>` with `{"path": "<to>"}` - the rename step of
@@ -491,6 +537,7 @@ export class ServerClient {
     return httpRequest(joinUrl(this.apiBaseUrl, route), this.#token, {
       method: options.method,
       fetchImpl: this.#fetch,
+      ...(this.#authHeaders === undefined ? {} : { authHeaders: this.#authHeaders }),
       ...(options.json === undefined ? {} : { json: options.json }),
       ...(options.allowStatus === undefined ? {} : { allowStatus: options.allowStatus }),
       ...(options.notFoundCode === undefined ? {} : { notFoundCode: options.notFoundCode })

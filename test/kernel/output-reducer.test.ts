@@ -14,7 +14,12 @@ import {
 import type { JupyterMessage } from '../../src/kernel/messages.js';
 import * as fx from './fixtures.js';
 
-const AREA: OutputAreaRef = { notebookId: 'nb_1', cellId: 'cell_a', generation: 1 };
+const AREA: OutputAreaRef = {
+  notebookId: 'nb_1',
+  cellId: 'cell_a',
+  identityToken: 'id:cell_a',
+  generation: 1
+};
 
 function reducerFor(
   msgId: string,
@@ -59,7 +64,7 @@ describe('createExecutionReducer: single message types', () => {
       fx.stream(parent, 'stdout', 'b\n'),
       fx.stream(parent, 'stdout', 'c\n')
     ]);
-    expect(effects.map((e) => e.kind)).toEqual(['append', 'update', 'update']);
+    expect(effects.map((e) => e.kind)).toEqual(['append', 'appendStream', 'appendStream']);
     expect(reducer.state.outputs).toEqual([
       { output_type: 'stream', name: 'stdout', text: 'a\nb\nc\n' }
     ]);
@@ -211,8 +216,18 @@ describe('createExecutionReducer: display ids', () => {
 
   it('routes an update from a later execution to an earlier cell', () => {
     const displays = new DisplayRegistry();
-    const firstArea: OutputAreaRef = { notebookId: 'nb_1', cellId: 'cell_a', generation: 1 };
-    const secondArea: OutputAreaRef = { notebookId: 'nb_1', cellId: 'cell_b', generation: 1 };
+    const firstArea: OutputAreaRef = {
+      notebookId: 'nb_1',
+      cellId: 'cell_a',
+      identityToken: 'id:cell_a',
+      generation: 1
+    };
+    const secondArea: OutputAreaRef = {
+      notebookId: 'nb_1',
+      cellId: 'cell_b',
+      identityToken: 'id:cell_b',
+      generation: 1
+    };
 
     const first = fx.nextMsgId('req');
     const firstReducer = createExecutionReducer({ area: firstArea, msgId: first, displays });

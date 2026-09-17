@@ -73,6 +73,7 @@ export interface NotebookHandleInit {
   readonly collaborationSessionId: string;
   readonly wsBaseUrl: string;
   readonly token: string;
+  readonly authHeaders?: Readonly<Record<string, string>>;
   readonly awarenessUser: { readonly name: string; readonly color: string };
   readonly journalLimit: number;
   readonly previewChars?: number;
@@ -128,6 +129,7 @@ export class NotebookHandle {
     const connection = new RtcConnection({
       wsBaseUrl: init.wsBaseUrl,
       token: init.token,
+      ...(init.authHeaders === undefined ? {} : { authHeaders: init.authHeaders }),
       fileId: init.fileId,
       sessionId: init.collaborationSessionId,
       ydoc: notebook.ydoc,

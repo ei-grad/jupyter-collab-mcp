@@ -8,6 +8,7 @@ dev/jupyter/.jupyter_ystore.db
 
 # scratch
 .scratch/
+.codex/config.toml
 
 # Node
 node_modules/

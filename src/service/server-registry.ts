@@ -28,7 +28,11 @@ import {
   type ServerProfile
 } from '../core/index.js';
 import { ServerClient } from '../jupyter/server-client.js';
-import { resolveServer, type CredentialSources } from './credentials.js';
+import {
+  resolveServer,
+  validateServerProfile,
+  type CredentialSources
+} from './credentials.js';
 import { discoverLocalServers, type DiscoveryEnvironment } from './discovery.js';
 
 /** One known server. The credential is resolved on first use, not on listing. */
@@ -50,13 +54,18 @@ export interface ServerRegistryOptions {
 
 /** Credential-free view of a profile (SPEC.md §9, §11). */
 export function describeServer(profile: ServerProfile): ServerDescriptor {
+  const validated = validateServerProfile(profile);
   return {
-    id: profile.id,
-    kind: profile.kind,
-    apiBaseUrl: profile.apiBaseUrl,
-    ...(profile.browserBaseUrl === undefined ? {} : { browserBaseUrl: profile.browserBaseUrl }),
-    ...(profile.hubUser === undefined ? {} : { hubUser: profile.hubUser }),
-    ...(profile.hubServerName === undefined ? {} : { hubServerName: profile.hubServerName })
+    id: validated.id,
+    kind: validated.kind,
+    apiBaseUrl: validated.apiBaseUrl,
+    ...(validated.browserBaseUrl === undefined
+      ? {}
+      : { browserBaseUrl: validated.browserBaseUrl }),
+    ...(validated.hubUser === undefined ? {} : { hubUser: validated.hubUser }),
+    ...(validated.hubServerName === undefined
+      ? {}
+      : { hubServerName: validated.hubServerName })
   };
 }
 
@@ -160,7 +169,7 @@ export class ServerRegistry {
 
   /** The resolved credential of a server; internal use only (SPEC.md §11). */
   tokenFor(entry: ServerEntry): string {
-    return resolveServer(entry.profile, this.#options.credentials).token;
+    return this.clientFor(entry).connectionAuth().token;
   }
 
   /**
@@ -198,12 +207,15 @@ export class ServerRegistry {
   }
 
   async #load(): Promise<ServerEntry[]> {
-    const configured = this.#config.servers.map((profile) => ({
-      id: profile.id,
-      profile,
-      origin: 'configured' as ServerOrigin,
-      descriptor: describeServer(profile)
-    }));
+    const configured = this.#config.servers.map((input) => {
+      const profile = validateServerProfile(input);
+      return {
+        id: profile.id,
+        profile,
+        origin: 'configured' as ServerOrigin,
+        descriptor: describeServer(profile)
+      };
+    });
     if (configured.length > 0) {
       const seen = new Set<string>();
       for (const entry of configured) {
@@ -221,11 +233,14 @@ export class ServerRegistry {
         : (await discoverLocalServers(this.#options.discovery ?? {})).map(
             (found) => found.profile
           );
-    return profiles.map((profile) => ({
-      id: profile.id,
-      profile,
-      origin: 'discovered' as ServerOrigin,
-      descriptor: describeServer(profile)
-    }));
+    return profiles.map((input) => {
+      const profile = validateServerProfile(input);
+      return {
+        id: profile.id,
+        profile,
+        origin: 'discovered' as ServerOrigin,
+        descriptor: describeServer(profile)
+      };
+    });
   }
 }

@@ -1,15 +1,11 @@
-/**
- * Adversarial review of `src/kernel/execution-registry.ts`, kept as a
- * regression suite.
- *
- * Every test targets a SPEC.md §12 acceptance row or an explicit §8
- * requirement, and each one failed against the first implementation; the
- * quoted requirement it checks is next to the decisive assertion.
- */
+/** Execution-registry identity, lifecycle, and failure-state coverage. */
 
 import { describe, expect, it } from 'vitest';
+import type { YCodeCell } from '@jupyter/ydoc';
+import type * as Y from 'yjs';
 import { sourceRevision, type JobState, type SourceRevision } from '../../src/core/index.js';
 import { ExecutionRegistry, type Revalidate } from '../../src/kernel/execution-registry.js';
+import { Wire, reviewBook, reviewCode, reviewPeer } from '../core/notebook/review.helpers.js';
 import { FakeSinkFactory } from './fake-sink.js';
 import * as fx from './fixtures.js';
 import { RoutingFakeKernel, captureUnhandledRejections, flush, sleep } from './review-fakes.js';
@@ -27,6 +23,22 @@ function tableRevalidate(sources: Map<string, string>): Revalidate {
     if (source === undefined) return { ok: false, code: 'cell_not_found' };
     if (rev(source) !== expected) return { ok: false, code: 'revision_conflict' };
     return { ok: true, source, identityToken: `id:${cellId}` };
+  };
+}
+
+function identityRevalidate(
+  sources: Map<string, string>,
+  identities: Map<string, string>
+): Revalidate {
+  return (cellId, expected, expectedIdentityToken) => {
+    const source = sources.get(cellId);
+    const identityToken = identities.get(cellId);
+    if (source === undefined || identityToken === undefined) {
+      return { ok: false, code: 'cell_not_found' };
+    }
+    if (identityToken !== expectedIdentityToken) return { ok: false, code: 'cell_replaced' };
+    if (rev(source) !== expected) return { ok: false, code: 'revision_conflict' };
+    return { ok: true, source, identityToken };
   };
 }
 
@@ -301,6 +313,160 @@ describe('registry disposal', () => {
 });
 
 describe('cross-execution display routing (SPEC §8, §12 "Outputs")', () => {
+  async function staleDisplayDoesNotReachReusedId(change: 'delete/recreate' | 'rename/reuse') {
+    const kernel = new RoutingFakeKernel();
+    const registry = new ExecutionRegistry(kernel.asKernelClient());
+    const sinks = new FakeSinkFactory();
+    const sources = new Map([
+      ['a', 'handle = display("v1", display_id=True)'],
+      ['u', 'handle.update("v2")']
+    ]);
+    const identities = new Map([
+      ['a', 'cell:a:old'],
+      ['u', 'cell:u']
+    ]);
+    sinks.identities.set('a', identities.get('a')!);
+    sinks.identities.set('u', identities.get('u')!);
+    const revalidate = identityRevalidate(sources, identities);
+
+    const original = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [
+        {
+          cellId: 'a',
+          sourceRevision: rev(sources.get('a')!),
+          identityToken: identities.get('a')!
+        }
+      ],
+      getSink: sinks.begin,
+      revalidate
+    });
+    const displayRequest = kernel.pending()!;
+    kernel.complete(displayRequest.msgId, 1, [
+      fx.displayData(displayRequest.msgId, { 'text/plain': 'v1' }, 'REUSED_ID_DISPLAY')
+    ]);
+    await drive(registry, kernel, original);
+
+    const replacementIdentity = `cell:a:${change}`;
+    identities.set('a', replacementIdentity);
+    sinks.replace('a', replacementIdentity);
+    const replacement = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [
+        {
+          cellId: 'a',
+          sourceRevision: rev(sources.get('a')!),
+          identityToken: replacementIdentity
+        }
+      ],
+      getSink: sinks.begin,
+      revalidate
+    });
+    await drive(registry, kernel, replacement);
+    const replacementSink = sinks.latest('a')!;
+    expect(replacementSink.generation).toBe(1);
+
+    const updater = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [
+        {
+          cellId: 'u',
+          sourceRevision: rev(sources.get('u')!),
+          identityToken: identities.get('u')!
+        }
+      ],
+      getSink: sinks.begin,
+      revalidate
+    });
+    const updateRequest = kernel.pending()!;
+    kernel.complete(updateRequest.msgId, 3, [
+      fx.updateDisplayData(
+        updateRequest.msgId,
+        { 'text/plain': 'must not reach replacement' },
+        'REUSED_ID_DISPLAY'
+      )
+    ]);
+    await drive(registry, kernel, updater);
+
+    expect(JSON.stringify(replacementSink.outputs)).not.toContain('must not reach replacement');
+    expect(registry.get(updater)!.job.cells[0]!.outputAreaLost).toBe(true);
+    registry.dispose();
+  }
+
+  it('does not route an old display target into a deleted and recreated same-id cell', async () => {
+    await staleDisplayDoesNotReachReusedId('delete/recreate');
+  });
+
+  it('does not route an old display target into a same-id cell after rename and reuse', async () => {
+    await staleDisplayDoesNotReachReusedId('rename/reuse');
+  });
+
+  it('keeps a recreated cell output when the same request updates its predecessor display', async () => {
+    const kernel = new RoutingFakeKernel();
+    const registry = new ExecutionRegistry(kernel.asKernelClient());
+    const sinks = new FakeSinkFactory();
+    const sources = new Map([['a', 'render()']]);
+    const identities = new Map([['a', 'cell:a:old']]);
+    sinks.identities.set('a', identities.get('a')!);
+    const revalidate = identityRevalidate(sources, identities);
+
+    const predecessor = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [
+        {
+          cellId: 'a',
+          sourceRevision: rev(sources.get('a')!),
+          identityToken: identities.get('a')!
+        }
+      ],
+      getSink: sinks.begin,
+      revalidate
+    });
+    const predecessorRequest = kernel.pending()!;
+    kernel.complete(predecessorRequest.msgId, 1, [
+      fx.displayData(
+        predecessorRequest.msgId,
+        { 'text/plain': 'predecessor' },
+        'PREDECESSOR_DISPLAY'
+      )
+    ]);
+    await drive(registry, kernel, predecessor);
+
+    identities.set('a', 'cell:a:new');
+    sinks.replace('a', identities.get('a')!);
+    const recreated = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [
+        {
+          cellId: 'a',
+          sourceRevision: rev(sources.get('a')!),
+          identityToken: identities.get('a')!
+        }
+      ],
+      getSink: sinks.begin,
+      revalidate
+    });
+    const recreatedRequest = kernel.pending()!;
+    kernel.complete(recreatedRequest.msgId, 2, [
+      fx.displayData(recreatedRequest.msgId, { 'text/plain': 'NEW' }),
+      fx.updateDisplayData(
+        recreatedRequest.msgId,
+        { 'text/plain': 'predecessor updated' },
+        'PREDECESSOR_DISPLAY'
+      )
+    ]);
+    await drive(registry, kernel, recreated);
+
+    const notebookOutputs = sinks.latest('a')!.outputs;
+    const collectedOutputs = registry.get(recreated)!.job.cells[0]!.outputsCollected;
+    expect(notebookOutputs).toEqual([
+      { output_type: 'display_data', data: { 'text/plain': 'NEW' }, metadata: {} }
+    ]);
+    expect(collectedOutputs).toEqual(notebookOutputs);
+    expect(registry.get(recreated)!.job.cells[0]!.outputAreaLost).toBe(true);
+    registry.dispose();
+  });
+
   it('an update to a superseded generation is stopped and recorded on the job', async () => {
     const kernel = new RoutingFakeKernel();
     const registry = new ExecutionRegistry(kernel.asKernelClient());
@@ -323,7 +489,6 @@ describe('cross-execution display routing (SPEC §8, §12 "Outputs")', () => {
       fx.displayData(req1.msgId, { 'text/plain': 'v1' }, 'DISPLAY_1')
     ]);
     await drive(registry, kernel, firstRun);
-
     // 2. the user re-runs `a`, so a new generation owns the output area.
     const secondRun = registry.submit({
       notebookRef: NOTEBOOK,
@@ -439,6 +604,7 @@ describe('cross-execution display routing (SPEC §8, §12 "Outputs")', () => {
       fx.displayData(req1.msgId, { 'text/plain': 'v1' }, 'DISPLAY_2')
     ]);
     await drive(registry, kernel, firstRun);
+    const firstVersion = registry.get(firstRun)!.job.cells[0]!.outputVersion;
 
     const updater = registry.submit({
       notebookRef: NOTEBOOK,
@@ -454,10 +620,180 @@ describe('cross-execution display routing (SPEC §8, §12 "Outputs")', () => {
 
     // The shared model got the update...
     expect(JSON.stringify(sinks.latest('a')!.outputs)).toContain('v2');
-    // ...but `execution_get` on the first job still reports the old bundle.
+    // ...and the earlier job publishes a new output version for execution_get.
     const collected = JSON.stringify(registry.get(firstRun)!.job.cells[0]!.outputsCollected);
     expect(collected).toContain('v2');
+    expect(registry.get(firstRun)!.job.cells[0]!.outputVersion).toBeGreaterThan(firstVersion);
+
+    const ownerSink = sinks.latest('a')!;
+    let fullOutputReads = 0;
+    const readOutputs = ownerSink.getOutputs.bind(ownerSink);
+    ownerSink.getOutputs = () => {
+      fullOutputReads += 1;
+      return readOutputs();
+    };
+    kernel.deliver(req1.msgId, fx.stream(req1.msgId, 'stdout', 'late\n'));
+    await flush();
+    const afterLate = registry.get(firstRun)!.job.cells[0]!.outputsCollected;
+    expect(JSON.stringify(afterLate)).toContain('v2');
+    expect(JSON.stringify(afterLate)).toContain('late');
+    expect(afterLate).toEqual(ownerSink.outputs);
+    expect(fullOutputReads).toBe(0);
     registry.dispose();
+  });
+});
+
+describe('accepted execution identity (SPEC §8 "Jobs")', () => {
+  it('does not send a queued replacement with the same id and source', async () => {
+    const kernel = new RoutingFakeKernel();
+    const registry = new ExecutionRegistry(kernel.asKernelClient());
+    const sinks = new FakeSinkFactory();
+    const sources = new Map([
+      ['a', 'first()'],
+      ['b', 'same_source()']
+    ]);
+    const identities = new Map([
+      ['a', 'cell:a'],
+      ['b', 'cell:b:accepted']
+    ]);
+    for (const [cellId, identityToken] of identities) {
+      sinks.identities.set(cellId, identityToken);
+    }
+    const revalidate = identityRevalidate(sources, identities);
+    const id = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [
+        { cellId: 'a', sourceRevision: rev('first()'), identityToken: 'cell:a' },
+        {
+          cellId: 'b',
+          sourceRevision: rev('same_source()'),
+          identityToken: 'cell:b:accepted'
+        }
+      ],
+      getSink: sinks.begin,
+      revalidate
+    });
+    expect(kernel.sent.map((request) => request.cellId)).toEqual(['a']);
+
+    identities.set('b', 'cell:b:replacement');
+    sinks.replace('b', 'cell:b:replacement');
+    kernel.complete(kernel.pending()!.msgId, 1);
+    await drive(registry, kernel, id);
+
+    expect(kernel.sent.map((request) => request.cellId)).toEqual(['a']);
+    expect(sinks.all('b')).toHaveLength(0);
+    expect(registry.get(id)!.job.cells[1]).toMatchObject({
+      state: 'not_sent',
+      notSentReason: 'cell_replaced'
+    });
+    registry.dispose();
+  });
+});
+
+describe('display routing across a shared-model identity boundary', () => {
+  async function staleDisplayAcrossPeerReplacement(change: 'delete/recreate' | 'rename/reuse') {
+    const local = reviewPeer(
+      41,
+      reviewBook([
+        reviewCode('a', 'handle = display("v1", display_id=True)'),
+        reviewCode('u', 'handle.update("v2")')
+      ])
+    );
+    const remote = reviewPeer(42);
+    const wire = new Wire(local.notebook.ydoc, remote.notebook.ydoc);
+    wire.setAuto(true);
+    const kernel = new RoutingFakeKernel();
+    const registry = new ExecutionRegistry(kernel.asKernelClient());
+    const revalidate: Revalidate = (cellId, expected, expectedIdentityToken) => {
+      try {
+        const ref = local.model.cellRef(cellId);
+        if (ref.identityToken !== expectedIdentityToken) {
+          return { ok: false, code: 'cell_replaced' };
+        }
+        const source = local.notebook.getCell(ref.index).getSource();
+        if (rev(source) !== expected) return { ok: false, code: 'revision_conflict' };
+        return { ok: true, source, identityToken: ref.identityToken };
+      } catch {
+        return { ok: false, code: 'cell_not_found' };
+      }
+    };
+    const accepted = (cellId: string) => {
+      const ref = local.model.cellRef(cellId);
+      const source = local.notebook.getCell(ref.index).getSource();
+      return { cellId, sourceRevision: rev(source), identityToken: ref.identityToken };
+    };
+    const getSink = (cellId: string, identityToken: string) =>
+      local.model.beginExecutionGeneration(cellId, identityToken);
+
+    const original = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [accepted('a')],
+      getSink,
+      revalidate
+    });
+    const displayRequest = kernel.pending()!;
+    kernel.complete(displayRequest.msgId, 1, [
+      fx.displayData(displayRequest.msgId, { 'text/plain': 'v1' }, 'RTC_REUSED_DISPLAY')
+    ]);
+    await drive(registry, kernel, original);
+
+    local.model.generations.invalidate('a');
+    const cells = remote.notebook.ydoc.getArray<Y.Map<unknown>>('cells');
+    const at = cells.toArray().findIndex((cell) => cell.get('id') === 'a');
+    remote.notebook.ydoc.transact(() => {
+      if (change === 'delete/recreate') {
+        remote.notebook.deleteCell(at);
+        remote.notebook.insertCell(at, reviewCode('a', 'handle = display("v1", display_id=True)') as never);
+      } else {
+        cells.get(at).set('id', 'renamed-a');
+        remote.notebook.insertCell(
+          at + 1,
+          reviewCode('a', 'handle = display("v1", display_id=True)') as never
+        );
+      }
+    });
+
+    const replacement = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [accepted('a')],
+      getSink,
+      revalidate
+    });
+    await drive(registry, kernel, replacement);
+
+    const updater = registry.submit({
+      notebookRef: NOTEBOOK,
+      cells: [accepted('u')],
+      getSink,
+      revalidate
+    });
+    const updateRequest = kernel.pending()!;
+    kernel.complete(updateRequest.msgId, 3, [
+      fx.updateDisplayData(
+        updateRequest.msgId,
+        { 'text/plain': 'must not cross identity' },
+        'RTC_REUSED_DISPLAY'
+      )
+    ]);
+    await drive(registry, kernel, updater);
+
+    const replacementRef = local.model.cellRef('a');
+    const replacementOutputs = (local.notebook.getCell(replacementRef.index) as YCodeCell).getOutputs();
+    expect(JSON.stringify(replacementOutputs)).not.toContain('must not cross identity');
+    expect(registry.get(updater)!.job.cells[0]!.outputAreaLost).toBe(true);
+
+    registry.dispose();
+    wire.dispose();
+    local.dispose();
+    remote.dispose();
+  }
+
+  it('rejects a stale display target after peer delete/recreate with the same id', async () => {
+    await staleDisplayAcrossPeerReplacement('delete/recreate');
+  });
+
+  it('rejects a stale display target after peer rename and id reuse', async () => {
+    await staleDisplayAcrossPeerReplacement('rename/reuse');
   });
 });
 

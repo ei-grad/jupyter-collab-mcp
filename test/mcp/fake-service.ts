@@ -162,8 +162,15 @@ export interface FakeOptions {
   readonly bigImage?: boolean;
   /** Emit this many summary cells, to exercise the response budget. */
   readonly bulkCells?: number;
+  readonly oversizedMetadata?: boolean;
+  /** Put output-shaped user values in metadata and attachments. */
+  readonly outputShapedOpaqueData?: boolean;
+  /** Return a completed execution whose kernel result is failed. */
+  readonly executionFailed?: boolean;
   /** Make `readOutputResource` answer "too large for one read". */
   readonly resourceTooLarge?: boolean;
+  /** Number of resource descriptors exposed through paginated listing. */
+  readonly resourceCount?: number;
 }
 
 const envelope = { nextRequestId: '5' } as const;
@@ -325,8 +332,19 @@ export class FakeCollabService implements CollabService {
     };
     let result: NotebookReadResult;
     if (request.view === 'summary') {
-      result = { ...common, view: 'summary', summary: this.summary() };
+      const summary = this.summary();
+      result = {
+        ...common,
+        view: 'summary',
+        summary,
+        ...(summary.pageCursor === undefined ? {} : { nextCursor: summary.pageCursor })
+      };
     } else if (request.view === 'cells') {
+      const outputShapedValue = {
+        output_type: 'display_data',
+        index: 91,
+        output: { output_type: 'display_data', data: { 'image/png': TINY_PNG }, metadata: {} }
+      };
       result = {
         ...common,
         view: 'cells',
@@ -338,7 +356,15 @@ export class FakeCollabService implements CollabService {
             source: 'df.head()',
             sourceTruncated: false,
             sourceBytes: 9,
-            metadata: { tags: ['keep'], 'user/Weird Key': 1 },
+            metadata:
+              this.options.oversizedMetadata === true
+                ? { payload: 'x'.repeat(100_000) }
+                : this.options.outputShapedOpaqueData === true
+                  ? { 'user/Weird Key': outputShapedValue, value: ['kept', { exactlyAsGiven: true }] }
+                  : { tags: ['keep'], 'user/Weird Key': 1 },
+            ...(this.options.outputShapedOpaqueData === true
+              ? { attachments: { 'opaque.png': { 'image/png': TINY_PNG }, nested: outputShapedValue } }
+              : {}),
             sourceRevision: SRC,
             cellRevision: CELL,
             outputsRevision: OUT,
@@ -424,17 +450,18 @@ export class FakeCollabService implements CollabService {
   }
 
   private view(executionId: string, notebookId: string): ExecutionView {
+    const failed = this.options.executionFailed === true;
     return {
       executionId,
       notebookId,
       sessionId: 'ses_1',
       kernelId: 'k_1',
-      state: 'succeeded',
+      state: failed ? 'failed' : 'succeeded',
       stopOnError: true,
       cells: [
         {
           cellId: 'cell_a',
-          state: 'succeeded',
+          state: failed ? 'failed' : 'succeeded',
           sourceRevision: SRC,
           msgId: 'msg_1',
           executionCount: 4,
@@ -442,11 +469,13 @@ export class FakeCollabService implements CollabService {
           cellDeleted: false,
           outputIncomplete: false,
           outputs: this.outputs(),
+          outputsReset: false,
           outputsTruncated: false
         }
       ],
       createdAt: '2026-09-06T10:03:00Z',
       finishedAt: '2026-09-06T10:03:02Z',
+      ...(failed ? { reason: 'ValueError: boom' } : {}),
       cursor: 'exe_7',
       waitTimedOut: false,
       lifetime: LIFETIME_JOB
@@ -624,19 +653,24 @@ export class FakeCollabService implements CollabService {
 
   async listOutputResources(cursor?: string): Promise<ListOutputResourcesResult> {
     this.calls.push({ method: 'listOutputResources', request: cursor });
+    const count = this.options.resourceCount ?? 1;
+    const offset = cursor === undefined ? 0 : Number(cursor.slice('res_'.length));
+    const end = Math.min(offset + 100, count);
     return {
-      resources: [
-        {
-          uri: 'jupyter-output:out_1',
-          outputId: 'out_1',
-          name: 'cell 0 · image/png',
+      resources: Array.from({ length: end - offset }, (_, index) => {
+        const number = offset + index + 1;
+        return {
+          uri: `jupyter-output:out_${String(number)}`,
+          outputId: `out_${String(number)}`,
+          name: `cell ${String(number - 1)} · image/png`,
           mimeType: 'image/png',
           byteSize: TINY_PNG.length,
           executionId: 'exe_1',
           notebookId: 'nb_1',
           lifetime: LIFETIME_JOB
-        }
-      ]
+        };
+      }),
+      ...(end < count ? { nextCursor: `res_${String(end)}` } : {})
     };
   }
 
