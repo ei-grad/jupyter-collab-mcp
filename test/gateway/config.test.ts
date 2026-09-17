@@ -45,6 +45,15 @@ describe('gateway configuration', () => {
     expect(config.nodeCommand).toMatch(/\/node_modules\/\.bin\/tsx$/);
     expect(config.upstreamCli).toMatch(/\/src\/mcp\/cli\.ts$/);
     expect(config.runtimeDir).toBe('/run/mcp');
+    expect(config.allowMissingEmailVerified).toBe(false);
+  });
+
+  it.each(['true', 'false'])('loads explicit missing-email-claim policy %s', (value) => {
+    expect(loadGatewayConfig(environment({ JUPYTER_MCP_ALLOW_MISSING_EMAIL_VERIFIED: value })).allowMissingEmailVerified).toBe(value === 'true');
+  });
+
+  it.each(['', '1', '0', 'TRUE', 'yes', 'null', ' true '])('rejects malformed missing-email-claim policy %j', (value) => {
+    expect(() => loadGatewayConfig(environment({ JUPYTER_MCP_ALLOW_MISSING_EMAIL_VERIFIED: value }))).toThrow('must be true or false');
   });
 
   it.each([

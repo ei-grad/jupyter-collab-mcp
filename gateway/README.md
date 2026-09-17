@@ -25,6 +25,7 @@ All variables use the `JUPYTER_MCP_` prefix.
 | `REDIRECT_URIS` | Space-separated exact callbacks or bounded callback patterns |
 | `USERNAME_EMAIL_DOMAIN` | Required verified email domain |
 | `USERNAME_MODE` | `email-localpart` or `email-localpart-dashes` |
+| `ALLOW_MISSING_EMAIL_VERIFIED` | `true` or `false` (default); permit only an absent claim from the configured trusted issuer |
 | `ALLOWED_USERS` | Space-separated provisioned JupyterHub usernames |
 | `API_BASE_URL` | Operator-controlled JupyterHub proxy base |
 | `BROWSER_BASE_URL` | Display base; defaults to `API_BASE_URL` |
@@ -36,6 +37,12 @@ All variables use the `JUPYTER_MCP_` prefix.
 | `CONNECT_TIMEOUT` | Worker initialization timeout in seconds; default 10 |
 | `EXPIRY_POLL_SECONDS` | Expired-worker sweep interval; default 5 |
 | `NODE_COMMAND`, `UPSTREAM_CLI` | Optional local worker executable overrides |
+
+Enable `ALLOW_MISSING_EMAIL_VERIFIED` only for a configured issuer whose
+authentication policy establishes the signed email identity without that claim.
+It permits absence only: explicit `false`, `null` and malformed values remain
+rejected, along with invalid signatures, issuer/audience, expiry, domains and
+unprovisioned users. There are no automatic issuer-hostname exceptions.
 
 Redirect patterns accept an exact HTTPS callback, one bounded HTTPS path suffix
 such as `https://client.example.invalid/oauth/*`, or a loopback port pattern

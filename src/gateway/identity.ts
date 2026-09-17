@@ -18,6 +18,7 @@ export interface IdentityVerifierOptions {
   readonly emailDomain: string;
   readonly usernameMode: UsernameMode;
   readonly allowedUsers: ReadonlySet<string>;
+  readonly allowMissingEmailVerified?: boolean;
   readonly now?: () => number;
   readonly getKey?: JWTVerifyGetKey;
   readonly fetchImpl?: typeof fetch;
@@ -159,8 +160,11 @@ export class IdentityVerifier {
     ) {
       throw new IdentityVerificationError('invalid_claims');
     }
-    if (emailVerified === undefined) throw new IdentityVerificationError('email_verified_missing');
-    if (emailVerified !== true) throw new IdentityVerificationError('email_not_verified');
+    if (emailVerified === undefined) {
+      if (this.#options.allowMissingEmailVerified !== true) throw new IdentityVerificationError('email_verified_missing');
+    } else if (emailVerified !== true) {
+      throw new IdentityVerificationError('email_not_verified');
+    }
     if (!emailPattern.test(email)) throw new IdentityVerificationError('email_domain');
     let username = email.slice(0, -(`@${this.#options.emailDomain}`).length);
     if (this.#options.usernameMode === 'email-localpart-dashes') {

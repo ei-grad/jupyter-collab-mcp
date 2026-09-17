@@ -264,11 +264,15 @@ describe('hosted OAuth authorization flow', () => {
   it.each([
     { mode: 'success', basePath: '' },
     { mode: 'success', basePath: '/gateway/jupyter' },
+    ...['strict_missing_email_verified', 'opt_in_missing_email_verified', 'opt_in_false', 'opt_in_null', 'opt_in_string'].map((mode) => ({ mode, basePath: '' })),
     ...['nonce_mismatch', 'unexpected_refresh_token', 'missing_id_token'].map((mode) => ({ mode, basePath: '' }))
   ])('uses the real Node callback and openid-client exchange: $mode $basePath', async ({ mode, basePath }) => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const publicUrl = `https://mcp.example${basePath}`;
-    const gatewayConfig = { ...config(), publicUrl: new URL(publicUrl) };
+    const gatewayConfig = {
+      ...config(), publicUrl: new URL(publicUrl),
+      allowMissingEmailVerified: mode.startsWith('opt_in_')
+    };
     const store = new EncryptedStore(
       new MemoryKeyValueBackend(),
       gatewayConfig.storageKey
@@ -298,7 +302,10 @@ describe('hosted OAuth authorization flow', () => {
         const now = Math.floor(Date.now() / 1000);
         const idToken = await new SignJWT({
           email: 'alice.person@example.invalid',
-          email_verified: true,
+          email_verified: mode.endsWith('missing_email_verified') ? undefined
+            : mode === 'opt_in_false' ? false
+              : mode === 'opt_in_null' ? null
+                : mode === 'opt_in_string' ? 'true' : true,
           nonce: mode === 'nonce_mismatch' ? 'sensitive-wrong-nonce' : authorizationNonce
         })
           .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
@@ -372,14 +379,34 @@ describe('hosted OAuth authorization flow', () => {
     expect(tokenRedirectUri).toBe(`${publicUrl}/auth/callback`);
     expect(completed?.status).toBe(303);
     const clientCallback = new URL(completed!.headers.get('location')!);
-    if (mode === 'success') {
+    if (mode === 'success' || mode === 'opt_in_missing_email_verified') {
       expect(clientCallback.searchParams.get('code')).not.toBeNull();
       expect(stderr).not.toHaveBeenCalled();
+      if (mode === 'opt_in_missing_email_verified') {
+        const tokenResponse = await oauth.handle(new Request(`${publicUrl}/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'authorization_code', client_id: clientId,
+            code: clientCallback.searchParams.get('code')!, redirect_uri: REDIRECT_URI,
+            code_verifier: verifier
+          })
+        }));
+        expect(tokenResponse?.status).toBe(200);
+        const token = await tokenResponse!.json() as { access_token: string };
+        const authenticated = await oauth.verifyBearer(`Bearer ${token.access_token}`);
+        expect(authenticated).not.toBeInstanceOf(Response);
+        if (authenticated instanceof Response) throw new Error('opt-in identity rejected');
+        expect(authenticated.identity.username).toBe('alice-person');
+      }
     } else {
       expect(clientCallback.searchParams.get('error')).toBe('server_error');
       expect(clientCallback.searchParams.has('code')).toBe(false);
+      const identityFailure = mode === 'strict_missing_email_verified' || mode.startsWith('opt_in_');
+      const reason = mode === 'strict_missing_email_verified' ? 'email_verified_missing'
+        : mode.startsWith('opt_in_') ? 'email_not_verified' : mode;
       expect(stderr.mock.calls.map(([text]) => text)).toEqual([
-        `oauth_callback_failed stage=upstream_exchange reason=${mode}\n`
+        `oauth_callback_failed stage=${identityFailure ? 'identity_verification' : 'upstream_exchange'} reason=${reason}\n`
       ]);
     }
     expect(clientCallback.searchParams.get('state')).toBe('client-state');

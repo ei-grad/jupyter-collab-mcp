@@ -1089,9 +1089,13 @@ upstream ID token. Redirects are checked against current operator policy at
 registration, authorization, and callback time. Upstream OIDC discovery, JWKS,
 and token requests never follow redirects. An inconclusive identity-verification
 failure denies the request but does not destroy a still-live local grant.
-An identity derived from an email claim is accepted only when the signed
-`email_verified` claim is the boolean `true`. A false, missing, or malformed
-claim is rejected before a worker slot or process is allocated.
+An identity derived from an email claim requires the signed `email_verified`
+claim to be boolean `true` by default. An operator may explicitly set
+`JUPYTER_MCP_ALLOW_MISSING_EMAIL_VERIFIED=true` to also accept an absent claim
+from the configured trusted issuer. The setting accepts only `true` or `false`
+and defaults to `false`; it never permits explicit false, null or malformed
+claim values. Signature, issuer, audience, expiry, email-domain and provisioned
+user checks remain mandatory before a worker slot or process is allocated.
 
 A worker and its handles belong to one issuer, subject, Hub user, and assertion
 generation. Different principals or credential generations cannot use those

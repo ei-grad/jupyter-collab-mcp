@@ -6,6 +6,7 @@ import { IdentityVerifier, identityFailureReason } from '../../src/gateway/ident
 const NOW = 1_800_000_000;
 let privateKey: CryptoKey;
 let verifier: IdentityVerifier;
+let optInVerifier: IdentityVerifier;
 
 async function issue(changes: Record<string, unknown> = {}): Promise<string> {
   const claims = {
@@ -26,16 +27,18 @@ beforeAll(async () => {
   const pair = await generateKeyPair('RS256', { extractable: true });
   privateKey = pair.privateKey;
   const jwk = await exportJWK(pair.publicKey);
-  verifier = new IdentityVerifier({
+  const options = {
     issuer: 'https://issuer.example',
     audience: 'gateway-client',
     jwksUri: new URL('https://issuer.example/jwks'),
     emailDomain: 'example.invalid',
-    usernameMode: 'email-localpart-dashes',
+    usernameMode: 'email-localpart-dashes' as const,
     allowedUsers: new Set(['alice-person']),
     now: () => NOW,
     getKey: createLocalJWKSet({ keys: [{ ...jwk, kid: 'test-key', alg: 'RS256' }] })
-  });
+  };
+  verifier = new IdentityVerifier(options);
+  optInVerifier = new IdentityVerifier({ ...options, allowMissingEmailVerified: true });
 });
 
 describe('OIDC access identity', () => {
@@ -60,10 +63,14 @@ describe('OIDC access identity', () => {
     { email: 'unknown@example.invalid' },
     { email: 'Alice.Person@example.invalid' },
     { email_verified: false },
+    { email_verified: null },
     { email_verified: 'true' },
     { email_verified: 1 }
   ])('rejects an invalid signed identity %#', async (changes) => {
     await expect(verifier.verify(await issue(changes))).rejects.toThrow(
+      'access ID token is missing or invalid'
+    );
+    await expect(optInVerifier.verify(await issue(changes))).rejects.toThrow(
       'access ID token is missing or invalid'
     );
   });
@@ -80,6 +87,7 @@ describe('OIDC access identity', () => {
       .sign(privateKey);
     await expect(verifier.verify(token)).rejects.toThrow('access ID token is missing or invalid');
     await expect(verifier.verify(token)).rejects.toMatchObject({ reason: 'email_verified_missing' });
+    expect((await optInVerifier.verify(token)).username).toBe('alice-person');
   });
 
   it.each([
@@ -109,6 +117,7 @@ describe('OIDC access identity', () => {
     const token = await new SignJWT({ exp: NOW + 120 })
       .setProtectedHeader({ alg: 'RS256', kid: 'test-key' }).sign(pair.privateKey);
     await expect(verifier.verify(token)).rejects.toMatchObject({ reason: 'signature' });
+    await expect(optInVerifier.verify(token)).rejects.toMatchObject({ reason: 'signature' });
   });
 
   it('does not trust reason properties on unknown errors', () => {

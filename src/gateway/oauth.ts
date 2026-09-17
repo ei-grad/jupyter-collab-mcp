@@ -812,6 +812,7 @@ export async function createGatewayOAuth(
     audience: config.oidcClientId,
     jwksUri: new URL(discovery.jwks_uri!),
     emailDomain: config.usernameEmailDomain,
+    allowMissingEmailVerified: config.allowMissingEmailVerified,
     usernameMode: config.usernameMode,
     allowedUsers: config.allowedUsers,
     fetchImpl: noRedirectFetch

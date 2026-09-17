@@ -15,6 +15,7 @@ export interface GatewayConfig {
   readonly redirectUris: readonly string[];
   readonly usernameEmailDomain: string;
   readonly usernameMode: UsernameMode;
+  readonly allowMissingEmailVerified: boolean;
   readonly allowedUsers: ReadonlySet<string>;
   readonly apiBaseUrl: URL;
   readonly browserBaseUrl: URL;
@@ -236,6 +237,10 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
   const redirectUris = required(env, 'REDIRECT_URIS').split(/\s+/).filter(Boolean).map(validateRedirectPattern);
   if (redirectUris.length === 0) throw new Error('explicit OAuth redirect URIs are required');
   const sourceRuntime = fileURLToPath(import.meta.url).endsWith('.ts');
+  const allowMissingEmailVerified = env[`${PREFIX}ALLOW_MISSING_EMAIL_VERIFIED`] ?? 'false';
+  if (allowMissingEmailVerified !== 'true' && allowMissingEmailVerified !== 'false') {
+    throw new Error(`${PREFIX}ALLOW_MISSING_EMAIL_VERIFIED must be true or false`);
+  }
 
   return Object.freeze({
     publicUrl: validatePublicUrl(required(env, 'PUBLIC_URL'), 'PUBLIC_URL'),
@@ -248,6 +253,7 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
     redirectUris: Object.freeze(redirectUris),
     usernameEmailDomain,
     usernameMode,
+    allowMissingEmailVerified: allowMissingEmailVerified === 'true',
     allowedUsers,
     apiBaseUrl,
     browserBaseUrl: validateJupyterUrl(
