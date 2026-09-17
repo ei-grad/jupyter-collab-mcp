@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { exchangeAuthorization, registerClient, resolveClientMetadata } from '@modelcontextprotocol/client';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
@@ -189,6 +190,70 @@ async function issueBearer(oauth: GatewayOAuth, upstream: FakeUpstream): Promise
 }
 
 describe('hosted OAuth authorization flow', () => {
+  it('registers the real MCP SDK interactive defaults with only the supported grant', async () => {
+    const { oauth, upstream } = await gateway();
+    const fetchFn: typeof fetch = async (input, init) => {
+      const response = await oauth.handle(new Request(input, init));
+      if (response === null) throw new Error('unexpected OAuth route');
+      return response;
+    };
+    const clientMetadata = resolveClientMetadata({
+      redirectUrl: REDIRECT_URI,
+      clientMetadata: {
+        redirect_uris: [REDIRECT_URI],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none'
+      }
+    });
+    expect(clientMetadata.grant_types).toEqual(['authorization_code', 'refresh_token']);
+    const clientInformation = await registerClient('https://mcp.example', {
+      clientMetadata,
+      fetchFn
+    });
+    expect(clientInformation.grant_types).toEqual(['authorization_code']);
+    const codeVerifier = 'v'.repeat(64);
+    const authorizationCode = await issueDownstreamCode(
+      oauth, upstream, clientInformation.client_id, codeVerifier
+    );
+    const token = await exchangeAuthorization('https://mcp.example', {
+      clientInformation, authorizationCode, codeVerifier, redirectUri: REDIRECT_URI, fetchFn
+    });
+    expect(token).not.toHaveProperty('refresh_token');
+    const verified = await oauth.verifyBearer(`Bearer ${token.access_token}`);
+    expect(verified).not.toBeInstanceOf(Response);
+    if (verified instanceof Response) throw new Error('bearer unexpectedly rejected');
+    expect(verified.identity.assertion()).toBe(upstream.assertion);
+    expect(verified.identity.username).toBe('alice-person');
+    const refresh = await fetchFn('https://mcp.example/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token', client_id: clientInformation.client_id, refresh_token: 'synthetic'
+      })
+    });
+    expect(refresh.status).toBe(400);
+    expect(await refresh.json()).toMatchObject({ error: 'unsupported_grant_type' });
+  });
+
+  it.each([
+    [], ['refresh_token'], ['client_credentials'], 'authorization_code', null,
+    ['authorization_code', null], ['authorization_code', 1], ['authorization_code', '']
+  ].map((grantTypes) => ({ grantTypes })))(
+    'rejects unsupported-only or malformed registration grant metadata: $grantTypes',
+    async ({ grantTypes }) => {
+      const { oauth } = await gateway();
+      const response = await oauth.handle(new Request('https://mcp.example/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: [REDIRECT_URI], grant_types: grantTypes, token_endpoint_auth_method: 'none'
+        })
+      }));
+      expect(response?.status).toBe(400);
+      expect(await response?.json()).toMatchObject({ error: 'invalid_client_metadata' });
+    }
+  );
+
   it('uses the real openid-client exchange and verifies its nonce and JWKS', async () => {
     const gatewayConfig = config();
     const store = new EncryptedStore(

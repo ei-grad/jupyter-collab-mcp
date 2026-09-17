@@ -407,12 +407,14 @@ export class GatewayOAuth {
     ) {
       return oauthError('invalid_redirect_uri', 'redirect URI is not permitted');
     }
-    const grantTypes = input['grant_types'] ?? ['authorization_code'];
+    const grantTypes = asStringArray(
+      input['grant_types'] === undefined ? ['authorization_code'] : input['grant_types']
+    );
     const responseTypes = input['response_types'] ?? ['code'];
     if (
-      !Array.isArray(grantTypes) ||
-      grantTypes.length !== 1 ||
-      grantTypes[0] !== 'authorization_code' ||
+      grantTypes === null ||
+      grantTypes.some((grant) => grant.length === 0) ||
+      !grantTypes.includes('authorization_code') ||
       !Array.isArray(responseTypes) ||
       responseTypes.length !== 1 ||
       responseTypes[0] !== 'code'

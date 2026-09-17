@@ -1067,8 +1067,12 @@ schemas, structured results, images, errors, and output resources preserve the
 stdio contract.
 It exposes a narrow OAuth proxy: dynamic client registration followed by an
 authorization-code grant with mandatory S256 PKCE and a trusted upstream OIDC
-login. Refresh, implicit, and device grants are unsupported. Registrations,
-transactions, one-time codes, and local access tokens are encrypted at rest;
+login. Refresh, implicit, and device grants are unsupported. Dynamic registration
+accepts a nonempty array of nonempty grant-type strings containing
+`authorization_code`, including clients that also request `refresh_token`, and
+registers and returns only `authorization_code`. Omitted grant types default to
+`authorization_code`; malformed or unsupported-only requests are rejected.
+Registrations, transactions, one-time codes, and local access tokens are encrypted at rest;
 one-time values are consumed atomically and no record outlives the signed
 upstream ID token. Redirects are checked against current operator policy at
 registration, authorization, and callback time. Upstream OIDC discovery, JWKS,
