@@ -54,7 +54,7 @@ endpoints and does not connect to Redis. Configure:
 | --- | --- |
 | `ACCESS_ISSUER` | Exact Access team origin, e.g. `https://team.cloudflareaccess.com` |
 | `ACCESS_AUDIENCE` | This MCP Access application's audience tag |
-| `ACCESS_SESSION_TTL_SECONDS` | Absolute in-memory transport/worker lifetime; default 28800 |
+| `ACCESS_SESSION_TTL_SECONDS` | Absolute in-memory transport/worker lifetime; default 28800; 0 disables this bound |
 | `ACCESS_SESSION_IDLE_SECONDS` | Idle session timeout; default 900 (15 minutes) |
 
 The common public/Jupyter URLs, username mapping, provisioned-user allow-list,
@@ -77,8 +77,12 @@ Modern-only stateless clients without this session handshake are not supported.
 
 `DELETE` closes the transport and worker. Idle timeout reclaims abandoned
 connections even if a client disconnects without DELETE; authenticated requests
-reset it, and a running request prevents idle eviction. The absolute lifetime is
-never extended. Handles expire with their transport session, so a client returning
+reset it, and a running request prevents idle eviction. A configured absolute
+lifetime is never extended. For two hours of idle retention without eviction
+based on session age, set `ACCESS_SESSION_IDLE_SECONDS=7200` and
+`ACCESS_SESSION_TTL_SECONDS=0`. This does not extend Cloudflare login or token
+validity; every request still needs a valid assertion. Handles expire with their
+transport session, so a client returning
 after inactivity must initialize and reopen its notebook handles. Token expiry
 stops Jupyter traffic but preserves handles until the session timeout.
 Restarting the origin loses process-local handles and

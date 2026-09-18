@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
+import type { WorkerSession } from './worker-registry.js';
+
 export interface GatewayIdentity {
   readonly issuer: string;
   readonly subject: string;
@@ -14,6 +16,7 @@ export interface GatewayIdentity {
   readonly grantId?: string;
   readonly grantGeneration?: number;
   readonly grantExpiresAt?: number;
+  readonly session?: WorkerSession;
   assertion(): string;
 }
 
@@ -129,7 +132,10 @@ export async function startNodeWorker(
         browserBaseUrl: userBaseUrl(settings.browserBaseUrl, identity.username),
         credentialRef: `file:${assertionFile}`,
         auth: { type: 'header', name: settings.assertionHeader },
-        ...(identity.grantId === undefined ? {} : { credentialRefresh: 'request', credentialExpiry: 'jwt', credentialExpiresAt: identity.grantExpiresAt })
+        ...(identity.grantId === undefined && identity.session === undefined ? {} : {
+          credentialRefresh: 'request', credentialExpiry: 'jwt',
+          credentialExpiresAt: identity.session?.expiresAt ?? identity.grantExpiresAt
+        })
       }
     ]
   };

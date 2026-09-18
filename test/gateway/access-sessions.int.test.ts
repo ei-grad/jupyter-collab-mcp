@@ -15,12 +15,13 @@ let runtime: GatewayHttpRuntime | undefined;
 const clients: Client[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(clients.splice(0).map((client) => client.close()));
   await runtime?.close();
   runtime = undefined;
 });
 
-it('binds SDK sessions to verified principals, isolates agents and renews exact assertions', async () => {
+it.each([0, 3600])('binds SDK sessions to verified principals, isolates agents and renews exact assertions (TTL=%s)', async (ttl) => {
   const keys = await generateKeyPair('RS256', { extractable: true });
   const config = loadCloudflareAccessConfig({
     JUPYTER_MCP_PUBLIC_URL: 'https://mcp.example.invalid',
@@ -58,7 +59,7 @@ it('binds SDK sessions to verified principals, isolates agents and renews exact 
     return worker;
   });
   runtime = createGatewayHttpRuntime({ registry, authenticate: gate, allowedHostnames: ['127.0.0.1'],
-    allowedOriginHostnames: [], accessSessionTtlSeconds: 3600 });
+    allowedOriginHostnames: [], accessSessionTtlSeconds: ttl, accessSessionIdleSeconds: 7200 });
   await runtime.listen(0, '127.0.0.1');
   const url = new URL(`http://127.0.0.1:${String((runtime.server.address() as AddressInfo).port)}/mcp`);
   let aliceToken = await issue('alice');
@@ -95,6 +96,20 @@ it('binds SDK sessions to verified principals, isolates agents and renews exact 
   await first.client.listTools();
   expect(registry.size).toBe(1);
   expect(assertions).toEqual([firstToken, aliceToken]);
+  if (ttl === 0) {
+    // Only the clock is mocked: real SDK requests, signatures and transports remain active.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    for (let hour = 0; hour < 9; hour++) {
+      vi.setSystemTime(Date.now() + 60 * 60 * 1000);
+      expect((await raw(aliceToken, session)).status).toBe(401);
+      await registry.expire();
+      expect(registry.size).toBe(1);
+      aliceToken = await issue('alice');
+      expect((await first.client.listTools()).tools[0]?.name).toBe('alice');
+      expect(first.transport.sessionId).toBe(session);
+      expect(registry.size).toBe(1);
+    }
+  }
   const second = await connect();
   expect(second.transport.sessionId).not.toBe(session);
   await second.client.listTools();
@@ -106,13 +121,13 @@ it('binds SDK sessions to verified principals, isolates agents and renews exact 
   expect((await fetch(new URL('/register', url))).status).toBe(404);
 });
 
-it('reclaims abandoned sessions after idle expiry without evicting an active request', async () => {
+it.each([0, 3600])('reclaims abandoned sessions after idle expiry without evicting an active request (TTL=%s)', async (ttl) => {
   const { TEST_AUTH, TEST_IDENTITY, createProxyFixture } = await import('./helpers.js');
   const fixture = await createProxyFixture();
   runtime = createGatewayHttpRuntime({ registry: fixture.registry,
     authenticate: () => ({ authInfo: { ...TEST_AUTH }, identity: TEST_IDENTITY }),
     allowedHostnames: ['127.0.0.1'], allowedOriginHostnames: [],
-    accessSessionTtlSeconds: 3600, accessSessionIdleSeconds: 0.1 });
+    accessSessionTtlSeconds: ttl, accessSessionIdleSeconds: 0.1 });
   await runtime.listen(0, '127.0.0.1');
   const url = new URL(`http://127.0.0.1:${String((runtime.server.address() as AddressInfo).port)}/mcp`);
   const initialize = () => fetch(url, {

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import type { Client } from '@modelcontextprotocol/client';
 
 import {
@@ -77,10 +79,17 @@ interface Slot {
   readonly lock: AsyncLock;
   readonly grantId?: string;
   readonly grantExpiresAt?: number;
+  readonly session?: WorkerSession;
   grantGeneration: number;
   references: number;
   retiring: boolean;
   worker?: GatewayWorker;
+}
+
+/** A registry-owned lifetime, independent of the current request's credential. */
+export interface WorkerSession {
+  readonly id: string;
+  readonly expiresAt?: number;
 }
 
 export interface WorkerLease {
@@ -97,7 +106,9 @@ export function workerKey(identity: GatewayIdentity): string {
   return JSON.stringify([
     identity.issuer,
     identity.subject,
-    ...(identity.grantId === undefined
+    ...(identity.session !== undefined
+      ? ['session', identity.username, identity.session.id]
+      : identity.grantId === undefined
       ? [credentialDigest(identity.assertion())]
       : ['grant', identity.username, identity.grantId])
   ]);
@@ -120,6 +131,7 @@ function waitForDelay(milliseconds: number, signal: AbortSignal): Promise<void> 
 export class WorkerRegistry {
   readonly #slots = new Map<string, Slot>();
   readonly #retiredGrants = new Map<string, number>();
+  readonly #sessions = new WeakMap<WorkerSession, { principal: string; closed: boolean }>();
   readonly #factory: WorkerFactory;
   #closed = false;
 
@@ -139,7 +151,37 @@ export class WorkerRegistry {
     return this.#slots.size;
   }
 
+  createSession(identity: GatewayIdentity, expiresAt?: number): WorkerSession {
+    this.validate(identity);
+    if (this.#closed) throw new Error('Jupyter MCP is shutting down');
+    if (expiresAt !== undefined && (!Number.isFinite(expiresAt) || expiresAt <= Date.now() / 1000)) {
+      throw new Error('Invalid worker session deadline');
+    }
+    const session = Object.freeze({ id: randomUUID(), ...(expiresAt === undefined ? {} : { expiresAt }) });
+    this.#sessions.set(session, { principal: JSON.stringify([principalKey(identity), identity.username]), closed: false });
+    return session;
+  }
+
+  async retireSession(session: WorkerSession): Promise<void> {
+    const state = this.#sessions.get(session);
+    if (state === undefined) throw new Error('Unknown worker session');
+    // In-flight identities retain this closed object; no global tombstone is needed.
+    state.closed = true;
+    const slots = [...this.#slots.values()].filter((slot) => slot.session === session);
+    for (const slot of slots) slot.retiring = true;
+    await this.#retireAll(slots, 'Failed to retire session workers');
+  }
+
   validate(identity: GatewayIdentity): GatewayIdentity {
+    if (identity.session !== undefined) {
+      const state = this.#sessions.get(identity.session);
+      if (state === undefined || state.closed ||
+          state.principal !== JSON.stringify([principalKey(identity), identity.username]) ||
+          (identity.session.expiresAt !== undefined && identity.session.expiresAt <= Date.now() / 1000) ||
+          identity.grantId !== undefined || identity.grantExpiresAt !== undefined) {
+        throw new Error('Jupyter worker session is closed or not permitted');
+      }
+    }
     if (identity.grantId !== undefined && this.#retiredGrants.has(identity.grantId)) {
       throw new Error('Jupyter authorization grant is revoked');
     }
@@ -153,9 +195,9 @@ export class WorkerRegistry {
       (identity.requestExpiresAt !== undefined &&
         (!Number.isFinite(identity.requestExpiresAt) || identity.requestExpiresAt <= Date.now() / 1000)) ||
       !this.settings.allowedUsers.has(identity.username) ||
+      (identity.grantGeneration !== undefined && (!Number.isSafeInteger(identity.grantGeneration) || identity.grantGeneration < 0)) ||
       (identity.grantId !== undefined &&
         (identity.grantId.length === 0 || identity.grantExpiresAt === undefined ||
-         (identity.grantGeneration !== undefined && (!Number.isSafeInteger(identity.grantGeneration) || identity.grantGeneration < 0)) ||
          !Number.isFinite(identity.grantExpiresAt) || identity.grantExpiresAt <= Date.now() / 1000)) ||
       (identity.grantId === undefined && identity.grantExpiresAt !== undefined)
     ) {
@@ -199,6 +241,7 @@ export class WorkerRegistry {
       slot = {
         key, principal, lock: new AsyncLock(), references: 0, retiring: false,
         grantGeneration: identity.grantGeneration ?? 0,
+        ...(identity.session === undefined ? {} : { session: identity.session }),
         ...(identity.grantId === undefined ? {} : {
           grantId: identity.grantId, grantExpiresAt: identity.grantExpiresAt!
         })
@@ -215,6 +258,7 @@ export class WorkerRegistry {
       if (this.#closed) throw new Error('Jupyter MCP is shutting down');
       if (slot.retiring) throw new Error('Jupyter worker is retiring; retry later');
       if (slot.grantExpiresAt !== identity.grantExpiresAt) throw new Error('Jupyter grant deadline changed');
+      if (slot.session !== identity.session) throw new Error('Jupyter worker session changed');
       if (slot.worker !== undefined && slot.worker.username !== identity.username) {
         throw new Error('Jupyter worker identity does not match its owner');
       }
@@ -255,7 +299,7 @@ export class WorkerRegistry {
         }
       }
       const worker = slot.worker;
-      if (identity.grantId !== undefined) {
+      if (identity.grantId !== undefined || identity.session !== undefined) {
         const generation = identity.grantGeneration ?? 0;
         const changed = worker.credentialDigest !== credentialDigest(identity.assertion());
         if (generation === slot.grantGeneration && changed) {
@@ -321,7 +365,9 @@ export class WorkerRegistry {
       (slot) =>
         slot.references === 0 &&
         slot.worker !== undefined &&
-        (slot.retiring || (slot.grantExpiresAt ?? slot.worker.expiresAt) <= now)
+        (slot.retiring || (slot.session === undefined
+          ? (slot.grantExpiresAt ?? slot.worker.expiresAt) <= now
+          : slot.session.expiresAt !== undefined && slot.session.expiresAt <= now))
     );
     for (const slot of expired) slot.retiring = true;
     await this.#retireAll(expired, 'Failed to retire expired workers');

@@ -309,15 +309,20 @@ export function loadCloudflareAccessConfig(env: NodeJS.ProcessEnv = process.env)
   if (issuer.pathname !== '/' || !/^[a-z0-9-]+\.cloudflareaccess\.com$/.test(issuer.hostname)) {
     throw new Error('ACCESS_ISSUER must be a Cloudflare Access team origin');
   }
-  const sessionTtlSeconds = parsePositiveNumber(env, 'ACCESS_SESSION_TTL_SECONDS', 8 * 60 * 60, true);
+  const sessionTtlSeconds = env[`${PREFIX}ACCESS_SESSION_TTL_SECONDS`] === '0'
+    ? 0 : parsePositiveNumber(env, 'ACCESS_SESSION_TTL_SECONDS', 8 * 60 * 60, true);
   if (sessionTtlSeconds > Math.floor((2 ** 31 - 1) / 1000)) {
     throw new Error('ACCESS_SESSION_TTL_SECONDS exceeds the supported timer duration');
+  }
+  const sessionIdleSeconds = parsePositiveNumber(env, 'ACCESS_SESSION_IDLE_SECONDS', 15 * 60, true);
+  if (sessionIdleSeconds > Math.floor((2 ** 31 - 1) / 1000)) {
+    throw new Error('ACCESS_SESSION_IDLE_SECONDS exceeds the supported timer duration');
   }
   return Object.freeze({
     ...loadCommonConfig(env),
     accessIssuer: issuer.origin,
     accessAudience: required(env, 'ACCESS_AUDIENCE'),
     sessionTtlSeconds,
-    sessionIdleSeconds: parsePositiveNumber(env, 'ACCESS_SESSION_IDLE_SECONDS', 15 * 60, true)
+    sessionIdleSeconds
   });
 }

@@ -1169,11 +1169,17 @@ different principal cannot use it, and independent initializations for the same
 principal cannot share workers or handles. Assertion rotation preserves a
 session's worker and atomically updates its credentials under the worker lease.
 Expired assertions cannot authorize requests. Missing or unknown sessions require
-initialization; DELETE and absolute session expiry retire the owned worker.
+initialization; DELETE and configured absolute session expiry retire the owned worker.
 Restart loses process-local handles, but does not invalidate Cloudflare-managed
 OAuth grants. Session allocation obeys global/per-principal capacity limits, and
 invalid initialization attempts do not retain capacity.
 Abandoned sessions expire after a bounded idle interval even when clients omit
 DELETE, returning their capacity. Authenticated requests reset that interval;
-in-flight requests cannot be evicted for idleness. The absolute session deadline
-still applies, and expired handles require a new initialization and reopen.
+in-flight requests cannot be evicted for idleness. Operators may disable the
+absolute session lifetime with `ACCESS_SESSION_TTL_SECONDS=0`; then continued
+authenticated activity preserves the worker and handles regardless of session
+age. This retention never extends an assertion or Cloudflare login lifetime:
+expired credentials cannot authorize requests or downstream traffic. Explicit
+close and idle expiry prevent late in-flight work from resurrecting the session,
+without retaining permanent revocation records. When an absolute deadline is
+configured it still applies; expired handles require initialization and reopen.

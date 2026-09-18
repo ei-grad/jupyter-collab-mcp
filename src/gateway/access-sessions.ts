@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import {
   WebStandardStreamableHTTPServerTransport,
   type AuthInfo,
@@ -8,13 +6,13 @@ import {
 } from '@modelcontextprotocol/server';
 
 import { createGatewayProxyServer, type GatewayProxyOptions, type IdentityResolver } from './proxy-server.js';
-import type { WorkerRegistry } from './worker-registry.js';
+import type { WorkerRegistry, WorkerSession } from './worker-registry.js';
 import type { GatewayIdentity } from './worker.js';
 
 interface Session {
   readonly id: string;
   readonly principal: string;
-  readonly deadline: number;
+  readonly lifetime: WorkerSession;
   readonly server: Server;
   readonly transport: WebStandardStreamableHTTPServerTransport;
   timer?: ReturnType<typeof setTimeout>;
@@ -51,19 +49,22 @@ export function createAccessSessionHandler(
     clearTimeout(session.timer);
     await Promise.all([
       session.server.close(),
-      ...(session.transport.sessionId === undefined ? [] : [registry.retireGrant(session.id, session.deadline)])
+      registry.retireSession(session.lifetime)
     ]);
   }
 
   function expired(session: Session, now: number): boolean {
-    return session.deadline <= now || (session.inFlight === 0 && session.idleDeadline <= now);
+    return (session.lifetime.expiresAt !== undefined && session.lifetime.expiresAt <= now) ||
+      (session.inFlight === 0 && session.idleDeadline <= now);
   }
 
   function schedule(session: Session): void {
     clearTimeout(session.timer);
     if (sessions.get(session.id) !== session) return;
     const now = Date.now() / 1000;
-    const nextCheck = Math.min(session.deadline, session.inFlight > 0 ? now + idleSeconds : session.idleDeadline);
+    const idleCheck = session.inFlight > 0 ? now + idleSeconds : session.idleDeadline;
+    const nextCheck = session.lifetime.expiresAt === undefined
+      ? idleCheck : Math.min(session.lifetime.expiresAt, idleCheck);
     session.timer = setTimeout(() => {
       if (expired(session, Date.now() / 1000)) {
         void remove(session).catch((error: unknown) => {
@@ -99,8 +100,8 @@ export function createAccessSessionHandler(
               registry.settings.maxWorkersPerPrincipal) {
           return failure(429, 'Session capacity reached; close an existing connection');
         }
-        const id = randomUUID();
-        const deadline = Date.now() / 1000 + ttlSeconds;
+        const lifetime = registry.createSession(identity, ttlSeconds === 0 ? undefined : Date.now() / 1000 + ttlSeconds);
+        const id = lifetime.id;
         const server = createGatewayProxyServer(registry, (context) => {
           const info = context.http?.authInfo;
           const current = info === undefined ? undefined : identities.get(info);
@@ -112,7 +113,7 @@ export function createAccessSessionHandler(
           enableJsonResponse: true,
           onsessionclosed: async () => { if (session !== undefined) await remove(session); }
         });
-        session = { id, deadline, principal: principal(identity), server, transport,
+        session = { id, lifetime, principal: principal(identity), server, transport,
           idleDeadline: Date.now() / 1000 + idleSeconds, inFlight: 0, generation: 0 };
         sessions.set(id, session);
         schedule(session);
@@ -128,7 +129,7 @@ export function createAccessSessionHandler(
       identities.set(authInfo, {
         issuer: identity.issuer, subject: identity.subject, username: identity.username,
         expiresAt: identity.expiresAt, requestExpiresAt: identity.expiresAt,
-        grantId: session.id, grantExpiresAt: session.deadline,
+        session: session.lifetime,
         grantGeneration: ++session.generation,
         assertion: () => identity.assertion()
       });

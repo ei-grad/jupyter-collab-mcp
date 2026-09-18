@@ -42,6 +42,25 @@ describe('Cloudflare Access assertion mode', () => {
     expect(config).not.toHaveProperty('oidcClientSecret');
   });
 
+  it('allows idle-only session retention without extending credential validity', () => {
+    const config = loadCloudflareAccessConfig({ ...accessEnvironment,
+      JUPYTER_MCP_ACCESS_SESSION_TTL_SECONDS: '0',
+      JUPYTER_MCP_ACCESS_SESSION_IDLE_SECONDS: '7200'
+    });
+    expect(config.sessionTtlSeconds).toBe(0);
+    expect(config.sessionIdleSeconds).toBe(7200);
+  });
+
+  it.each(['-1', '0.5', 'Infinity', '2147484'])(
+    'rejects unsupported Access retention durations %s', (value) => {
+      for (const name of ['TTL', 'IDLE']) {
+        expect(() => loadCloudflareAccessConfig({ ...accessEnvironment,
+          [`JUPYTER_MCP_ACCESS_SESSION_${name}_SECONDS`]: value
+        })).toThrow();
+      }
+    }
+  );
+
   it.each(['http://team.cloudflareaccess.com', 'https://issuer.example', 'https://team.cloudflareaccess.com/path'])('rejects an invalid issuer %s', (issuer) => {
     expect(() => loadCloudflareAccessConfig({ ...accessEnvironment, JUPYTER_MCP_ACCESS_ISSUER: issuer })).toThrow();
   });

@@ -404,6 +404,99 @@ describe('refresh grant worker ownership', () => {
   });
 });
 
+describe('transport session worker ownership', () => {
+  it('retains handles without an age bound but keeps downstream JWT expiry enabled', async () => {
+    const registry = new WorkerRegistry(await settings());
+    const actor = identity('alice', 'first');
+    const session = registry.createSession(actor);
+    try {
+      const initial = await registry.acquire({ ...actor, session, grantGeneration: 1 });
+      await initial.release();
+      await registry.expire(actor.expiresAt + 10 * 60 * 60);
+      expect(registry.size).toBe(1);
+      const profile = JSON.parse(await readFile(join(initial.worker.directory, 'profile.json'), 'utf8'));
+      expect(profile.servers[0]).toMatchObject({ credentialRefresh: 'request', credentialExpiry: 'jwt' });
+      expect(profile.servers[0]).not.toHaveProperty('credentialExpiresAt');
+      await expect(registry.acquire({ ...actor, session, expiresAt: 1 })).rejects.toThrow('expired');
+      const renewed = await registry.acquire({ ...actor, session, grantGeneration: 2,
+        assertion: () => 'second', expiresAt: actor.expiresAt + 300 });
+      expect(renewed.worker).toBe(initial.worker);
+      expect(await readFile(join(initial.worker.directory, 'assertion'), 'utf8')).toBe('second');
+      await renewed.release();
+      await registry.retireSession(session);
+      expect(registry.size).toBe(0);
+      await expect(registry.acquire({ ...actor, session })).rejects.toThrow('closed');
+    } finally {
+      await registry.close();
+    }
+  });
+
+  it('enforces finite deadlines and rejects forged or cross-principal session owners', async () => {
+    const fake = fakeFactory();
+    const registry = new WorkerRegistry(await settings(), fake.factory);
+    const actor = identity();
+    const session = registry.createSession(actor, actor.expiresAt + 10);
+    const lease = await registry.acquire({ ...actor, session });
+    await lease.release();
+    for (const invalid of [
+      { ...identity('bob'), session },
+      { ...actor, username: 'bob', session },
+      { ...actor, session: { ...session } },
+      { ...actor, session, grantId: 'oauth', grantExpiresAt: actor.expiresAt }
+    ]) await expect(registry.acquire(invalid)).rejects.toThrow('not permitted');
+    await registry.expire(session.expiresAt! + 1);
+    expect(registry.size).toBe(0);
+    await registry.close();
+  });
+
+  it('cannot resurrect a closed session before its first acquisition', async () => {
+    const fake = fakeFactory();
+    const registry = new WorkerRegistry(await settings(), fake.factory);
+    const actor = identity();
+    const session = registry.createSession(actor);
+    await registry.retireSession(session);
+    await expect(registry.acquire({ ...actor, session })).rejects.toThrow('closed');
+    expect(fake.factory).not.toHaveBeenCalled();
+    expect(registry.size).toBe(0);
+    await registry.close();
+  });
+
+  it('closes late startup workers and rejects queued identities after session retirement', async () => {
+    const delayed = delayedFakeFactory();
+    const registry = new WorkerRegistry(await settings(), delayed.factory);
+    const actor = identity();
+    const session = registry.createSession(actor);
+    const pending = registry.acquire({ ...actor, session });
+    const rejected = expect(pending).rejects.toThrow('closed');
+    await delayed.entered;
+    const queued = registry.acquire({ ...actor, session });
+    const queuedRejected = expect(queued).rejects.toThrow('closed');
+    const closing = registry.retireSession(session);
+    delayed.proceed();
+    await Promise.all([rejected, queuedRejected, closing]);
+    expect(delayed.workers[0]?.close).toHaveBeenCalledOnce();
+    expect(registry.size).toBe(0);
+    await expect(registry.acquire({ ...actor, session })).rejects.toThrow('closed');
+    await registry.close();
+  });
+
+  it('retries failed session cleanup through the normal sweep', async () => {
+    const fake = fakeFactory();
+    const registry = new WorkerRegistry(await settings(), fake.factory);
+    const actor = identity();
+    const session = registry.createSession(actor);
+    const lease = await registry.acquire({ ...actor, session });
+    await lease.release();
+    fake.workers[0]!.close.mockRejectedValueOnce(new Error('cleanup failed'));
+    await expect(registry.retireSession(session)).rejects.toBeInstanceOf(AggregateError);
+    expect(registry.size).toBe(1);
+    await expect(registry.acquire({ ...actor, session })).rejects.toThrow('closed');
+    await registry.expire();
+    expect(registry.size).toBe(0);
+    await registry.close();
+  });
+});
+
 
 it('does not resurrect a grant revoked before its first worker started', async () => {
   const { factory } = fakeFactory();

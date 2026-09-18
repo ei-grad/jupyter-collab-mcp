@@ -86,8 +86,9 @@ async function call(
 }
 
 describe('HTTP mode with the canonical stdio CLI', () => {
-  it.each(['legacy', 'refresh', 'access'])('preserves tools and isolated handles (mode=%s)', async (mode) => {
+  it.each(['legacy', 'refresh', 'access', 'access-idle'])('preserves tools and isolated handles (mode=%s)', async (mode) => {
     const refresh = mode !== 'legacy';
+    const access = mode.startsWith('access');
     const assertions = ['grant-one', 'grant-two'].map((label) => refresh
       ? `e30.${Buffer.from(JSON.stringify({ exp: Date.now() / 1000 + 300, label })).toString('base64url')}.synthetic`
       : label);
@@ -144,7 +145,7 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     });
     runtime = createGatewayHttpRuntime({
       registry,
-      ...(mode === 'access' ? { accessSessionTtlSeconds: 3600 } : {}),
+      ...(access ? { accessSessionTtlSeconds: mode === 'access-idle' ? 0 : 3600 } : {}),
       allowedHostnames: ['127.0.0.1'],
       allowedOriginHostnames: [],
       authenticate: (request) => {
@@ -161,7 +162,7 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     const gatewayAddress = runtime.server.address() as AddressInfo;
     const baseUrl = `http://127.0.0.1:${String(gatewayAddress.port)}`;
 
-    if (mode === 'access') {
+    if (access) {
       for (const token of ['first', 'independent']) {
         const response = await fetch(`${baseUrl}/mcp`, {
           method: 'POST',
