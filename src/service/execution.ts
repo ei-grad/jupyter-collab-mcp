@@ -376,7 +376,7 @@ export function buildExecutionView(
     waitTimedOut: options.waitTimedOut,
     lifetime: {
       scope: 'until_session_close',
-      releasedBy: ['execution_cancel', 'session_close', 'process_exit'],
+      releasedBy: ['notebook_close', 'session_close', 'process_exit'],
       processScoped: HANDLE_LIFETIME.processScoped
     }
   };

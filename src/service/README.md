@@ -76,7 +76,7 @@ process run. Opening the same `fileId` through `notebook_open` in one session
 returns the existing handle; concurrent opens are coalesced through
 `WorkingSession.opening`. Two sessions for one notebook intentionally use two
 `Y.Doc` instances and two sockets, both counted against the replica budget.
-`notebook_close`/`session_close` are idempotent for their own handle (bounded
+The library's `notebookClose`/`sessionClose` are idempotent for their own handle (bounded
 tombstone), reject with `EXECUTION_ACTIVE` by default, and **never** shut down
 the kernel. `force` abandons the job, which becomes `unknown`.
 Close and shutdown fence every asynchronous stage of a pending open. A handle
@@ -169,3 +169,18 @@ in-process `literal:` reference. `createCollabService` installs
 
 `openHandle` in `CollabServiceOptions` is the only testing seam; all other unit
 tests exercise the real code.
+
+## Implicit MCP context and embedding API
+
+MCP exposes 16 tools. Server-scoped requests use optional `serverId`;
+handle-scoped requests address the notebook or execution directly. The service
+coalesces lazy bindings by canonical server profile ID. They share one ledger
+and one mutation lock, so switching servers or closing notebooks never resets
+the sequence. Create receipts include the selected server ID in their digest.
+`serverList` returns the implicit context's current `nextRequestId`. Shutdown
+clears all bindings and shared receipts; normal notebook close drops its jobs
+and replica while retained output snapshots are bounded by their store.
+
+TypeScript embedding clients use `sessionOpen`/`sessionClose` and library
+`sessionId` arguments to manage independent contexts and ledgers. Public MCP
+lifetime descriptors describe notebook and connection closure.

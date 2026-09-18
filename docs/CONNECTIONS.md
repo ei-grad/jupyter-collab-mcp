@@ -313,13 +313,13 @@ are not a sufficient contract.
 | Servers | `server_list` returns only profiles authorized for the principal; no shared credentials belonging to another user |
 | Pools | A connection pool does not combine different upstream identities merely by URL/kernel ID |
 | Retry | Verify the principal before lookup, then apply `(application session, request_id)` and the operation/target/payload digest from SPEC; another user's request ID does not reveal a result |
-| Session creation | Current HTTP mode preserves the stdio `session_open` contract without a creation ID; a lost response must not be retried blindly |
+| Context creation | Automatic per isolated worker; MCP clients open notebooks directly and send no working-session ID |
 | Lifecycle | Explicit close plus a bounded lease for abandoned idle sessions; HTTP disconnect is not close |
 | Active work | An idle lease does not destroy an active job; its retention has a separate bounded budget and visible status |
 | Restart | When worker state is lost, old handles expire; jobs are not retried automatically |
 | Token refresh | Every exact credential generation owns a separate worker; a new token does not inherit old handles, while an old still-valid grant retains its own worker |
 
-Core request IDs form a sequence within a working session, with a bounded
+Core request IDs form a sequence within a connection context across all servers, with a bounded
 result cache and retention of the high-water mark of accepted numbers as
 specified in SPEC. An evicted old ID does not run an operation again.
 Core mutating tool calls within one session are sent sequentially using the
@@ -331,11 +331,10 @@ computation itself need not finish before the next tool call when its execution
 handle has already been returned. Independent sessions and reads may proceed in
 parallel.
 
-The current HTTP mode has no separate creation ID for `session_open`, so a lost
-creation response is not retry-safe. Adding one would require a different
-namespace with explicitly bounded retention and expiration. An HTTP transport
-request ID does not substitute for that application ID or for the core request
-sequence.
+The implicit context lasts as long as its isolated worker. Individual HTTP
+request completion is not context closure. Managed Access transport termination
+or idle expiry stops its worker; stdio EOF/SIGTERM releases the process context.
+Notebook mutations use the context-wide request ledger to recover lost responses.
 
 Do not use legacy `Mcp-Session-Id` as identity or an ownership basis. The
 2026-07-28 revision does not create it; the GET/DELETE legacy session endpoint

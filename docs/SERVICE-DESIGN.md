@@ -74,14 +74,15 @@ touch the number and provide a way to recover the counter after context loss
 
 ## 4. Handles and lifetimes
 
-`SessionId`, `NotebookId`, `ExecutionId`, and `OutputId` are opaque
-strings bound to the process lifetime. `HandleLifetime` in creation-tool
-responses reports `scope` (`until_close_or_process_exit` for sessions and
-notebooks, `until_session_close` for jobs and output snapshots),
-`releasedBy`, and `processScoped: true`. After restart, the result is
-`HANDLE_EXPIRED`; code is not re-executed.
+`NotebookId`, `ExecutionId`, and `OutputId` are opaque strings bound to the
+process lifetime. Public creation-tool responses report notebook closure and
+connection closure through `lifetime.scope` and `lifetime.released_by`, plus
+`process_scoped: true`. Jobs are released with their notebook; output snapshots
+expire on bounded-store eviction or connection closure. After restart, the
+result is `HANDLE_EXPIRED`; code is not re-executed. The embedding API also
+exposes `SessionId` and its internal `HandleLifetime` descriptors.
 
-`sessionClose`/`notebookClose` are idempotent for their own handle
+The library's `sessionClose`/`notebookClose` are idempotent for their own handle
 (`alreadyClosed: true`), reject with `EXECUTION_ACTIVE` by default, and
 have an explicit `force`; `kernelsLeftRunning`/`kernelLeftRunning`
 record that closing never shuts down a kernel (§4).
@@ -326,3 +327,18 @@ raw-shape form (`{field: z.string()}`) in `registerTool` is marked
 - Kernel binding through Sessions API does not yet belong to any module:
   `kernelStatus`/`kernelControl`/`notebookExecute` are described in the
   facade, while the registry layer must implement this step.
+
+## Implicit MCP context and embedding API
+
+MCP exposes 16 tools. Server-scoped requests use optional `serverId`;
+handle-scoped requests address the notebook or execution directly. The service
+coalesces lazy bindings by canonical server profile ID. They share one ledger
+and one mutation lock, so switching servers or closing notebooks never resets
+the sequence. Create receipts include the selected server ID in their digest.
+`serverList` returns the implicit context's current `nextRequestId`. Shutdown
+clears all bindings and shared receipts; normal notebook close drops its jobs
+and replica while retained output snapshots are bounded by their store.
+
+TypeScript embedding clients use `sessionOpen`/`sessionClose` and library
+`sessionId` arguments to manage independent contexts and ledgers. Public MCP
+lifetime descriptors describe notebook and connection closure.

@@ -1,6 +1,6 @@
 ---
 name: jupyter-collab
-description: Work inside a live JupyterLab notebook through the jupyter-collab-mcp server - open a working session and a notebook over RTC, read the summary and cells by ID and revision, apply edits, run cells so the user sees them run, read plots and errors, follow the user's own changes, and control the kernel. Use whenever the user wants a real notebook edited, executed or inspected instead of a script.
+description: Work inside a live JupyterLab notebook through the jupyter-collab-mcp server - open a notebook over RTC, read the summary and cells by ID and revision, apply edits, run cells so the user sees them run, read plots and errors, follow the user's own changes, and control the kernel. Use whenever the user wants a real notebook edited, executed or inspected instead of a script.
 ---
 
 # Jupyter collaboration (RTC)
@@ -9,18 +9,18 @@ The notebook is a shared document. Every edit appears in the user's open
 JupyterLab immediately, and the user edits the same document at the same time.
 Work from IDs and revisions, never from remembered line numbers.
 
-## 1. Server, working session, notebook
+## 1. Server and notebook
 
-1. `server_list` - safe descriptors only. If `selection_required` is true, ask
-   the user which `server_id` to use.
-2. `session_open {server_id?, label?}` -> `session_id`, `next_request_id: "1"`.
-   Opening a session starts no kernel and touches no file.
-3. `notebook_list {session_id, directory}` to find the file, then
-   `notebook_open {session_id, path}` -> `notebook_id`, `summary`,
-   `changes_cursor`. Opening the same file again in the same session returns
-   the same handle (`reused: true`).
-4. `notebook_create {session_id, request_id, directory, name?}` for a new file.
-   Reuse one session for related work; handles die with the process.
+1. `server_list` returns safe server descriptors and `next_request_id`.
+   If selection is ambiguous, choose the intended configured `server_id`.
+2. `notebook_list {server_id?, directory}` finds a file, then
+   `notebook_open {server_id?, path}` returns `notebook_id`, `summary`,
+   `changes_cursor`, and the current `next_request_id`. Reopening the same file
+   on the same server reuses its handle (`reused: true`).
+3. `notebook_create {server_id?, request_id, directory, name?}` creates a file.
+   The working context is automatic. All servers in this connection share
+   one mutation counter.
+   Handles bind their server; subsequent handle-based calls need no server ID.
 
 ## 2. Summary, IDs, revisions
 
@@ -52,7 +52,7 @@ user sees `[*]`, outputs and the final `execution_count`. Then
 Never run notebook code with a shell tool instead: it would be invisible.
 
 **request_id discipline.** `notebook_create`, `notebook_apply`,
-`notebook_execute` and `kernel_control` are deduplicated per working session.
+`notebook_execute` and `kernel_control` are deduplicated per connection context.
 
 - Take the number from the `next_request_id` of the last answer of *this*
   session. Never invent, increment or remember it yourself.
@@ -114,7 +114,7 @@ Never run notebook code with a shell tool instead: it would be invisible.
 
 ## 6. Closing vs interrupting vs restarting vs shutting down
 
-- `notebook_close` / `session_close` release *our* handles only. The kernel
+- `notebook_close` and connection teardown release *our* handles only. The kernel
   keeps running and the user's JupyterLab is untouched.
 - `execution_cancel {execution_id}` drops cells we have not sent yet. Cells
   already handed to the kernel keep running.
@@ -159,8 +159,8 @@ Tell the user the server is up and let them configure the token themselves.
 ## Example
 
 ```jsonc
-// 1. session_open {} -> {"session_id":"s1","next_request_id":"1"}
-// 2. notebook_open {"session_id":"s1","path":"analysis.ipynb"}
+// 1. server_list {} -> servers, next_request_id "1"
+// 2. notebook_open {"path":"analysis.ipynb"}
 //    -> notebook_id "nb_A", summary, changes_cursor "c7"
 // 3. notebook_apply
 {"notebook_id":"nb_A","request_id":"1","operations":[

@@ -52,6 +52,8 @@ export interface WorkingSessionInit {
   readonly limits: ServiceLimits;
   readonly outputStoreMaxBytes: number;
   readonly now?: () => Date;
+  /** Implicit server bindings share one connection-wide mutation sequence. */
+  readonly mutationContext?: { readonly ledger: RequestLedger; readonly lock: Mutex };
 }
 
 /** One working session (SPEC.md §4). */
@@ -61,7 +63,7 @@ export class WorkingSession {
   readonly label: string | undefined;
   readonly openedAt: string;
   readonly ledger: RequestLedger;
-  readonly lock = new Mutex();
+  readonly lock: Mutex;
   readonly outputs: OutputStore;
   readonly notebooks = new Map<NotebookId, NotebookHandle>();
   /** Concurrent opens of one document coalesce here (SPEC.md §4). */
@@ -78,7 +80,8 @@ export class WorkingSession {
     this.server = init.server;
     this.label = init.label;
     this.openedAt = now().toISOString();
-    this.ledger = new RequestLedger(
+    this.lock = init.mutationContext?.lock ?? new Mutex();
+    this.ledger = init.mutationContext?.ledger ?? new RequestLedger(
       {
         maxReceipts: init.limits.maxReceiptsPerSession,
         requestMaxBytes: init.limits.requestMaxBytes,
@@ -170,7 +173,7 @@ export class SessionRegistry {
    * @throws CoreError `RESOURCE_LIMIT` - `maxSessions` reached; a live session
    * is never evicted to make room (SPEC.md §9).
    */
-  open(server: ServerEntry, label?: string): WorkingSession {
+  open(server: ServerEntry, label?: string, mutationContext?: WorkingSessionInit['mutationContext']): WorkingSession {
     if (this.#sessions.size >= this.#limits.maxSessions) {
       throw coreError('RESOURCE_LIMIT', 'the working-session budget of this process is exhausted', {
         details: { sessions: this.#sessions.size, limit: this.#limits.maxSessions }
@@ -182,7 +185,8 @@ export class SessionRegistry {
       ...(label === undefined ? {} : { label }),
       limits: this.#limits,
       outputStoreMaxBytes: this.#outputStoreMaxBytes,
-      now: this.#now
+      now: this.#now,
+      ...(mutationContext === undefined ? {} : { mutationContext })
     });
     this.#sessions.set(session.id, session);
     return session;

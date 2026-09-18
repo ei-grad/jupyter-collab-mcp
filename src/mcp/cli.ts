@@ -86,7 +86,7 @@ function packageVersion(): string {
  *
  * `JUPYTER_URL` plus `JUPYTER_TOKEN` (or `JUPYTER_TOKEN_FILE`) form one
  * implicit profile called `default`, which is the single-server case
- * `session_open` may pick without a `server_id` (SPEC.md §6 item 1). A `--config`
+ * server-scoped tools may pick without a `server_id` (SPEC.md §6 item 1). A `--config`
  * file may declare more; the implicit profile is appended only when the file
  * does not already define an id `default`.
  */

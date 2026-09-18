@@ -60,7 +60,7 @@ export function createGatewayProxyServer(
       capabilities: { tools: {}, resources: {} },
       instructions:
         options.instructions ??
-        'Live Jupyter notebooks for the authenticated account. Open a working session before using notebook handles.'
+        'Live Jupyter notebooks for the authenticated account. Use server_list for server selection and the current next_request_id, then notebook_open or notebook_create to obtain a notebook handle. One automatic working context owns this connection.'
     }
   );
 

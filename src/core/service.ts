@@ -251,6 +251,8 @@ export interface ServerListEntry {
 
 /** Result of `server_list` (SPEC.md §9). */
 export interface ServerListResult {
+  /** Next mutation number for the implicit connection context. */
+  readonly nextRequestId?: RequestId | null;
   readonly servers: readonly ServerListEntry[];
   /** Whether local runtime discovery is enabled for this process. */
   readonly discoveryEnabled: boolean;
@@ -347,7 +349,9 @@ export interface NotebookListEntry {
 
 /** Arguments of `notebook_list`. */
 export interface NotebookListRequest {
-  readonly sessionId: SessionId;
+  /** Library-only explicit session; MCP callers select serverId instead. */
+  readonly sessionId?: SessionId;
+  readonly serverId?: string;
   /** `''` is the Jupyter root. `..` segments are rejected (SPEC.md §11). */
   readonly directory: string;
   readonly cursor?: DirectoryCursor;
@@ -385,7 +389,8 @@ export interface NotebookHandleInfo {
 
 /** Arguments of `notebook_create` (SPEC.md §6 "notebook creation", §9). */
 export interface NotebookCreateRequest {
-  readonly sessionId: SessionId;
+  readonly sessionId?: SessionId;
+  readonly serverId?: string;
   readonly requestId: RequestId;
   /** Directory the untitled file is allocated in. `''` is the Jupyter root. */
   readonly directory: string;
@@ -414,7 +419,8 @@ export interface NotebookCreateResult {
 
 /** Arguments of `notebook_open`. */
 export interface NotebookOpenRequest {
-  readonly sessionId: SessionId;
+  readonly sessionId?: SessionId;
+  readonly serverId?: string;
   readonly path: string;
   readonly limits?: ResponseLimits;
 }
@@ -922,7 +928,8 @@ export interface RunningKernelInfo {
 
 /** Arguments of `kernel_list`. */
 export interface KernelListRequest {
-  readonly sessionId: SessionId;
+  readonly sessionId?: SessionId;
+  readonly serverId?: string;
 }
 
 /** Result of `kernel_list`. Listing never executes code (SPEC.md §8). */

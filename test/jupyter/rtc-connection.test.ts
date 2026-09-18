@@ -334,7 +334,6 @@ describe('RtcConnection: close-code fixtures (SPEC.md §6 table)', () => {
           fake: { failWith: { method: 'notebookOpen', error: terminal } }
         });
         const answer = await mcp.call('notebook_open', {
-          session_id: 'ses_1',
           path: 'work/analysis.ipynb'
         });
         expect(answer.isError).toBe(true);

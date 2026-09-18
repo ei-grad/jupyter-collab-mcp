@@ -126,6 +126,7 @@ import {
 import { RequestLedger, type DedupTool, type Receipt } from './ledger.js';
 import { ServerRegistry, type ServerEntry, type ServerRegistryOptions } from './server-registry.js';
 import { SessionRegistry, type WorkingSession } from './session.js';
+import { Mutex } from './mutex.js';
 
 /**
  * Snapshot memory of one working session.
@@ -201,6 +202,9 @@ class CollabServiceImpl implements CollabService {
   readonly #config: ReturnType<typeof withDefaults>;
   readonly #servers: ServerRegistry;
   readonly #sessions: SessionRegistry;
+  readonly #implicitSessions = new Map<string, Promise<WorkingSession>>();
+  readonly #implicitLedger: RequestLedger;
+  readonly #implicitLock = new Mutex();
   readonly #kernels = new KernelHub();
   readonly #openTimeoutMs: number;
   readonly #openReplica: (init: NotebookHandleInit) => Promise<NotebookHandle>;
@@ -225,6 +229,11 @@ class CollabServiceImpl implements CollabService {
       options.guardStdout === false || isStdoutGuardInstalled() ? null : installStdoutGuard();
     this.#servers = new ServerRegistry(this.#config, options);
     this.#now = options.now ?? ((): Date => new Date());
+    this.#implicitLedger = new RequestLedger({
+      maxReceipts: this.#config.limits.maxReceiptsPerSession,
+      requestMaxBytes: this.#config.limits.requestMaxBytes,
+      receiptMaxBytes: this.#config.limits.receiptMaxBytes
+    }, this.#now);
     this.#sessions = new SessionRegistry(
       this.#config.limits,
       options.outputStoreMaxBytes ?? DEFAULT_OUTPUT_STORE_BYTES,
@@ -240,7 +249,35 @@ class CollabServiceImpl implements CollabService {
 
   async serverList(): Promise<ServerListResult> {
     this.#assertRunning();
-    return this.#servers.list();
+    return { ...await this.#servers.list(), nextRequestId: this.#implicitLedger.nextRequestId };
+  }
+
+  /** Resolve a library session or lazily bind a server to this MCP connection. */
+  async #sessionFor(request: { readonly sessionId?: string; readonly serverId?: string }): Promise<WorkingSession> {
+    if (request.sessionId !== undefined) {
+      if (request.serverId !== undefined) throw coreError('INVALID_ARGUMENT', 'choose sessionId or serverId, not both');
+      return this.#sessions.require(request.sessionId);
+    }
+    try {
+      const server = await this.#servers.select(request.serverId);
+      let pending = this.#implicitSessions.get(server.id);
+      if (pending === undefined) {
+        pending = (async () => {
+          await this.#servers.clientFor(server).status();
+          this.#assertRunning();
+          return this.#sessions.open(server, undefined, { ledger: this.#implicitLedger, lock: this.#implicitLock });
+        })();
+        this.#implicitSessions.set(server.id, pending);
+        // Only initialization failures are retryable; a live context and its
+        // high-water mark are never replaced after a document closes.
+        void pending.catch(() => {
+          if (this.#implicitSessions.get(server.id) === pending) this.#implicitSessions.delete(server.id);
+        });
+      }
+      return await pending;
+    } catch (error) {
+      throw withEnvelopeDetails(error, { nextRequestId: this.#implicitLedger.nextRequestId, requestAccepted: false });
+    }
   }
 
   async sessionOpen(request: SessionOpenRequest): Promise<WithEnvelope<SessionOpenResult>> {
@@ -310,7 +347,7 @@ class CollabServiceImpl implements CollabService {
 
   async notebookList(request: NotebookListRequest): Promise<WithEnvelope<NotebookListResult>> {
     this.#assertRunning();
-    const session = this.#sessions.require(request.sessionId);
+    const session = await this.#sessionFor(request);
     try {
       const directory = normalizeContentsPath(request.directory);
       const client = this.#servers.clientFor(session.server);
@@ -358,10 +395,17 @@ class CollabServiceImpl implements CollabService {
     request: NotebookCreateRequest
   ): Promise<WithEnvelope<NotebookCreateResult>> {
     this.#assertRunning();
-    const session = this.#sessions.require(request.sessionId);
+    const session = await this.#sessionFor(request);
     return session.lock.run(async () => {
+      try {
+        this.#assertRunning();
+        this.#assertSessionOpen(session);
+      } catch (error) {
+        throw withEnvelopeDetails(error, session.envelope({ requestAccepted: false }));
+      }
       const { directory, name } = this.#validateCreate(session, request);
       const payload = {
+        serverId: session.server.id,
         directory,
         name: name ?? null
       };
@@ -410,7 +454,7 @@ class CollabServiceImpl implements CollabService {
 
   async notebookOpen(request: NotebookOpenRequest): Promise<WithEnvelope<NotebookOpenResult>> {
     this.#assertRunning();
-    const session = this.#sessions.require(request.sessionId);
+    const session = await this.#sessionFor(request);
     try {
       const path = normalizeContentsPath(request.path);
       const live = [...session.notebooks.values()].find(
@@ -920,7 +964,7 @@ class CollabServiceImpl implements CollabService {
 
   async kernelList(request: KernelListRequest): Promise<WithEnvelope<KernelListResult>> {
     this.#assertRunning();
-    const session = this.#sessions.require(request.sessionId);
+    const session = await this.#sessionFor(request);
     try {
       const client = this.#servers.clientFor(session.server);
       const [specs, kernels, sessions] = await Promise.all([
@@ -1137,6 +1181,8 @@ class CollabServiceImpl implements CollabService {
         // Shutdown problems go to stderr through the caller; stdout is MCP's.
       }
     }
+    this.#implicitLedger.clear();
+    this.#implicitSessions.clear();
     if (this.#kernelWatch !== null) {
       clearInterval(this.#kernelWatch);
       this.#kernelWatch = null;
@@ -1449,14 +1495,14 @@ class CollabServiceImpl implements CollabService {
     }
     session.executions.clear();
     session.outputs.clear();
-    session.ledger.clear();
+    if (session.ledger !== this.#implicitLedger) session.ledger.clear();
     this.#sessions.forget(session.id);
   }
 
   #assertSessionOpen(session: WorkingSession): void {
     if (session.closed) {
-      throw coreError('HANDLE_EXPIRED', `working session ${session.id} was closed`, {
-        details: { session_id: session.id, next_request_id: null }
+      throw coreError('HANDLE_EXPIRED', 'working context was closed', {
+        details: { next_request_id: null }
       });
     }
   }

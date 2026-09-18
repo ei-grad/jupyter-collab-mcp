@@ -69,7 +69,7 @@ const obj = (properties: Record<string, JsonSchema>, required: readonly string[]
  */
 const ENVELOPE: Record<string, JsonSchema> = {
   next_request_id: nullableStr(
-    'request_id the next deduplicated mutation of this session must use. null when the session accepts no further mutations.'
+    'request_id the next deduplicated mutation of this connection must use. null when the context accepts no further mutations.'
   ),
   request_accepted: {
     type: ['boolean', 'null'],
@@ -88,7 +88,7 @@ const result = (properties: Record<string, JsonSchema>, required: readonly strin
 
 const LIFETIME = obj(
   {
-    scope: str('until_close_or_process_exit | until_session_close'),
+    scope: str('until_close_or_process_exit | until_connection_close'),
     released_by: arr(str()),
     process_scoped: bool('Always true: after a restart the handle is HANDLE_EXPIRED.')
   },
@@ -148,7 +148,6 @@ const NOTEBOOK_SUMMARY = obj(
 const NOTEBOOK_HANDLE = obj(
   {
     notebook_id: str(),
-    session_id: str(),
     path: str(),
     file_id: str(),
     document_id: str(),
@@ -156,7 +155,7 @@ const NOTEBOOK_HANDLE = obj(
     stale: bool(),
     lifetime: LIFETIME
   },
-  ['notebook_id', 'session_id', 'path', 'file_id', 'connection_state', 'stale', 'lifetime']
+  ['notebook_id', 'path', 'file_id', 'connection_state', 'stale', 'lifetime']
 );
 
 const SNAPSHOT_REF = obj(
@@ -208,7 +207,6 @@ const EXECUTION_CELL = obj(
 const EXECUTION_VIEW: Record<string, JsonSchema> = {
   execution_id: str(),
   notebook_id: str(),
-  session_id: str(),
   kernel_id: nullableStr(),
   state: str('queued | running | succeeded | failed | cancelled | interrupted | unknown — a Python error is failed, not a tool error.'),
   stop_on_error: bool(),
@@ -236,7 +234,7 @@ const KERNEL_STATUS: Record<string, JsonSchema> = {
 // shared zod fragments
 // ---------------------------------------------------------------------------
 
-const sessionId = z.string().min(1).describe('session_id from session_open.');
+const serverId = z.string().min(1).optional().describe('Jupyter server profile. Omit only when exactly one server is available; otherwise SERVER_SELECTION_REQUIRED.');
 const notebookId = z.string().min(1).describe('notebook_id from notebook_open or notebook_create.');
 const executionId = z.string().min(1).describe('execution_id from notebook_execute.');
 const outputId = z.string().min(1).describe('output_id from an outputs read or an execution result.');
@@ -245,7 +243,7 @@ const requestId = z
   .string()
   .regex(/^[1-9][0-9]{0,18}$/u, 'request_id must be a canonical decimal number without leading zeros')
   .describe(
-    'Canonical decimal request number of this working session, starting at "1" and growing by one. Always take it from next_request_id of the previous answer; never invent or reconstruct one. A repeat with the same payload replays the stored result; a different payload is REQUEST_ID_CONFLICT.'
+    'Canonical decimal request number of this connection, starting at "1" and growing by one. Always take it from next_request_id of the previous answer; never invent or reconstruct one. A repeat with the same payload replays the stored result; a different payload is REQUEST_ID_CONFLICT.'
   );
 
 const revision = (what: string) => z.string().min(1).describe(`Expected ${what} revision, taken from a previous read. A mismatch is REVISION_CONFLICT and nothing is applied.`);
@@ -354,18 +352,18 @@ export interface ToolSpec {
 }
 
 const SEQUENTIAL =
-  'Deduplicated and sequential: send it only after the previous mutation of this session answered, with request_id = that answer\'s next_request_id. An error before acceptance leaves the number unused (request_accepted:false); after acceptance the number is spent even if the operation failed.';
+  'Deduplicated and sequential: send it only after the previous mutation of this connection answered, with request_id = that answer\'s next_request_id. An error before acceptance leaves the number unused (request_accepted:false); after acceptance the number is spent even if the operation failed.';
 
 const NOT_A_TOOL_ERROR =
   'A Python error, an aborted or interrupted run and a lost kernel are job results (state failed / aborted / interrupted / unknown), never tool errors.';
 
-/** The 18 tools of SPEC.md §9, in the order of the table there. */
+/** The 16 tools of SPEC.md §9, in the order of the table there. */
 export const TOOL_SPECS: readonly ToolSpec[] = [
   {
     name: 'server_list',
     title: 'List Jupyter servers',
     description:
-      'Configured and (if enabled) discovered Jupyter servers, as credential-free descriptors. Contacts nothing and starts nothing. Use it to pick server_id for session_open when more than one is available.',
+      'Configured and (if enabled) discovered Jupyter servers, as credential-free descriptors. Contacts nothing and starts nothing. Use it to pick server_id for notebook_list/open/create or kernel_list when more than one is available.',
     input: z.object({}),
     output: obj(
       {
@@ -374,13 +372,14 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
             {
               descriptor: SERVER_DESCRIPTOR,
               origin: str('configured | discovered'),
-              default_choice: bool('true when session_open without server_id would pick this one.')
+              default_choice: bool('true when a server-scoped tool without server_id would pick this one.')
             },
             ['descriptor', 'origin', 'default_choice']
           )
         ),
         discovery_enabled: bool(),
-        selection_required: bool('true when session_open without server_id fails with SERVER_SELECTION_REQUIRED.'),
+        selection_required: bool('true when a server-scoped tool without server_id fails with SERVER_SELECTION_REQUIRED.'),
+        next_request_id: ENVELOPE['next_request_id'] as JsonSchema,
         response_truncated: ENVELOPE['response_truncated'] as JsonSchema,
         read_more: ENVELOPE['read_more'] as JsonSchema
       },
@@ -390,57 +389,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     deduplicated: false
   },
   {
-    name: 'session_open',
-    title: 'Open a working session',
-    description:
-      'Open a working session on one server. Starts no kernel and opens no document. The answer carries the first next_request_id ("1"). Repeating it creates a separate session — it is not deduplicated. The handle lives until session_close or process exit; after a restart it is HANDLE_EXPIRED.',
-    input: z.object({
-      server_id: z.string().min(1).optional().describe('Omit only when exactly one server is available, otherwise SERVER_SELECTION_REQUIRED.'),
-      label: z.string().optional().describe('Free-form diagnostic label. Never a credential.')
-    }),
-    output: result(
-      {
-        session_id: str(),
-        server: SERVER_DESCRIPTOR,
-        label: str(),
-        lifetime: LIFETIME,
-        opened_at: str(),
-        kernel_started: bool('Always false: opening a session starts no kernel.')
-      },
-      ['session_id', 'server', 'lifetime', 'opened_at', 'kernel_started']
-    ),
-    readOnly: false,
-    deduplicated: false
-  },
-  {
-    name: 'session_close',
-    title: 'Close a working session',
-    description:
-      'Release a working session with its notebooks, replicas, journals, jobs and output snapshots. Kernels and the Jupyter server keep running. Idempotent by handle. Refuses with EXECUTION_ACTIVE while a job of the session is active; force:true abandons that job (its state becomes unknown) and still shuts down no kernel.',
-    input: z.object({
-      session_id: sessionId,
-      force: z.boolean().optional().describe('Close despite an active job, abandoning it. Default false.')
-    }),
-    output: result(
-      {
-        session_id: str(),
-        closed_notebook_ids: arr(str()),
-        dropped_execution_ids: arr(str()),
-        already_closed: bool(),
-        kernels_left_running: bool('Always true.')
-      },
-      ['session_id', 'closed_notebook_ids', 'dropped_execution_ids', 'already_closed', 'kernels_left_running']
-    ),
-    readOnly: false,
-    deduplicated: false
-  },
-  {
     name: 'notebook_list',
     title: 'List notebooks',
     description:
       'Notebooks and directories under directory, with whatever Jupyter kernel-session information the server reports. Reads no file bodies and opens no document.',
-    input: z.object({
-      session_id: sessionId,
+    input: z.strictObject({
+      server_id: serverId,
       directory,
       cursor: z.string().optional().describe('Continue a previous listing.'),
       limits
@@ -465,7 +419,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
                 },
                 ['jupyter_session_id']
               ),
-              open_notebook_id: str('Set when this working session already has the file open.')
+              open_notebook_id: str('Set when this connection already has the file open.')
             },
             ['name', 'path', 'type']
           )
@@ -483,9 +437,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_create',
     title: 'Create and open a notebook',
     description:
-      `Allocate an untitled notebook in directory, rename it to name through Contents when one is given, then open its RTC room. ${SEQUENTIAL} The number is consumed before the file is allocated, so any failure after that reports request_accepted:true. On ALREADY_EXISTS (name taken) and PERMISSION_DENIED the untitled file stays on the server and the error names its path with side_effects:applied; a lost rename confirmation is OPERATION_UNCERTAIN and is never retried automatically. The notebook handle lives until notebook_close, session_close or process exit.`,
-    input: z.object({
-      session_id: sessionId,
+      `Allocate an untitled notebook in directory, rename it to name through Contents when one is given, then open its RTC room. ${SEQUENTIAL} The number is consumed before the file is allocated, so any failure after that reports request_accepted:true. On ALREADY_EXISTS (name taken) and PERMISSION_DENIED the untitled file stays on the server and the error names its path with side_effects:applied; a lost rename confirmation is OPERATION_UNCERTAIN and is never retried automatically. The notebook handle lives until notebook_close, connection close or process exit.`,
+    input: z.strictObject({
+      server_id: serverId,
       request_id: requestId,
       directory,
       name: z
@@ -511,9 +465,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_open',
     title: 'Open a notebook',
     description:
-      'Open a notebook by path and return a reusable handle plus a consistent summary and changes_cursor. Opening the same file again in this session returns the same handle (reused:true) — one replica, one WebSocket; a different working session deliberately gets its own replica. Starts no kernel. Takes no request_id. The handle lives until notebook_close, session_close or process exit.',
-    input: z.object({
-      session_id: sessionId,
+      'Open a notebook by path and return a reusable handle plus a consistent summary and changes_cursor. Opening the same file again on this connection and server returns the same handle (reused:true) — one replica, one WebSocket; a different connection gets its own replica. Starts no kernel. Takes no request_id. The handle lives until notebook_close, connection close or process exit.',
+    input: z.strictObject({
+      server_id: serverId,
       path: z.string().min(1).describe('Path of the .ipynb in the Jupyter Contents root.'),
       limits
     }),
@@ -660,7 +614,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_execute',
     title: 'Run cells',
     description:
-      `Queue code cells on the notebook's bound kernel, in order, one at a time. Before each cell its outputs are cleared and execution_state is set to running; the final execution_count and idle are written when it completes. ${SEQUENTIAL} wait_ms bounds the answer only — when it elapses the job keeps running and execution_get reads the rest; nothing is interrupted and nothing is re-sent. ${NOT_A_TOOL_ERROR} Requires a bound kernel (kernel_control action:"start"), otherwise KERNEL_NOT_BOUND before any output is touched. The execution handle and its output snapshots live until session_close.`,
+      `Queue code cells on the notebook's bound kernel, in order, one at a time. Before each cell its outputs are cleared and execution_state is set to running; the final execution_count and idle are written when it completes. ${SEQUENTIAL} wait_ms bounds the answer only — when it elapses the job keeps running and execution_get reads the rest; nothing is interrupted and nothing is re-sent. ${NOT_A_TOOL_ERROR} Requires a bound kernel (kernel_control action:"start"), otherwise KERNEL_NOT_BOUND before any output is touched. The execution handle lives until notebook_close or connection close; output snapshots remain available until bounded-store eviction or connection close.`,
     input: z.object({
       notebook_id: notebookId,
       request_id: requestId,
@@ -677,7 +631,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       wait_ms: waitMs,
       limits
     }),
-    output: result(EXECUTION_VIEW, ['execution_id', 'notebook_id', 'session_id', 'state', 'stop_on_error', 'cells', 'created_at', 'cursor', 'wait_timed_out']),
+    output: result(EXECUTION_VIEW, ['execution_id', 'notebook_id', 'state', 'stop_on_error', 'cells', 'created_at', 'cursor', 'wait_timed_out']),
     readOnly: false,
     deduplicated: true
   },
@@ -692,7 +646,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       wait_ms: waitMs,
       limits
     }),
-    output: result(EXECUTION_VIEW, ['execution_id', 'notebook_id', 'session_id', 'state', 'stop_on_error', 'cells', 'created_at', 'cursor', 'wait_timed_out']),
+    output: result(EXECUTION_VIEW, ['execution_id', 'notebook_id', 'state', 'stop_on_error', 'cells', 'created_at', 'cursor', 'wait_timed_out']),
     readOnly: true,
     deduplicated: false
   },
@@ -810,8 +764,8 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
   {
     name: 'kernel_list',
     title: 'List kernels',
-    description: 'Kernelspecs and running kernels of the session\'s server. Executes no code and starts nothing. Takes no request_id.',
-    input: z.object({ session_id: sessionId }),
+    description: 'Kernelspecs and running kernels of the selected server. Executes no code and starts nothing. Takes no request_id.',
+    input: z.strictObject({ server_id: serverId }),
     output: result(
       {
         kernelspecs: arr(obj({ name: str(), display_name: str(), language: str() }, ['name', 'display_name', 'language'])),

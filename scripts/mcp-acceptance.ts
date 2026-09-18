@@ -98,7 +98,6 @@ async function main(): Promise<number> {
   try {
     mcp = await startMcp(stand);
     const child = mcp;
-    let sessionId = '';
     let notebookId = '';
     let changesCursor = '';
     let requestId = '1';
@@ -113,33 +112,25 @@ async function main(): Promise<number> {
 
     await row('Protocol', 'initialize + tools/list', async () => {
       const tools = (await child.client.listTools()).tools;
-      expect(tools.length === 18, `expected 18 tools, got ${String(tools.length)}`);
+      expect(tools.length === 16, `expected 16 tools, got ${String(tools.length)}`);
       expect(
         tools.every((tool) => tool.inputSchema !== undefined && tool.outputSchema !== undefined),
         'every tool publishes an input and an output schema'
       );
-      return `18 tools with input+output schemas, protocol 2026-07-28`;
+      return `16 tools with input+output schemas, protocol 2026-07-28`;
     });
 
     await row('Servers', 'server_list is credential-free', async () => {
       const answer = await child.call('server_list');
       expect(list(answer['servers']).length === 1, 'exactly the configured server');
+      requestId = str(answer['next_request_id']);
+      expect(requestId === '1', 'initial implicit request number');
       expect(!JSON.stringify(answer).includes(TOKEN), 'no token in the answer');
       return 'one configured server, no credential in the descriptor';
     });
 
-    await row('Sessions', 'session_open', async () => {
-      const answer = await child.call('session_open', { label: 'acceptance' });
-      sessionId = str(answer['session_id']);
-      requestId = str(answer['next_request_id']);
-      expect(requestId === '1', `first next_request_id is "1", got ${requestId}`);
-      expect(answer['kernel_started'] === false, 'opening a session starts no kernel');
-      return `session ${sessionId}, next_request_id=1`;
-    });
-
     await row('Create name', 'notebook_create with a chosen name', async () => {
       const answer = await child.call('notebook_create', {
-        session_id: sessionId,
         request_id: requestId,
         directory: '',
         name: NOTEBOOK
@@ -153,7 +144,7 @@ async function main(): Promise<number> {
     });
 
     await row('Reopening', 'notebook_open returns the same handle', async () => {
-      const answer = await child.call('notebook_open', { session_id: sessionId, path: NOTEBOOK });
+      const answer = await child.call('notebook_open', { path: NOTEBOOK });
       expect(answer['reused'] === true, 'the live replica was reused');
       expect(obj(answer['notebook'])['notebook_id'] === notebookId, 'same notebook_id');
       return 'one replica, one WebSocket';
@@ -342,9 +333,9 @@ async function main(): Promise<number> {
       return 'the .ipynb on disk contains the cell and its outputs';
     });
 
-    await row('Cleanup', 'session_close leaves the kernel running', async () => {
-      const closed = await child.call('session_close', { session_id: sessionId });
-      expect(closed['kernels_left_running'] === true, 'closing shuts no kernel down');
+    await row('Cleanup', 'notebook_close leaves the kernel running', async () => {
+      const closed = await child.call('notebook_close', { notebook_id: notebookId });
+      expect(closed['kernel_left_running'] === true, 'closing shuts no kernel down');
       const response = await fetch(`${stand.baseUrl}/api/kernels`, {
         headers: { Authorization: `token ${stand.token}` }
       });

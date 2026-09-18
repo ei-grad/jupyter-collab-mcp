@@ -53,10 +53,8 @@ const call = async (actor: GatewayIdentity, name: string, args: Result = {}): Pr
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 try {
-  const session = await call(first, 'session_open');
-  const sessionId = session['session_id'];
   const created = await call(first, 'notebook_create', {
-    session_id: sessionId, request_id: '1', directory: '', name: `refresh-${Date.now()}.ipynb`
+    request_id: '1', directory: '', name: `refresh-${Date.now()}.ipynb`
   });
   const notebookId = (created['notebook'] as Result)['notebook_id'];
   const applied = await call(first, 'notebook_apply', {
@@ -81,7 +79,7 @@ try {
   const rotated = await registry.acquire(renewed);
   assert.equal(rotated.worker, worker);
   await rotated.release();
-  await call(renewed, 'notebook_list', { session_id: sessionId, directory: '' });
+  await call(renewed, 'notebook_list', { directory: '' });
   process.stdout.write('renewed assertion; original notebook and execution handles retained\n');
 
   await wait(Math.max(0, first.expiresAt * 1000 - Date.now()) + 500);

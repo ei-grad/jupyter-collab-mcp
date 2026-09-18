@@ -17,11 +17,9 @@ afterEach(async () => {
 
 const VALID_ARGS: Record<string, Record<string, unknown>> = {
   server_list: {},
-  session_open: { server_id: 'default', label: 'tests' },
-  session_close: { session_id: 'ses_1' },
-  notebook_list: { session_id: 'ses_1', directory: 'work' },
-  notebook_create: { session_id: 'ses_1', request_id: '1', directory: 'work', name: 'new.ipynb' },
-  notebook_open: { session_id: 'ses_1', path: 'work/analysis.ipynb' },
+  notebook_list: { server_id: 'default', directory: 'work' },
+  notebook_create: { server_id: 'default', request_id: '1', directory: 'work', name: 'new.ipynb' },
+  notebook_open: { server_id: 'default', path: 'work/analysis.ipynb' },
   notebook_close: { notebook_id: 'nb_1' },
   notebook_read: { notebook_id: 'nb_1', view: 'summary' },
   notebook_apply: {
@@ -48,18 +46,18 @@ const VALID_ARGS: Record<string, Record<string, unknown>> = {
   execution_cancel: { execution_id: 'exe_1' },
   notebook_changes: { notebook_id: 'nb_1', cursor: 'chg_7' },
   notebook_save: { notebook_id: 'nb_1' },
-  kernel_list: { session_id: 'ses_1' },
+  kernel_list: { server_id: 'default' },
   kernel_status: { notebook_id: 'nb_1' },
   kernel_control: { notebook_id: 'nb_1', request_id: '4', action: 'start', expected_kernel_id: null }
 };
 
 describe('tools/list', () => {
-  it('publishes all 18 SPEC §9 tools with an input and an output schema', async () => {
+  it('publishes all 16 SPEC §9 tools with an input and an output schema', async () => {
     harness = await connect();
     const listed = await harness.client.listTools();
     const names = listed.tools.map((tool) => tool.name).sort();
     expect(names).toEqual(TOOL_SPECS.map((spec) => spec.name).sort());
-    expect(names).toHaveLength(18);
+    expect(names).toHaveLength(16);
     for (const tool of listed.tools) {
       expect(tool.inputSchema, tool.name).toBeDefined();
       expect(tool.outputSchema, tool.name).toBeDefined();
@@ -167,7 +165,7 @@ describe('argument validation', () => {
     ['notebook_apply', { notebook_id: 'nb_1', request_id: '1', operations: [] }, /operations/u],
     ['notebook_execute', { notebook_id: 'nb_1', request_id: '007', cells: [] }, /request_id|cells/u],
     ['kernel_control', { notebook_id: 'nb_1', request_id: '1', action: 'interrupt' }, /expected_kernel_id/u],
-    ['session_open', { server_id: 42 }, /server_id/u]
+    ['kernel_list', { server_id: 42 }, /server_id/u]
   ];
 
   for (const [tool, args, expected] of bad) {
@@ -388,25 +386,6 @@ describe('response size and output content', () => {
     expect(answer.isError).toBe(true);
     expect(answer.structuredContent).toBeUndefined();
     expect(metaError(answer)).toMatchObject({ code: 'RESOURCE_LIMIT' });
-  });
-
-  it('does not report no effects when a completed close result exceeds the budget', async () => {
-    const service = new FakeCollabService();
-    service.sessionClose = async (request) => ({
-      sessionId: request.sessionId,
-      closedNotebookIds: Array.from({ length: 100 }, (_unused, index) => `nb_${String(index)}`),
-      droppedExecutionIds: [],
-      alreadyClosed: false,
-      kernelsLeftRunning: true,
-      nextRequestId: null
-    });
-    harness = await connect({ service, server: { responseMaxBytes: 500 } });
-    const answer = await harness.call('session_close', { session_id: 'ses_1' });
-    expect(answer.isError).toBe(true);
-    expect(metaError(answer)).toMatchObject({
-      code: 'RESOURCE_LIMIT',
-      side_effects: 'unknown'
-    });
   });
 
   it('honours a smaller configured budget', async () => {

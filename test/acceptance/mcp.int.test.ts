@@ -42,6 +42,7 @@ const nb = (label: string): string => `acc-${RUN}-${label}.ipynb`;
 
 let stand: Stand;
 let mcp: McpChild;
+const extraClients: McpChild[] = [];
 /** Kernels started during the run; deleted in afterAll, never by the product. */
 const startedKernels = new Set<string>();
 
@@ -63,6 +64,7 @@ beforeAll(async () => {
 }, 180_000);
 
 afterAll(async () => {
+  await Promise.all(extraClients.map((client) => client.close()));
   await mcp?.close();
   const target = { baseUrl: stand.baseUrl, token: stand.token };
   try {
@@ -84,34 +86,38 @@ afterAll(async () => {
 // state shared by the ordered scenarios below
 // ---------------------------------------------------------------------------
 
-interface Session {
-  readonly id: string;
+interface Context {
+  readonly client: McpChild;
   readonly counter: Counter;
 }
 
-let main: Session;
+let main: Context;
 let docPath: string;
 let docId: string;
 let docCursor: string;
 
-async function openSession(label: string): Promise<Session> {
-  const answer = await mcp.call('session_open', { label });
+async function openContext(client?: McpChild): Promise<Context> {
+  if (client === undefined) {
+    client = await startMcp(stand);
+    extraClients.push(client);
+  }
+  const answer = await client.call('server_list');
   const counter = new Counter();
   counter.take(answer);
-  return { id: str(answer['session_id']), counter };
+  return { client, counter };
 }
 
 // ---------------------------------------------------------------------------
 
 describe('protocol surface', () => {
-  it('initialize pins 2026-07-28 and tools/list publishes all 18 tools with schemas', async () => {
+  it('initialize pins 2026-07-28 and tools/list publishes all 16 tools with schemas', async () => {
     // `client.connect` already completed the pinned handshake in beforeAll.
     expect(mcp.client.getServerVersion()?.name).toBe('jupyter-collab-mcp');
     expect(mcp.client.getServerCapabilities()?.tools).toBeDefined();
     expect(mcp.client.getServerCapabilities()?.resources).toBeDefined();
 
     const tools = (await mcp.client.listTools()).tools;
-    expect(tools).toHaveLength(18);
+    expect(tools).toHaveLength(16);
     expect(tools.map((tool) => tool.name).sort()).toEqual(
       [
         'execution_cancel',
@@ -129,9 +135,7 @@ describe('protocol surface', () => {
         'notebook_read',
         'notebook_save',
         'output_read',
-        'server_list',
-        'session_close',
-        'session_open'
+        'server_list'
       ].sort()
     );
     for (const tool of tools) {
@@ -164,10 +168,10 @@ describe('protocol surface', () => {
     expect(JSON.stringify(answer)).not.toContain(TOKEN);
   });
 
-  it('session_open answers next_request_id "1" and starts no kernel', async () => {
-    main = await openSession('acceptance-main');
+  it('the implicit context exposes next_request_id without starting a kernel', async () => {
+    main = await openContext(mcp);
     expect(main.counter.value).toBe('1');
-    const kernels = await mcp.call('kernel_list', { session_id: main.id });
+    const kernels = await mcp.call('kernel_list', {});
     expect(list(kernels['kernelspecs']).length).toBeGreaterThan(0);
   });
 });
@@ -176,7 +180,6 @@ describe('Create name (SPEC §12)', () => {
   it('creates an untitled notebook, a named one, and keeps the untitled file on ALREADY_EXISTS', async () => {
     // -- no name: the server-chosen untitled name is kept -------------------
     const untitled = await mcp.call('notebook_create', {
-      session_id: main.id,
       request_id: main.counter.value,
       directory: ''
     });
@@ -189,7 +192,6 @@ describe('Create name (SPEC §12)', () => {
     // -- with a name: newUntitled -> Contents PATCH -> room ------------------
     docPath = nb('doc');
     const created = await mcp.call('notebook_create', {
-      session_id: main.id,
       request_id: main.counter.value,
       directory: '',
       name: docPath
@@ -206,7 +208,6 @@ describe('Create name (SPEC §12)', () => {
 
     // -- the same name again: ALREADY_EXISTS, untitled file stays -----------
     const error = await mcp.fail('notebook_create', {
-      session_id: main.id,
       request_id: main.counter.value,
       directory: '',
       name: docPath
@@ -228,7 +229,6 @@ describe('Create name (SPEC §12)', () => {
 
   it('removes the pristine server placeholder from a fresh notebook', async () => {
     const created = await mcp.call('notebook_create', {
-      session_id: main.id,
       request_id: main.counter.value,
       directory: '',
       name: nb('placeholder')
@@ -239,27 +239,27 @@ describe('Create name (SPEC §12)', () => {
 });
 
 describe('Reopening / Separate conversations (SPEC §12)', () => {
-  it('reopening in one session returns the same handle, a second session gets its own', async () => {
-    const first = await mcp.call('notebook_open', { session_id: main.id, path: docPath });
+  it('reopening reuses a handle while an independent client gets its own', async () => {
+    const first = await mcp.call('notebook_open', { path: docPath });
     expect(obj(first['notebook'])['notebook_id']).toBe(docId);
     expect(first['reused']).toBe(true);
 
     // Concurrent opens coalesce onto the one replica.
     const [a, b] = await Promise.all([
-      mcp.call('notebook_open', { session_id: main.id, path: docPath }),
-      mcp.call('notebook_open', { session_id: main.id, path: docPath })
+      mcp.call('notebook_open', { path: docPath }),
+      mcp.call('notebook_open', { path: docPath })
     ]);
     expect(obj(a['notebook'])['notebook_id']).toBe(docId);
     expect(obj(b['notebook'])['notebook_id']).toBe(docId);
 
-    // A different working session is a different replica of the same file.
-    const other = await openSession('acceptance-second');
-    const mirror = await mcp.call('notebook_open', { session_id: other.id, path: docPath });
+    // An independent MCP client owns a different replica of the same file.
+    const other = await openContext();
+    const mirror = await other.client.call('notebook_open', { path: docPath });
     const mirrorHandle = obj(mirror['notebook']);
     expect(mirrorHandle['notebook_id']).not.toBe(docId);
     expect(mirrorHandle['file_id']).toBe(obj(first['notebook'])['file_id']);
     expect(mirror['next_request_id']).toBe('1');
-    await mcp.call('session_close', { session_id: other.id });
+    await other.client.close();
   }, 60_000);
 });
 
@@ -527,9 +527,9 @@ describe('Retries / Replay and call ordering (SPEC §12)', () => {
 
 describe('Retries: revision-bearing operations', () => {
   it('resending an identical revision-bearing apply replays instead of conflicting', async () => {
-    const session = await openSession('acceptance-replay-defect');
+    const session = await openContext();
+    const mcp = session.client;
     const created = await mcp.call('notebook_create', {
-      session_id: session.id,
       request_id: session.counter.value,
       directory: '',
       name: nb('replay-defect')
@@ -560,7 +560,7 @@ describe('Retries: revision-bearing operations', () => {
       const replay = await mcp.call('notebook_apply', payload);
       expect(replay['replayed']).toBe(true);
     } finally {
-      await mcp.call('session_close', { session_id: session.id, force: true });
+      await mcp.close();
     }
   }, 120_000);
 });
@@ -630,8 +630,7 @@ describe('Bidirectional RTC / Cursors (SPEC §12)', () => {
     writeFileSync(configPath, JSON.stringify({ limits: { journalMaxEvents: 4 } }));
     const small = await startMcp(stand, {}, ['--config', configPath]);
     try {
-      const session = str((await small.call('session_open', { label: 'tiny-journal' }))['session_id']);
-      const opened = await small.call('notebook_open', { session_id: session, path: docPath });
+      const opened = await small.call('notebook_open', { path: docPath });
       const notebookId = str(obj(opened['notebook'])['notebook_id']);
       const cursor = str(opened['changes_cursor']);
       let requestId = str(opened['next_request_id']);
@@ -657,7 +656,6 @@ describe('Bidirectional RTC / Cursors (SPEC §12)', () => {
         cursor: str(fresh['changes_cursor'])
       });
       expect(list(resumed['events'])).toHaveLength(0);
-      await small.call('session_close', { session_id: session });
     } finally {
       await small.close();
       rmSync(configPath, { force: true });
@@ -743,9 +741,9 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
   }, 60_000);
 
   it('replays switch and shutdown after each action changes the binding', async () => {
-    const session = await openSession('acceptance-kernel-replay');
+    const session = await openContext();
+    const mcp = session.client;
     const created = await mcp.call('notebook_create', {
-      session_id: session.id,
       request_id: session.counter.value,
       directory: '',
       name: nb('kernel-replay')
@@ -787,7 +785,7 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     expect(stopped['kernel_id']).toBeNull();
     expect(shutdownReplay['replayed']).toBe(true);
     expect(shutdownReplay['kernel_id']).toBeNull();
-    await mcp.call('session_close', { session_id: session.id });
+    await mcp.close();
   }, 120_000);
 
   it('persists the selected kernelspec in notebook metadata', async () => {
@@ -962,9 +960,9 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
 
 describe('Interruption and cancellation (SPEC §12)', () => {
   it('cancels queued cells, refuses to close while the job is active and interrupts the running one', async () => {
-    const session = await openSession('acceptance-interrupt');
+    const session = await openContext();
+    const mcp = session.client;
     const created = await mcp.call('notebook_create', {
-      session_id: session.id,
       request_id: session.counter.value,
       directory: '',
       name: nb('interrupt')
@@ -1045,8 +1043,6 @@ describe('Interruption and cancellation (SPEC §12)', () => {
     // -- a close while a job is active is refused (SPEC §4) -----------------
     const closeError = await mcp.fail('notebook_close', { notebook_id: notebookId });
     expect(closeError.code).toBe('EXECUTION_ACTIVE');
-    const sessionCloseError = await mcp.fail('session_close', { session_id: session.id });
-    expect(sessionCloseError.code).toBe('EXECUTION_ACTIVE');
 
     // -- an explicit interrupt is available during the long job -------------
     const interrupted = await mcp.call('kernel_control', {
@@ -1069,11 +1065,11 @@ describe('Interruption and cancellation (SPEC §12)', () => {
     expect(second?.['not_sent_reason']).toBe('cancelled');
 
     // The kernel survived every one of those (SPEC §4).
-    const kernels = await mcp.call('kernel_list', { session_id: session.id });
+    const kernels = await mcp.call('kernel_list', {});
     expect(list(kernels['running']).some((entry) => entry['kernel_id'] === kernelId)).toBe(true);
 
-    const closed = await mcp.call('session_close', { session_id: session.id });
-    expect(closed['kernels_left_running']).toBe(true);
+    const closed = await mcp.call('notebook_close', { notebook_id: notebookId });
+    expect(closed['kernel_left_running']).toBe(true);
     expect(closed['already_closed']).toBe(false);
 
     // Handles of a closed session are gone.
@@ -1088,9 +1084,9 @@ describe('Retry limit (SPEC §12)', () => {
     // is only forgotten after 4 096 further acceptances. The cheapest
     // accepted mutation is one notebook-metadata key, which also chains its
     // own expected revision, so no read is needed between the calls.
-    const session = await openSession('acceptance-receipts');
+    const session = await openContext();
+    const mcp = session.client;
     const created = await mcp.call('notebook_create', {
-      session_id: session.id,
       request_id: session.counter.value,
       directory: '',
       name: nb('receipts')
@@ -1183,17 +1179,16 @@ describe('Retry limit (SPEC §12)', () => {
     // Exactly one cell was added by the two calls.
     expect(Number(obj(afterConcurrent['summary'])['cell_count'])).toBe(cellsAfterFirst + 1);
 
-    await mcp.call('session_close', { session_id: session.id });
+    await mcp.close();
   }, 300_000);
 });
 
 describe('Cleanup and credentials (SPEC §12)', () => {
-  it('closes the main session and leaves the kernel running', async () => {
-    const closed = await mcp.call('session_close', { session_id: main.id });
-    expect(closed['kernels_left_running']).toBe(true);
-    expect(list(closed['closed_notebook_ids']).length).toBeGreaterThan(0);
-    const again = await mcp.call('session_close', { session_id: main.id });
-    expect(again['already_closed']).toBe(true);
+  it('closing the connection releases its handles and leaves kernels running', async () => {
+    await mcp.close();
+    const kernels = await apiFetchOk({ baseUrl: stand.baseUrl, token: stand.token }, '/api/kernels');
+    const running = kernels.json<Array<{ id: string }>>();
+    expect(running.some((kernel) => startedKernels.has(kernel.id))).toBe(true);
   }, 60_000);
 
   it('the child wrote nothing but JSON-RPC to stdout', () => {

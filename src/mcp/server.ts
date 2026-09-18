@@ -43,8 +43,6 @@ import type {
   NotebookReadRequest,
   NotebookSaveRequest,
   OutputReadRequest,
-  SessionCloseRequest,
-  SessionOpenRequest
 } from '../core/index.js';
 import { TOOL_SPECS, TOOL_SPECS_BY_NAME } from './schemas.js';
 import type { ToolSpec } from './schemas.js';
@@ -57,6 +55,7 @@ import {
   toWire,
   WireBudgetError
 } from './wire.js';
+import { OPAQUE_KEYS } from './wire.js';
 import type { WireObject, WireValue } from './wire.js';
 
 /** `_meta` key carrying the structured error of a failed tool call. */
@@ -72,7 +71,7 @@ export const OUTPUT_URI_TEMPLATE = 'jupyter-output:{output_id}';
  * template does not match that URI and `resources/read` would answer
  * "Resource not found". Both are registered; the service parses either.
  */
-export const OUTPUT_URI_TEMPLATE_SESSION = 'jupyter-output://{session_id}/{output_id}';
+export const OUTPUT_URI_TEMPLATE_SESSION = 'jupyter-output://{context_id}/{output_id}';
 
 /** Severity of an adapter diagnostic. Diagnostics never reach stdout. */
 export type LogLevel = 'error' | 'warn' | 'info' | 'debug';
@@ -382,12 +381,6 @@ export function renderText(tool: string, payload: WireObject): string {
       }
       break;
     }
-    case 'session_open':
-      lines.push(`session ${s(payload['session_id'])} on ${s(nested(payload, 'server')['id'])}; no kernel started`);
-      break;
-    case 'session_close':
-      lines.push(`session ${s(payload['session_id'])} closed=${payload['already_closed'] === true ? 'already' : 'now'}; notebooks=${s(payload['closed_notebook_ids'])} kernels left running`);
-      break;
     case 'notebook_list': {
       const entries = payload['entries'];
       lines.push(`${s(payload['directory'])}: ${Array.isArray(entries) ? entries.length : 0} entr(ies) truncated=${s(payload['truncated'])}`);
@@ -562,10 +555,6 @@ async function dispatch(service: CollabService, tool: string, request: unknown):
   switch (tool) {
     case 'server_list':
       return service.serverList();
-    case 'session_open':
-      return service.sessionOpen(request as SessionOpenRequest);
-    case 'session_close':
-      return service.sessionClose(request as SessionCloseRequest);
     case 'notebook_list':
       return service.notebookList(request as NotebookListRequest);
     case 'notebook_create':
@@ -682,7 +671,7 @@ function registerTool(
 
 /** Assemble content blocks and `structuredContent` from a service result. */
 function buildResult(tool: string, result: unknown, options: ResolvedOptions): CallToolResult {
-  const wire = toWire(result);
+  const wire = publicResult(toWire(result));
   const base: WireObject = typeof wire === 'object' && wire !== null && !Array.isArray(wire) ? wire : { result: wire };
   const extracted = extractOutputContent(tool, base, options);
   let bounded;
@@ -728,6 +717,28 @@ function buildResult(tool: string, result: unknown, options: ResolvedOptions): C
     content: [{ type: 'text', text }, ...extracted.blocks],
     structuredContent: bounded.payload
   };
+}
+
+/** Expose connection lifetime without rewriting arbitrary notebook values. */
+function publicResult(value: WireValue): WireValue {
+  if (Array.isArray(value)) return value.map(publicResult);
+  if (!isObject(value)) return value;
+  const result: WireObject = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'session_id') continue;
+    if (OPAQUE_KEYS.has(key)) {
+      result[key] = child;
+    } else if (key === 'lifetime' && isObject(child)) {
+      result[key] = {
+        ...child,
+        scope: child['scope'] === 'until_session_close' ? 'until_connection_close' : child['scope']!,
+        released_by: Array.isArray(child['released_by'])
+          ? child['released_by'].map((event) => event === 'session_close' ? 'connection_close' : event)
+          : []
+      };
+    } else result[key] = publicResult(child);
+  }
+  return result;
 }
 
 function registerOutputResources(server: McpServer, service: CollabService, options: ResolvedOptions): void {
@@ -787,7 +798,7 @@ function registerOutputResources(server: McpServer, service: CollabService, opti
   const metadata = {
     title: 'Notebook output snapshot',
     description:
-      'One immutable output snapshot produced by a run. The URI carries no credentials and expires with its working session (then HANDLE_EXPIRED). Hosts that do not read resources use the output_read tool for the same bytes.'
+      'One immutable output snapshot produced by a run. The URI carries no credentials and expires on bounded-store eviction or connection closure (then HANDLE_EXPIRED). Hosts that do not read resources use the output_read tool for the same bytes.'
   };
 
   // The listing lives on the short form; both templates read, because the URI

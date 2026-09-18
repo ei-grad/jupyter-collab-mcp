@@ -25,12 +25,11 @@ sent to other participants. Variables and computation results live in the
 Jupyter kernel; document state, kernel state, and LLM conversation context have
 different lifecycles.
 
-MCP does not itself provide a conversation session. In the 2026-07-28 protocol
-revision, state across requests must be addressed by explicit identifiers; a
-process may serve multiple conversations. The project therefore introduces its
-own `session_id`, `notebook_id`, and `execution_id`, passed in tool arguments.
-One stdio process per conversation may be a host configuration, but is not a
-server invariant. [MCP: request state](https://modelcontextprotocol.io/specification/2026-07-28/basic#statelessness)
+Each stdio process or isolated hosted worker owns one implicit working
+context. Notebook and execution handles explicitly address its state. A host that needs
+independent agents gives them independent workers/connections; a shared process
+does not infer conversation identity from tool calls. A hosted transport session
+is a routing key bound to verified identity, never proof of identity by itself.
 
 ## 2. Findings about the existing client
 
@@ -112,7 +111,8 @@ Core components:
 
 - `ServerRegistry`: validated server configuration, with credentials excluded
   from responses.
-- `SessionRegistry`: working sessions owned by the calling workflow.
+- `SessionRegistry`: bounded server bindings within the implicit context,
+  plus explicit sessions for TypeScript library callers.
 - `NotebookConnection`: shared model, RTC provider, synchronization status,
   revisions, and a bounded change log.
 - `KernelConnection`: one message receiver per kernel connection, routing by
@@ -120,29 +120,38 @@ Core components:
 - `ExecutionRegistry`: executions, their states, and references to results.
 - MCP adapter: tool schemas and result/error conversion.
 
-A working session selects one server and may open multiple notebooks. Repeating
-`notebook_open` for the same `fileId` in that session returns the existing handle
-and does not create another `Y.Doc`/WebSocket. Concurrent opens are coalesced
-into one operation. Replicas and cursors are independent across working sessions,
-although the server document remains shared. Two sessions for one notebook
-intentionally have two `Y.Doc` instances and two RTC WebSockets; each is fully
-charged against memory and connection budgets. In stdio this is not a security
-boundary between different people. A future shared HTTP adapter must bind
-handles to an authenticated owner and validate that owner on every call,
-including resource reads; the MCP transport session and `clientInfo` are not
-used as proof of ownership.
+An implicit working context can bind several Jupyter servers. Tools without
+a handle (`notebook_list`, `notebook_create`, `notebook_open`, `kernel_list`)
+accept optional `server_id`; omission selects only a single unambiguous server.
+Server bindings are initialized lazily and concurrent first calls coalesce.
+`server_list` returns `next_request_id` without contacting Jupyter. Each
+connection has exactly one mutation ledger and lock across its server bindings.
+Different server targets are different mutation payloads, even at the same path.
+Closing/reopening a notebook must not reset the request-number high-water mark.
+Queued notebook creation rechecks context lifetime after acquiring the mutation lock.
+After shutdown they accept no new receipt and cause no new file/kernel effect;
+the rejection reports `request_accepted: false`.
+
+Repeating `notebook_open` for the same server and `fileId` returns the existing
+handle without another `Y.Doc`/WebSocket. Concurrent opens coalesce. Separate
+workers keep independent replicas, cursors, jobs, output snapshots, and receipts,
+although the remote notebook and kernel can be shared. All handles/resources
+must stay within their verified owner and isolated worker. TypeScript embedding applications can explicitly open independent sessions
+through the library API.
 
 All handles are opaque and belong to a specific service process. A supplied
-`notebook_id` uniquely determines the server and working session; there is no
+`notebook_id` uniquely determines the server and connection context; there is no
 global "current notebook." Likewise, an `execution_id` addresses a specific
 execution. After a restart, old handles return `HANDLE_EXPIRED`. The agent
 explicitly reopens the document; unfinished code is not automatically retried.
-Creation-tool descriptions and responses state lifetimes: sessions/notebooks
-last until explicitly closed or the process exits; executions and their output
-resources last until the working session closes. An unusable RTC handle retains
-diagnostics until close, but no longer permits writes. Reopening the same file
-in that working session still returns the existing handle, including a terminal
-one; recovery therefore closes the terminal handle before opening and waiting
+Creation-tool descriptions and responses state lifetimes: notebook handles
+last until explicitly closed or the connection context ends. Jobs are released
+with their notebook; bounded output snapshots expire on eviction or context
+shutdown. Context shutdown releases all receipts, jobs, snapshots and connections.
+Public lifetime descriptors use `connection_close` for context teardown.
+An unusable RTC handle retains diagnostics until close, but no longer permits
+writes. Reopening the same file in that context still returns the existing
+handle, including a terminal one; recovery closes that handle before opening and waiting
 for a new ready replica. Active execution must first reach a terminal result or
 be abandoned by an explicit caller decision. Active handles are not evicted to
 admit new ones. This is application policy, and `HANDLE_EXPIRED` is its code,
@@ -158,9 +167,8 @@ the invalidated connection. A handle with an invalidated lease reacquires
 before its next kernel operation; releasing an old lease must not close its
 replacement.
 
-`notebook_close` releases its RTC connection. `session_close` closes the
-session's notebooks and subscriptions. By default, both refuse to close during
-active execution (`EXECUTION_ACTIVE`): first finish the work or explicitly
+`notebook_close` releases its RTC connection, subscriptions and jobs. By default
+it refuses to close during active execution (`EXECUTION_ACTIVE`): first finish the work or explicitly
 interrupt it. Normal MCP shutdown does not stop kernels or Jupyter Server. On
 EOF/SIGTERM, the process stops accepting executions, attempts to send buffered
 updates within a short deadline, and releases connections. Abnormal termination
@@ -271,7 +279,7 @@ handshake implementation.
    `{"format":"json","type":"notebook"}`.
 4. Extract `fileId` and the collaboration `sessionId` from the response. Connect
    to room `json:notebook:<fileId>` at `api/collaboration/room`, passing the
-   sessionId. This is neither a Jupyter kernel session nor an MCP working session.
+   sessionId. This is neither a Jupyter kernel session nor an MCP connection context.
 5. Create an empty shared model, complete initial Yjs synchronization, verify
    that the notebook structure is accessible, and then return the handle. Do
    not populate the local replica from a JSON copy in parallel with RTC. After
@@ -653,11 +661,9 @@ read results and changes.
 | Tool | Primary arguments | Result/effect |
 | --- | --- | --- |
 | `server_list` | — | Safe descriptors for discovered/configured servers |
-| `session_open` | `server_id?`, `label?` | `session_id`, lifetime, `next_request_id`; automatically select a sole server, without starting a kernel |
-| `session_close` | `session_id` | Close the working session without shutting down kernels |
-| `notebook_list` | `session_id`, `directory`, `cursor?` | Notebook files and available session information |
-| `notebook_create` | `session_id`, `directory`, `name?`, `request_id` | Untitled → optional rename → open; actual path, fileId, notebook_id, changes_cursor |
-| `notebook_open` | `session_id`, `path` | Reusable handle, lifetime, status, summary, and `changes_cursor` |
+| `notebook_list` | `server_id?`, `directory`, `cursor?` | Notebook files and available session information |
+| `notebook_create` | `server_id?`, `directory`, `name?`, `request_id` | Untitled → optional rename → open; actual path, fileId, notebook_id, changes_cursor |
+| `notebook_open` | `server_id?`, `path` | Reusable handle, lifetime, status, summary, and `changes_cursor` |
 | `notebook_close` | `notebook_id` | Release the replica |
 | `notebook_read` | `notebook_id`, `view`, `cell_ids?`, `cursor?`, `limits?` | Summary, source/metadata/attachments or outputs, revisions, page cursor, `changes_cursor` |
 | `notebook_apply` | `notebook_id`, `request_id`, `operations[]` | Added IDs, new revisions, delivery state |
@@ -667,7 +673,7 @@ read results and changes.
 | `execution_cancel` | `execution_id` | Cancel remaining unsent cells |
 | `notebook_changes` | `notebook_id`, `cursor`, `wait_ms?`, `limit?` | Changes after the cursor or `CURSOR_EXPIRED` |
 | `notebook_save` | `notebook_id` | Server save acknowledgement or uncertainty |
-| `kernel_list` | `session_id` | Kernelspecs and running kernels, without executing code |
+| `kernel_list` | `server_id?` | Kernelspecs and running kernels, without executing code |
 | `kernel_status` | `notebook_id` | Binding and observed kernel status |
 | `kernel_control` | `notebook_id`, `action`, `expected_kernel_id`, `kernel_name?`, `request_id` | Start/interrupt/restart/shutdown/switch with explicit effects |
 
@@ -681,12 +687,12 @@ Changing an existing cell type and writing attachments are deferred. The
 summary snapshot and `changes_cursor` are captured consistently, without an
 `await` between reading the model and recording the log boundary. `page_cursor`
 and `changes_cursor` have distinct, noninterchangeable types. Tool responses in
-a working session also return the current `next_request_id`. Descriptions for
+a connection context also return the current `next_request_id`. Descriptions for
 `notebook_create`, `notebook_apply`, `notebook_execute`, and `kernel_control`
-require sequential calls within each working session: send the next such call
+require sequential calls within each connection context: send the next such call
 after the preceding response, using its number. This constrains tool-call
 acceptance; a returned `execution_id` may still be running. Reads, observation,
-wait cancellation, and operations in different working sessions may proceed in
+wait cancellation, and operations in different connection contexts may proceed in
 parallel. Interrupt remains available after obtaining an execution handle.
 
 Example edit arguments and the subsequent execution call:
@@ -723,11 +729,11 @@ back.
 
 Deduplication is required for `notebook_create`, `notebook_apply`,
 `notebook_execute`, and `kernel_control`. `request_id` is the canonical decimal
-string of a positive 64-bit number increasing by one within the working session;
+string of a positive 64-bit number increasing by one within the connection context;
 initial `next_request_id` is `"1"`. The client takes the number from that
 session's latest response, without incrementing or reconstructing it from
 memory. This is a service API number; JSON-RPC has its own ID. Two mutation
-authors in one session must coordinate calls or use separate working sessions.
+authors in one session must coordinate calls or use independent workers/connections.
 If the host sends concurrent calls, the same number with different payloads
 returns `REQUEST_ID_CONFLICT`; the same number and payload is a replay; a later
 number arriving before its predecessor returns `REQUEST_OUT_OF_ORDER`. An error
@@ -775,8 +781,8 @@ The no-resend guarantee for an accepted request applies within one live working
 session with bounded result retention. Exactly-once behavior across restart,
 new sessions, or Jupyter connection loss is not promised. Close/cancel are
 repeatable against their target handle and send no code; repeated save may
-persist newer state and is not declared deduplicated. Repeated `session_open`
-creates another working session; `notebook_open` reuses a live handle.
+persist newer state and is not declared deduplicated. `notebook_open` reuses a
+live handle within its automatic context.
 
 Tool errors return `isError: true` and structured `code`, `message`,
 `retryable`, and `side_effects: none|applied|unknown`; when applicable, also
@@ -796,7 +802,7 @@ under a new ID.
 | `INVALID_ARGUMENT`, `UNSUPPORTED_OPERATION` | false | none | Fix arguments/select a supported operation |
 | `SERVER_NOT_FOUND`, `SERVER_SELECTION_REQUIRED` | false | none | Configure/explicitly select a server |
 | `AUTH_REQUIRED`, `PERMISSION_DENIED` | false | none | Fix credentials/permissions outside tool arguments |
-| `HANDLE_EXPIRED` | false | none | Explicitly open a new session/notebook; do not retry code |
+| `HANDLE_EXPIRED` | false | none | Explicitly reopen the notebook; do not retry code |
 | `NOT_READY` | true | none | Await readiness; for a terminal state, see the RTC code |
 | `RTC_SESSION_REJECTED`, `RTC_CONFLICT`, `FILE_ID_CHANGED` | false | unknown | Stop sending the old document; recover explicitly |
 | `RTC_BAD_REQUEST` | false | none | Fix the protocol profile/path |
@@ -844,7 +850,7 @@ host resource support does not make the execution result inaccessible.
 
 Initial configurable limits are 100 cells per summary, 64 KiB of text per
 response, up to 30 seconds of waiting per tool call, 10,000 notebook-log events,
-32 open replicas, and 64 working sessions per process. These design values make
+32 open replicas, and 64 server bindings per context. These design values make
 no claim about measured limits. Input request and compact receipt sizes are also
 bounded and checked before effects; outputs are not copied into the replay registry.
 Replicas, output buffers, and the deduplication registry have separate memory
@@ -906,10 +912,10 @@ do not replace explicit agent reads.
 
 The new skill must be substantially shorter than the old CLI catalog and cover:
 
-1. Selecting a server and opening a working session and notebook.
+1. Selecting a server and opening a notebook in the implicit context.
 2. Reading the summary and required cells; using IDs and revisions.
 3. Editing and visible notebook execution; obtaining the execution and result.
-   Mutations with `request_id` are sequential per working session, with every
+   Mutations with `request_id` are sequential per connection context, with every
    number taken from the latest response. After compaction or losing the
    counter, first make a read-only call in that session, such as
    `notebook_read` or `kernel_list`, to retrieve current `next_request_id`. If a

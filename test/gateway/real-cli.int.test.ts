@@ -100,7 +100,12 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     const seenAssertions: string[] = [];
     upstream = createServer((request, response) => {
       seenAssertions.push(String(request.headers['x-jupyter-access-token'] ?? ''));
-      const body = JSON.stringify(request.url?.includes('/api/contents/')
+      if (request.method === 'POST' && request.url?.includes('/api/contents/')) {
+        response.writeHead(403, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ message: 'read-only fixture' }));
+        return;
+      }
+      const body = JSON.stringify(request.url?.endsWith('/api/sessions') ? [] : request.url?.includes('/api/contents/')
         ? { type: 'directory', content: [] } : { kernels: 0, connections: 0 });
       response.writeHead(200, {
         'content-length': Buffer.byteLength(body),
@@ -181,32 +186,25 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     }
 
     const tools = await rpc(baseUrl, 'first', 'tools/list');
-    expect(tools['tools']).toHaveLength(18);
-    const first = await call(baseUrl, 'first', 'session_open');
-    const sessionId = (first['structuredContent'] as Record<string, unknown>)['session_id'];
-    expect(typeof sessionId).toBe('string');
-
+    expect(tools['tools']).toHaveLength(16);
+    // An accepted Contents failure consumes exactly one number. The implicit
+    // context must survive credential renewal and remain private to its worker.
+    const first = await call(baseUrl, 'first', 'notebook_create', { directory: '', request_id: '1' });
+    expect(first['isError']).toBe(true);
+    expect(JSON.stringify(first)).toContain('"next_request_id":"2"');
     if (refresh) {
-      const listed = await call(baseUrl, 'rotated', 'notebook_list', { session_id: sessionId, directory: '' });
+      const listed = await call(baseUrl, 'rotated', 'notebook_list', { directory: '' });
       expect(listed['isError'] ?? false, JSON.stringify(listed)).toBe(false);
+      expect(listed['structuredContent']).toMatchObject({ next_request_id: '2' });
       expect(registry.size).toBe(1);
     }
-    const foreign = await call(baseUrl, refresh ? 'independent' : 'rotated', 'session_close', {
-      session_id: sessionId
-    });
-    expect(foreign['isError']).toBe(true);
-    expect(JSON.stringify(foreign)).toContain('HANDLE_EXPIRED');
-
-    const rotated = await call(baseUrl, 'rotated', 'session_open');
-    const rotatedSessionId = (rotated['structuredContent'] as Record<string, unknown>)[
-      'session_id'
-    ];
-    await call(baseUrl, 'rotated', 'session_close', { session_id: rotatedSessionId });
-
-    const own = await call(baseUrl, refresh ? 'rotated' : 'first', 'session_close', { session_id: sessionId });
-    expect(own['isError'] ?? false).toBe(false);
-    expect(seenAssertions).toEqual(refresh
-      ? [assertions[0], assertions[1], assertions[1], assertions[1]] : assertions);
+    const independent = await call(baseUrl, refresh ? 'independent' : 'rotated', 'notebook_list', { directory: '' });
+    expect(independent['isError'] ?? false).toBe(false);
+    expect(independent['structuredContent']).toMatchObject({ next_request_id: '1' });
+    const own = await call(baseUrl, refresh ? 'rotated' : 'first', 'server_list');
+    expect(own['structuredContent']).toMatchObject({ next_request_id: '2' });
+    expect(seenAssertions[0]).toBe(assertions[0]);
+    expect(seenAssertions.at(-1)).toBe(assertions[1]);
 
     await runtime.close();
     runtime = undefined;

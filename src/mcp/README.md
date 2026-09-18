@@ -14,14 +14,14 @@ The SDK is `@modelcontextprotocol/server` 2.0.0, using protocol revision
 
 | File | Purpose |
 | --- | --- |
-| `schemas.ts` | The 18 §9 tools: Zod input schemas, JSON Schema outputs, and descriptions. The only place that defines the wire format. |
+| `schemas.ts` | The 16 §9 tools: Zod input schemas, JSON Schema outputs, and descriptions. The only place that defines the wire format. |
 | `wire.ts` | camelCase ↔ snake_case, omission of `undefined`, and the response budget (64 KiB) with truthful `response_truncated` / `read_more`. |
 | `server.ts` | `createMcpServer(service, options)`: tool and `jupyter-output:` resource registration, output conversion to `image` / `resource_link`, and error mapping. |
 | `cli.ts` | `jupyter-collab-mcp` entry point: stdout guard → configuration → service → `serveStdio`. |
 
 ## Tools
 
-All 18 tools from the §9 table are registered with `inputSchema` and
+All 16 tools from the §9 table are registered with `inputSchema` and
 `outputSchema`. Each description documents for an agent what the call does,
 what it intentionally does not do, and the lifetime of the returned handle.
 The following points are explicit:
@@ -188,8 +188,18 @@ JUPYTER_URL=http://127.0.0.1:8888 JUPYTER_TOKEN=devtoken pnpm start --log-level 
 `FakeCollabService` records calls; the SDK client communicates over an
 `InMemoryTransport` created by the same `serveStdio` with
 `pin: '2026-07-28'` (a successful connection proves the revision). Coverage
-includes round trips for all 18 tools, `tools/list` with schemas and
+includes round trips for all 16 tools, `tools/list` with schemas and
 descriptions, schema rejection as `INVALID_ARGUMENT`, error mapping and token
 redaction, response budgeting, `image` versus `resource_link` selection,
 `resources/list`, `resources/read`, and stdout cleanliness: a real `cli.ts`
 child process with JSON-RPC on stdout and diagnostics on stderr.
+
+## Implicit context
+
+Optional `server_id` belongs to notebook list/open/create and kernel list;
+other tools use notebook or execution handles. The service
+owns lazy bindings with one shared mutation ledger/lock; `server_list` exposes
+its next number without contacting Jupyter. The adapter omits library-internal
+session IDs and translates lifetime descriptors to `connection_close`, without
+changing notebook metadata or output payloads. TypeScript library callers can explicitly manage independent contexts with
+`sessionOpen` and `sessionClose`.
