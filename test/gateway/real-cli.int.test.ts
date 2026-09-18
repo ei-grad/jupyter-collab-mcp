@@ -83,11 +83,20 @@ async function call(
 }
 
 describe('HTTP mode with the canonical stdio CLI', () => {
-  it('preserves tools and isolates handles across credential generations', async () => {
+  it.each([false, true])('preserves tools and grant-scoped handles (refresh=%s)', async (refresh) => {
+    const assertions = ['grant-one', 'grant-two'].map((label) => refresh
+      ? `e30.${Buffer.from(JSON.stringify({ exp: Date.now() / 1000 + 300, label })).toString('base64url')}.synthetic`
+      : label);
+    const grantExpiresAt = Date.now() / 1000 + 3600;
+    const actor = (assertion: string, grantId = 'login-one'): GatewayIdentity => ({
+      ...identity(assertion),
+      ...(refresh ? { grantId, grantExpiresAt, grantGeneration: assertion === assertions[0] ? 0 : 1 } : {})
+    });
     const seenAssertions: string[] = [];
     upstream = createServer((request, response) => {
       seenAssertions.push(String(request.headers['x-jupyter-access-token'] ?? ''));
-      const body = JSON.stringify({ kernels: 0, connections: 0 });
+      const body = JSON.stringify(request.url?.includes('/api/contents/')
+        ? { type: 'directory', content: [] } : { kernels: 0, connections: 0 });
       response.writeHead(200, {
         'content-length': Buffer.byteLength(body),
         'content-type': 'application/json'
@@ -135,10 +144,11 @@ describe('HTTP mode with the canonical stdio CLI', () => {
       allowedOriginHostnames: [],
       authenticate: (request) => {
         const token = request.headers.get('authorization')?.replace(/^Bearer /u, '');
-        if (token === 'first') return { authInfo: auth(token), identity: identity('grant-one') };
+        if (token === 'first') return { authInfo: auth(token), identity: actor(assertions[0]!) };
         if (token === 'rotated') {
-          return { authInfo: auth(token), identity: identity('grant-two') };
+          return { authInfo: auth(token), identity: actor(assertions[1]!) };
         }
+        if (token === 'independent') return { authInfo: auth(token), identity: actor(assertions[1]!, 'login-two') };
         return new Response(null, { status: 401 });
       }
     });
@@ -152,7 +162,12 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     const sessionId = (first['structuredContent'] as Record<string, unknown>)['session_id'];
     expect(typeof sessionId).toBe('string');
 
-    const foreign = await call(baseUrl, 'rotated', 'session_close', {
+    if (refresh) {
+      const listed = await call(baseUrl, 'rotated', 'notebook_list', { session_id: sessionId, directory: '' });
+      expect(listed['isError'] ?? false, JSON.stringify(listed)).toBe(false);
+      expect(registry.size).toBe(1);
+    }
+    const foreign = await call(baseUrl, refresh ? 'independent' : 'rotated', 'session_close', {
       session_id: sessionId
     });
     expect(foreign['isError']).toBe(true);
@@ -164,9 +179,10 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     ];
     await call(baseUrl, 'rotated', 'session_close', { session_id: rotatedSessionId });
 
-    const own = await call(baseUrl, 'first', 'session_close', { session_id: sessionId });
+    const own = await call(baseUrl, refresh ? 'rotated' : 'first', 'session_close', { session_id: sessionId });
     expect(own['isError'] ?? false).toBe(false);
-    expect(seenAssertions).toEqual(['grant-one', 'grant-two']);
+    expect(seenAssertions).toEqual(refresh
+      ? [assertions[0], assertions[1], assertions[1], assertions[1]] : assertions);
 
     await runtime.close();
     runtime = undefined;

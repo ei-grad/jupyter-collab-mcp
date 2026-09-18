@@ -16,6 +16,8 @@ export interface GatewayConfig {
   readonly usernameEmailDomain: string;
   readonly usernameMode: UsernameMode;
   readonly allowMissingEmailVerified: boolean;
+  readonly refreshEnabled: boolean;
+  readonly refreshGrantTtlSeconds: number;
   readonly allowedUsers: ReadonlySet<string>;
   readonly apiBaseUrl: URL;
   readonly browserBaseUrl: URL;
@@ -36,6 +38,12 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
     throw new Error(`${PREFIX}${name} is required`);
   }
   return value;
+}
+
+function parseBoolean(env: NodeJS.ProcessEnv, name: string): boolean {
+  const value = env[`${PREFIX}${name}`] ?? 'false';
+  if (value !== 'true' && value !== 'false') throw new Error(`${PREFIX}${name} must be true or false`);
+  return value === 'true';
 }
 
 function parseUrl(value: string, name: string): URL {
@@ -237,10 +245,6 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
   const redirectUris = required(env, 'REDIRECT_URIS').split(/\s+/).filter(Boolean).map(validateRedirectPattern);
   if (redirectUris.length === 0) throw new Error('explicit OAuth redirect URIs are required');
   const sourceRuntime = fileURLToPath(import.meta.url).endsWith('.ts');
-  const allowMissingEmailVerified = env[`${PREFIX}ALLOW_MISSING_EMAIL_VERIFIED`] ?? 'false';
-  if (allowMissingEmailVerified !== 'true' && allowMissingEmailVerified !== 'false') {
-    throw new Error(`${PREFIX}ALLOW_MISSING_EMAIL_VERIFIED must be true or false`);
-  }
 
   return Object.freeze({
     publicUrl: validatePublicUrl(required(env, 'PUBLIC_URL'), 'PUBLIC_URL'),
@@ -253,7 +257,9 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
     redirectUris: Object.freeze(redirectUris),
     usernameEmailDomain,
     usernameMode,
-    allowMissingEmailVerified: allowMissingEmailVerified === 'true',
+    allowMissingEmailVerified: parseBoolean(env, 'ALLOW_MISSING_EMAIL_VERIFIED'),
+    refreshEnabled: parseBoolean(env, 'ENABLE_REFRESH'),
+    refreshGrantTtlSeconds: parsePositiveNumber(env, 'REFRESH_GRANT_TTL_SECONDS', 8 * 60 * 60, true),
     allowedUsers,
     apiBaseUrl,
     browserBaseUrl: validateJupyterUrl(

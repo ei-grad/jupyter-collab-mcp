@@ -12,6 +12,7 @@ import type { GatewayConfig } from './config.js';
 import { isRedirectAllowed } from './config.js';
 import { EncryptedStore } from './crypto-store.js';
 import { AccessIdentity, IdentityVerifier, identityFailureReason } from './identity.js';
+import { RefreshGrants, RefreshGrantError, type GrantAccessRecord, type UpstreamTokenSet } from './refresh-grants.js';
 
 const OAUTH_SCOPES = ['openid', 'email'] as const;
 const TRANSACTION_TTL_SECONDS = 600;
@@ -19,7 +20,7 @@ const CODE_TTL_SECONDS = 300;
 const MAX_REQUEST_BYTES = 1024 * 1024;
 
 class UpstreamGrantError extends Error {
-  constructor(readonly reason: 'missing_id_token' | 'unexpected_refresh_token') {
+  constructor(readonly reason: 'missing_id_token' | 'missing_refresh_token' | 'unexpected_refresh_token' | 'invalid_refresh_expiry') {
     super('upstream token response is not a bounded ID-token grant');
   }
 }
@@ -29,6 +30,8 @@ function upstreamFailureReason(error: unknown): string {
     switch (error.reason) {
       case 'missing_id_token': return 'missing_id_token';
       case 'unexpected_refresh_token': return 'unexpected_refresh_token';
+      case 'missing_refresh_token': return 'missing_refresh_token';
+      case 'invalid_refresh_expiry': return 'invalid_refresh_expiry';
     }
   }
   if (error instanceof oidc.ResponseBodyError) {
@@ -83,6 +86,7 @@ interface ClientRecord {
   readonly tokenEndpointAuthMethod: 'none' | 'client_secret_basic' | 'client_secret_post';
   readonly secretDigest?: string;
   readonly clientName?: string;
+  readonly refreshAllowed?: boolean;
 }
 
 interface TransactionRecord {
@@ -92,6 +96,7 @@ interface TransactionRecord {
   readonly downstreamCodeChallenge: string;
   readonly upstreamCodeVerifier: string;
   readonly upstreamNonce: string;
+  readonly refreshRequested?: boolean;
 }
 
 interface AuthorizationCodeRecord {
@@ -99,6 +104,8 @@ interface AuthorizationCodeRecord {
   readonly redirectUri: string;
   readonly codeChallenge: string;
   readonly assertion: string;
+  readonly upstreamRefreshToken?: string;
+  readonly refreshExpiresAt?: number;
 }
 
 interface AccessTokenRecord {
@@ -112,6 +119,7 @@ export interface UpstreamAuthorizationClient {
     readonly state: string;
     readonly nonce: string;
     readonly codeChallenge: string;
+    readonly requestRefresh?: boolean;
   }): URL;
   exchange(input: {
     readonly callbackUrl: URL;
@@ -119,7 +127,8 @@ export interface UpstreamAuthorizationClient {
     readonly state: string;
     readonly nonce: string;
     readonly codeVerifier: string;
-  }): Promise<string>;
+  }): Promise<string | UpstreamTokenSet>;
+  refresh?(token: string): Promise<UpstreamTokenSet>;
   close?(): Promise<void>;
 }
 
@@ -135,6 +144,7 @@ export interface GatewayOAuthOptions {
   readonly upstream: UpstreamAuthorizationClient;
   readonly now?: () => number;
   readonly randomToken?: () => string;
+  readonly onGrantRevoked?: (grantId: string, grantExpiresAt: number) => Promise<void>;
 }
 
 interface OidcDiscovery {
@@ -264,7 +274,7 @@ function clientRedirect(record: TransactionRecord, parameters: Record<string, st
 class OpenIdClient implements UpstreamAuthorizationClient {
   readonly #configuration: oidc.Configuration;
 
-  constructor(configuration: oidc.Configuration) {
+  constructor(configuration: oidc.Configuration, readonly refreshEnabled: boolean) {
     this.#configuration = configuration;
   }
 
@@ -273,11 +283,12 @@ class OpenIdClient implements UpstreamAuthorizationClient {
     readonly state: string;
     readonly nonce: string;
     readonly codeChallenge: string;
+    readonly requestRefresh?: boolean;
   }): URL {
     return oidc.buildAuthorizationUrl(this.#configuration, {
       response_type: 'code',
       redirect_uri: input.redirectUri,
-      scope: OAUTH_SCOPES.join(' '),
+      scope: [...OAUTH_SCOPES, ...(input.requestRefresh === true ? ['offline_access'] : [])].join(' '),
       state: input.state,
       nonce: input.nonce,
       code_challenge: input.codeChallenge,
@@ -291,7 +302,7 @@ class OpenIdClient implements UpstreamAuthorizationClient {
     readonly state: string;
     readonly nonce: string;
     readonly codeVerifier: string;
-  }): Promise<string> {
+  }): Promise<UpstreamTokenSet> {
     // The Node listener sees HTTP behind TLS termination. openid-client derives
     // the token request's redirect_uri from this URL, not additional parameters.
     const callbackUrl = new URL(input.redirectUri);
@@ -306,9 +317,25 @@ class OpenIdClient implements UpstreamAuthorizationClient {
         idTokenExpected: true
       }
     );
+    return this.#tokenSet(tokens);
+  }
+
+  async refresh(token: string): Promise<UpstreamTokenSet> {
+    return this.#tokenSet(await oidc.refreshTokenGrant(this.#configuration, token));
+  }
+
+  #tokenSet(tokens: oidc.TokenEndpointResponse): UpstreamTokenSet {
     if (typeof tokens.id_token !== 'string' || tokens.id_token === '') throw new UpstreamGrantError('missing_id_token');
-    if (tokens.refresh_token) throw new UpstreamGrantError('unexpected_refresh_token');
-    return tokens.id_token;
+    if (tokens.refresh_token && !this.refreshEnabled) throw new UpstreamGrantError('unexpected_refresh_token');
+    const lifetime = tokens['refresh_token_expires_in'];
+    if (lifetime !== undefined && (typeof lifetime !== 'number' || !Number.isFinite(lifetime) || lifetime <= 0)) {
+      throw new UpstreamGrantError('invalid_refresh_expiry');
+    }
+    return {
+      assertion: tokens.id_token,
+      ...(tokens.refresh_token === undefined ? {} : { refreshToken: tokens.refresh_token }),
+      ...(lifetime === undefined ? {} : { refreshExpiresIn: lifetime as number })
+    };
   }
 }
 
@@ -319,6 +346,7 @@ export class GatewayOAuth {
   readonly #upstream: UpstreamAuthorizationClient;
   readonly #now: () => number;
   readonly #randomToken: () => string;
+  readonly #grants: RefreshGrants;
   #closing: Promise<void> | undefined;
 
   constructor(options: GatewayOAuthOptions) {
@@ -328,6 +356,16 @@ export class GatewayOAuth {
     this.#upstream = options.upstream;
     this.#now = options.now ?? (() => Date.now() / 1000);
     this.#randomToken = options.randomToken ?? randomToken;
+    this.#grants = new RefreshGrants({
+      store: this.#store, signingKey: this.#config.signingKey,
+      now: this.#now, randomToken: this.#randomToken,
+      verify: (assertion, expected) => this.#identityVerifier.verify(assertion, expected),
+      refresh: async (token) => {
+        if (this.#upstream.refresh === undefined) throw new Error('upstream refresh unavailable');
+        return this.#upstream.refresh(token);
+      },
+      ...(options.onGrantRevoked === undefined ? {} : { onRevoked: options.onGrantRevoked })
+    });
   }
 
   async handle(request: Request): Promise<Response | null> {
@@ -362,16 +400,27 @@ export class GatewayOAuth {
     const match = authorizationHeader?.match(/^Bearer ([^\s]+)$/i);
     if (match == null) return this.#bearerFailure();
     const token = match[1]!;
-    const record = await this.#store.get<AccessTokenRecord>(
+    const record = await this.#store.get<AccessTokenRecord | GrantAccessRecord>(
       'access-tokens',
       digestOpaque(token, this.#config.signingKey)
     );
-    if (record === null || typeof record.clientId !== 'string' || typeof record.assertion !== 'string') {
+    if (record === null || typeof record.clientId !== 'string') {
       return this.#bearerFailure();
     }
     let identity: AccessIdentity;
+    let expiresAt: number;
     try {
-      identity = await this.#identityVerifier.verify(record.assertion);
+      if ('grantId' in record) {
+        if (!this.#config.refreshEnabled || typeof record.grantId !== 'string') return this.#bearerFailure();
+        const current = await this.#grants.identity(record);
+        if (current === null) return this.#bearerFailure();
+        identity = current;
+        expiresAt = Math.min(record.expiresAt, identity.expiresAt);
+      } else {
+        if (typeof record.assertion !== 'string') return this.#bearerFailure();
+        identity = await this.#identityVerifier.verify(record.assertion);
+        expiresAt = identity.expiresAt;
+      }
     } catch {
       return this.#bearerFailure();
     }
@@ -381,7 +430,7 @@ export class GatewayOAuth {
         token,
         clientId: record.clientId,
         scopes: [...identity.scopes],
-        expiresAt: identity.expiresAt,
+        expiresAt,
         resource: resourceUrl(this.#config.publicUrl),
         extra: {
           issuer: identity.issuer,
@@ -424,7 +473,7 @@ export class GatewayOAuth {
       registration_endpoint: endpoint(this.#config.publicUrl, '/register').href,
       scopes_supported: [...OAUTH_SCOPES],
       response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code'],
+      grant_types_supported: ['authorization_code', ...(this.#config.refreshEnabled ? ['refresh_token'] : [])],
       token_endpoint_auth_methods_supported: ['none', 'client_secret_basic', 'client_secret_post'],
       code_challenge_methods_supported: ['S256']
     };
@@ -492,6 +541,7 @@ export class GatewayOAuth {
       clientId,
       redirectUris: Object.freeze([...new Set(redirectUris)]),
       tokenEndpointAuthMethod: authMethod as ClientRecord['tokenEndpointAuthMethod'],
+      refreshAllowed: this.#config.refreshEnabled && grantTypes.includes('refresh_token'),
       ...(clientSecret === undefined
         ? {}
         : { secretDigest: digestOpaque(clientSecret, this.#config.signingKey) }),
@@ -502,7 +552,7 @@ export class GatewayOAuth {
       client_id: clientId,
       client_id_issued_at: Math.floor(this.#now()),
       redirect_uris: record.redirectUris,
-      grant_types: ['authorization_code'],
+      grant_types: ['authorization_code', ...(record.refreshAllowed ? ['refresh_token'] : [])],
       response_types: ['code'],
       token_endpoint_auth_method: record.tokenEndpointAuthMethod,
       ...(clientSecret === undefined
@@ -582,6 +632,7 @@ export class GatewayOAuth {
       downstreamCodeChallenge: challenge,
       upstreamCodeVerifier,
       upstreamNonce,
+      refreshRequested: this.#config.refreshEnabled && client.refreshAllowed === true,
       ...(typeof parameters['state'] === 'string' ? { downstreamState: parameters['state'] } : {})
     };
     await this.#store.put(
@@ -594,7 +645,8 @@ export class GatewayOAuth {
       redirectUri: endpoint(this.#config.publicUrl, '/auth/callback').href,
       state: transactionId,
       nonce: upstreamNonce,
-      codeChallenge: pkceChallenge(upstreamCodeVerifier)
+      codeChallenge: pkceChallenge(upstreamCodeVerifier),
+      requestRefresh: record.refreshRequested === true
     });
     return Response.redirect(upstream, 303);
   }
@@ -615,22 +667,24 @@ export class GatewayOAuth {
     if (callbackUrl.searchParams.has('error')) {
       return clientRedirect(record, { error: 'access_denied' });
     }
-    let assertion: string;
+    let tokens: UpstreamTokenSet;
     try {
-      assertion = await this.#upstream.exchange({
+      const result = await this.#upstream.exchange({
         callbackUrl,
         redirectUri: endpoint(this.#config.publicUrl, '/auth/callback').href,
         state,
         nonce: record.upstreamNonce,
         codeVerifier: record.upstreamCodeVerifier
       });
+      tokens = typeof result === 'string' ? { assertion: result } : result;
+      if (record.refreshRequested === true && !tokens.refreshToken) throw new UpstreamGrantError('missing_refresh_token');
     } catch (error) {
       process.stderr.write(`oauth_callback_failed stage=upstream_exchange reason=${upstreamFailureReason(error)}\n`);
       return clientRedirect(record, { error: 'server_error' });
     }
     let identity: AccessIdentity;
     try {
-      identity = await this.#identityVerifier.verify(assertion);
+      identity = await this.#identityVerifier.verify(tokens.assertion);
     } catch (error) {
       process.stderr.write(`oauth_callback_failed stage=identity_verification reason=${identityFailureReason(error)}\n`);
       return clientRedirect(record, { error: 'server_error' });
@@ -645,7 +699,11 @@ export class GatewayOAuth {
         clientId: record.clientId,
         redirectUri: record.redirectUri,
         codeChallenge: record.downstreamCodeChallenge,
-        assertion: identity.assertion()
+        assertion: identity.assertion(),
+        ...(record.refreshRequested !== true ? {} : {
+          upstreamRefreshToken: tokens.refreshToken!,
+          refreshExpiresAt: this.#now() + Math.min(this.#config.refreshGrantTtlSeconds, tokens.refreshExpiresIn ?? Infinity)
+        })
       } satisfies AuthorizationCodeRecord,
       Math.min(CODE_TTL_SECONDS, remaining)
     );
@@ -664,11 +722,30 @@ export class GatewayOAuth {
     } catch {
       return oauthError('invalid_request', 'invalid token request');
     }
-    if (parameters['grant_type'] !== 'authorization_code') {
+    if (parameters['grant_type'] !== 'authorization_code' && !(this.#config.refreshEnabled && parameters['grant_type'] === 'refresh_token')) {
       return oauthError('unsupported_grant_type', 'only authorization_code is supported');
     }
     const authenticated = await this.#authenticateClient(request, parameters);
     if (authenticated instanceof Response) return authenticated;
+    if (parameters['grant_type'] === 'refresh_token') {
+      if (authenticated.refreshAllowed !== true || typeof parameters['refresh_token'] !== 'string' || parameters['refresh_token'] === '') {
+        return oauthError('invalid_grant', 'refresh grant is invalid');
+      }
+      if (parameters['scope'] !== undefined) {
+        const scopes = typeof parameters['scope'] === 'string' ? parameters['scope'].split(/\s+/).filter(Boolean) : [];
+        if (scopes.length !== OAUTH_SCOPES.length || OAUTH_SCOPES.some((scope) => !scopes.includes(scope))) {
+          return oauthError('invalid_scope', 'refresh cannot change granted scopes');
+        }
+      }
+      try {
+        return jsonResponse(await this.#grants.refresh(authenticated.clientId, parameters['refresh_token']), 200);
+      } catch (error) {
+        if (error instanceof RefreshGrantError && error.reason === 'inflight') {
+          return oauthError('temporarily_unavailable', 'refresh is in progress', 503);
+        }
+        return oauthError('invalid_grant', 'refresh grant is invalid');
+      }
+    }
     const code = parameters['code'];
     const redirectUri = parameters['redirect_uri'];
     const verifier = parameters['code_verifier'];
@@ -696,6 +773,13 @@ export class GatewayOAuth {
     }
     const expiresIn = Math.floor(identity.expiresAt - this.#now());
     if (expiresIn < 1) return oauthError('invalid_grant', 'authorization grant is expired');
+    if (this.#config.refreshEnabled && authenticated.refreshAllowed === true && record.upstreamRefreshToken !== undefined && record.refreshExpiresAt !== undefined) {
+      try {
+        return jsonResponse(await this.#grants.create(authenticated.clientId, identity, record.upstreamRefreshToken, record.refreshExpiresAt));
+      } catch {
+        return oauthError('invalid_grant', 'authorization grant is invalid');
+      }
+    }
     const accessToken = this.#randomToken();
     await this.#store.put(
       'access-tokens',
@@ -756,7 +840,8 @@ export class GatewayOAuth {
 export async function createGatewayOAuth(
   config: GatewayConfig,
   store: EncryptedStore,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  onGrantRevoked?: (grantId: string, grantExpiresAt: number) => Promise<void>
 ): Promise<GatewayOAuth> {
   const noRedirectFetch: typeof fetch = (input, init) =>
     fetchImpl(input, { ...init, redirect: 'manual' });
@@ -821,6 +906,7 @@ export async function createGatewayOAuth(
     config,
     store,
     identityVerifier,
-    upstream: new OpenIdClient(configuration)
+    upstream: new OpenIdClient(configuration, config.refreshEnabled),
+    ...(onGrantRevoked === undefined ? {} : { onGrantRevoked })
   });
 }

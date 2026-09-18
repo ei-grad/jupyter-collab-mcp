@@ -24,6 +24,7 @@
  */
 
 import WebSocketImpl from 'ws';
+import { assertionDeadline } from './auth-expiry.js';
 
 /** DOM-shaped WebSocket constructor, as `y-websocket` expects it. */
 export type WebSocketCtor = typeof globalThis.WebSocket;
@@ -34,6 +35,39 @@ type NodeWebSocketCtor = new (
   protocols?: string | string[],
   options?: unknown
 ) => WebSocket;
+
+/** Failed handshakes remain asynchronous, as reconnecting SDKs expect. */
+class CredentialUnavailableSocket extends EventTarget {
+  readonly url = '';
+  readonly protocol = '';
+  readonly extensions = '';
+  readonly bufferedAmount = 0;
+  binaryType: 'arraybuffer' | 'blob' = 'arraybuffer';
+  readyState = 0;
+  onopen: ((event: Event) => unknown) | null = null;
+  onmessage: ((event: MessageEvent) => unknown) | null = null;
+  onerror: ((event: Event) => unknown) | null = null;
+  onclose: ((event: CloseEvent) => unknown) | null = null;
+
+  constructor() {
+    super();
+    queueMicrotask(() => this.close());
+  }
+
+  close(): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    const event = Object.assign(new Event('close'), {
+      code: 1006, reason: 'credential unavailable', wasClean: false
+    }) as CloseEvent;
+    this.dispatchEvent(event);
+    this.onclose?.(event);
+  }
+
+  send(): void {
+    throw new Error('credential unavailable');
+  }
+}
 
 /**
  * Wrap a WebSocket implementation so every socket it creates sends
@@ -47,14 +81,43 @@ type NodeWebSocketCtor = new (
 export function authenticatedWebSocket(
   token: string,
   base: WebSocketCtor = WebSocketImpl as unknown as WebSocketCtor,
-  authHeaders?: Readonly<Record<string, string>>
+  authHeaders?: Readonly<Record<string, string>>,
+  resolveAuthHeaders?: () => Readonly<Record<string, string>>,
+  credentialExpiry?: 'jwt',
+  credentialExpiresAt?: number
 ): WebSocketCtor {
-  const options = { headers: authHeaders ?? { Authorization: `token ${token}` }, followRedirects: false };
   const Base = base as unknown as NodeWebSocketCtor;
 
   class AuthenticatedWebSocket extends Base {
+    readonly #deadline: number | undefined;
+
     constructor(url: string | URL, protocols?: string | string[]) {
-      super(url, protocols, options);
+      let headers: Readonly<Record<string, string>>;
+      let deadline: number | undefined;
+      try {
+        headers = resolveAuthHeaders?.() ?? authHeaders ?? { Authorization: `token ${token}` };
+        deadline = credentialExpiry === 'jwt'
+          ? assertionDeadline(Object.values(headers)[0] ?? '', credentialExpiresAt) : undefined;
+      } catch {
+        return new CredentialUnavailableSocket() as unknown as AuthenticatedWebSocket;
+      }
+      super(url, protocols, { headers, followRedirects: false });
+      this.#deadline = deadline;
+      if (deadline !== undefined) {
+        // Jupyter treats 1000/1001 as terminal; renewal must permit reconnect.
+        const timer = setTimeout(() => this.close(4000, 'credential expired'),
+          Math.min(Math.max(0, deadline - Date.now()), 2_147_483_647));
+        timer.unref();
+        this.addEventListener('close', () => clearTimeout(timer), { once: true });
+      }
+    }
+
+    override send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+      if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
+        this.close(4000, 'credential expired');
+        return;
+      }
+      super.send(data);
     }
   }
 

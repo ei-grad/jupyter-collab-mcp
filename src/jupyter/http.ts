@@ -32,6 +32,8 @@ export interface HttpResponse {
 /** Options of {@link httpRequest}. */
 export interface HttpRequestOptions {
   readonly authHeaders?: Readonly<Record<string, string>>;
+  /** Resolve and validate fresh credentials before every redirect hop. */
+  readonly resolveAuthHeaders?: () => Readonly<Record<string, string>>;
   readonly method?: string;
   /** Serialised as JSON with `Content-Type: application/json`. */
   readonly json?: unknown;
@@ -149,16 +151,24 @@ export async function httpRequest(
   const fetchImpl = options.fetchImpl ?? fetch;
   const maxRedirects = options.maxRedirects ?? 5;
   const body = options.json === undefined ? undefined : JSON.stringify(options.json);
-  const secrets = options.authHeaders === undefined ? [token] : Object.values(options.authHeaders);
-  const scrub = (value: string): string => secrets.reduce(
+  const secrets = new Set(options.authHeaders === undefined ? [token] : Object.values(options.authHeaders));
+  const scrub = (value: string): string => [...secrets].sort((a, b) => b.length - a.length).reduce(
     (text, secret) => secret ? text.replaceAll(secret, '<redacted>') : text, value
   );
 
   let current = url;
   let response: Response;
   for (let hop = 0; ; hop += 1) {
-    const headers = new Headers(options.authHeaders);
-    if (options.authHeaders === undefined) headers.set('Authorization', `token ${token}`);
+    let authHeaders: Readonly<Record<string, string>> | undefined;
+    try {
+      authHeaders = options.resolveAuthHeaders?.() ?? options.authHeaders;
+    } catch (error) {
+      if (hop === 0 || isSafeMethod(method)) throw error;
+      throw mapTransportError(new Error('credential unavailable after redirect'), method, scrub(current));
+    }
+    for (const value of Object.values(authHeaders ?? {})) secrets.add(value);
+    const headers = new Headers(authHeaders);
+    if (authHeaders === undefined) headers.set('Authorization', `token ${token}`);
     if (body !== undefined) headers.set('Content-Type', 'application/json');
 
     const init: RequestInit = { method, headers, redirect: 'manual' };
@@ -176,7 +186,11 @@ export async function httpRequest(
     if (!isRedirect) break;
 
     // Read (and discard) the body so the connection can be reused.
-    await response.text();
+    try {
+      await response.text();
+    } catch (error) {
+      throw mapTransportError(new Error(scrub(error instanceof Error ? error.message : 'transport failure')), method, scrub(current));
+    }
     let target: string;
     try {
       target = new URL(location, current).toString();

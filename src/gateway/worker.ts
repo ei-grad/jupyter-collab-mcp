@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, lstat, rm, chmod, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, lstat, rm, chmod, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { Client } from '@modelcontextprotocol/client';
@@ -10,6 +10,10 @@ export interface GatewayIdentity {
   readonly subject: string;
   readonly username: string;
   readonly expiresAt: number;
+  readonly requestExpiresAt?: number;
+  readonly grantId?: string;
+  readonly grantGeneration?: number;
+  readonly grantExpiresAt?: number;
   assertion(): string;
 }
 
@@ -29,6 +33,7 @@ export interface GatewayWorker {
   readonly username: string;
   readonly credentialDigest: string;
   readonly expiresAt: number;
+  renew?(identity: GatewayIdentity): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -66,9 +71,20 @@ export class NodeGatewayWorker implements GatewayWorker {
     readonly client: Client,
     readonly directory: string,
     readonly username: string,
-    readonly credentialDigest: string,
-    readonly expiresAt: number
+    public credentialDigest: string,
+    public expiresAt: number
   ) {}
+
+  async renew(identity: GatewayIdentity): Promise<void> {
+    if (this.#closed || identity.username !== this.username || identity.expiresAt <= Date.now() / 1000) {
+      throw new Error('Jupyter worker credential cannot be renewed');
+    }
+    const temporary = join(this.directory, 'assertion.next');
+    await writeFile(temporary, identity.assertion(), { encoding: 'utf8', mode: 0o600 });
+    await rename(temporary, join(this.directory, 'assertion'));
+    this.credentialDigest = credentialDigest(identity.assertion());
+    this.expiresAt = identity.expiresAt;
+  }
 
   async close(): Promise<void> {
     if (this.#closed) return;
@@ -112,7 +128,8 @@ export async function startNodeWorker(
         apiBaseUrl: userBaseUrl(settings.apiBaseUrl, identity.username),
         browserBaseUrl: userBaseUrl(settings.browserBaseUrl, identity.username),
         credentialRef: `file:${assertionFile}`,
-        auth: { type: 'header', name: settings.assertionHeader }
+        auth: { type: 'header', name: settings.assertionHeader },
+        ...(identity.grantId === undefined ? {} : { credentialRefresh: 'request', credentialExpiry: 'jwt', credentialExpiresAt: identity.grantExpiresAt })
       }
     ]
   };

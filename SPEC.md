@@ -1054,9 +1054,15 @@ API, browser, and WebSocket base URLs are validated before discovery or
 role and contain no user information, query, or fragment; a rejection does not
 repeat the rejected URL.
 
-All transports of one cached server client share a credential snapshot. Updating
-an environment variable or credential file requires restarting MCP; restarting
-invalidates MCP handles but does not stop server kernels.
+By default all transports of one cached server client share a credential
+snapshot. Updating a credential then requires restarting MCP, invalidating
+handles without stopping kernels. A header-authenticated file profile may opt
+into `credentialRefresh: "request"`: REST (including each same-origin redirect
+hop) and each new RTC/kernel handshake read the current file. `credentialExpiry: "jwt"` additionally rejects an expired
+or malformed JWT expiry and closes existing sockets at that credential's expiry;
+`credentialExpiresAt` supplies a stricter absolute deadline. Decoding expiry is
+only a rejection guard; it does not establish signature or identity validity.
+Credential changes and reconnects never replay kernel execution automatically.
 
 ### Optional hosted HTTP transport
 
@@ -1067,10 +1073,11 @@ schemas, structured results, images, errors, and output resources preserve the
 stdio contract.
 It exposes a narrow OAuth proxy: dynamic client registration followed by an
 authorization-code grant with mandatory S256 PKCE and a trusted upstream OIDC
-login. Refresh, implicit, and device grants are unsupported. Dynamic registration
+login. Implicit and device grants are unsupported. Dynamic registration
 accepts a nonempty array of nonempty grant-type strings containing
 `authorization_code`, including clients that also request `refresh_token`, and
-registers and returns only `authorization_code`. Omitted grant types default to
+registers and returns only `authorization_code` unless refresh is enabled and
+the client also requests `refresh_token`. Omitted grant types default to
 `authorization_code`; malformed or unsupported-only requests are rejected.
 Failed OAuth callbacks emit a bounded stderr diagnostic naming the upstream
 exchange or identity-verification stage and an allowlisted reason code; unknown
@@ -1083,9 +1090,9 @@ Upstream code exchange uses the configured public callback URI, including its
 HTTPS scheme and base path, with only the incoming callback query copied onto
 it. Listener URLs and forwarded headers cannot change that URI; state, nonce
 and PKCE validation remain mandatory behind TLS-terminating proxies.
-Registrations, transactions, one-time codes, and local access tokens are encrypted at rest;
-one-time values are consumed atomically and no record outlives the signed
-upstream ID token. Redirects are checked against current operator policy at
+Registrations, transactions, one-time codes, local tokens and upstream refresh
+credentials are encrypted at rest. One-time codes are consumed atomically and
+codes/access tokens never outlive their signed upstream ID token. Redirects are checked against current operator policy at
 registration, authorization, and callback time. Upstream OIDC discovery, JWKS,
 and token requests never follow redirects. An inconclusive identity-verification
 failure denies the request but does not destroy a still-live local grant.
@@ -1097,12 +1104,43 @@ and defaults to `false`; it never permits explicit false, null or malformed
 claim values. Signature, issuer, audience, expiry, email-domain and provisioned
 user checks remain mandatory before a worker slot or process is allocated.
 
-A worker and its handles belong to one issuer, subject, Hub user, and assertion
-generation. Different principals or credential generations cannot use those
-handles. Concurrent valid grants retain independent workers; the HTTP host must
-not substitute one grant's newer assertion for another. HTTP disconnection must
-not evict workers. Signed expiry blocks new requests immediately, and expired
-workers are retired after active request leases finish. Worker cleanup leaves
+`JUPYTER_MCP_ENABLE_REFRESH=true` enables genuine upstream OIDC renewal and
+rotating opaque downstream refresh tokens; the default is false. Only the
+upstream authorization request adds `offline_access`; downstream scopes remain
+`openid email`. A new signed ID token is required on every renewal and must
+retain issuer, subject and mapped user, with unchanged nonce/authentication time
+when supplied. Signature, audience, time, email and provisioning checks apply
+again. A missing replacement upstream refresh token retains its predecessor;
+an absent ID token never permits reuse of an expired assertion.
+
+Each login has a persisted client-bound grant family with an absolute deadline
+(`JUPYTER_MCP_REFRESH_GRANT_TTL_SECONDS`, default eight hours). Rotation never
+extends that deadline or an already issued access token's own expiry. Redis
+atomic compare-and-swap admits one upstream renewal. An encrypted ten-second
+receipt lets concurrent requests with the same refresh token and authenticated
+client receive the exact same credential pair, with remaining lifetime, without
+another upstream request. This deliberately tolerates replay only within that
+short immediate-predecessor window; later consumed-token reuse revokes the
+family and its workers. Client binding is checked before consumption or
+revocation. Ambiguous upstream failure or an abandoned in-flight renewal fails
+closed and requires login, rather than retrying a potentially consumed upstream
+token. Family state, receipts and consumed-token references survive restart in
+encrypted storage. Existing registrations and unexpired legacy access records
+remain usable; obtaining refresh permission requires a new compatible
+registration/login, not conversion of an old access token.
+
+A refresh-enabled worker and its handles belong to one server-issued login grant
+plus issuer, subject and Hub user. Verified renewal replaces its private
+credential atomically under the request lease and preserves handles. Monotonic
+generations prevent queued older requests from overwriting a newer credential;
+queued requests still cannot outlive their own access-token deadline. Other
+logins never borrow that credential. Legacy workers remain assertion-generation
+bound. HTTP disconnection does not evict workers. An assertion-expiry gap may
+retain refresh-worker handles until the absolute grant deadline, but expired
+credentials cannot send REST requests, start handshakes or keep sockets sending.
+Fresh credentials reconnect existing handles without replaying execution.
+Revocation leaves a deadline-bounded tombstone so already-verified queued
+requests cannot recreate the worker. Worker cleanup leaves
 Jupyter kernels running and never replays an interrupted request. Retirement
 and shutdown attempt every owned worker independently; a failed close remains
 owned and quarantined for retry, never available for another lease; a

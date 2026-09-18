@@ -194,6 +194,9 @@ export class ServerClient {
 
   readonly #token: string;
   readonly #authHeaders: Readonly<Record<string, string>> | undefined;
+  readonly #credentialExpiresAt: number | undefined;
+  readonly #credentialExpiry: 'jwt' | undefined;
+  readonly #resolveAuthHeaders: (() => Readonly<Record<string, string>>) | undefined;
   readonly #fetch: typeof fetch;
   #settings: ServerConnection.ISettings | null = null;
 
@@ -203,6 +206,9 @@ export class ServerClient {
     this.serverId = server.profile.id;
     this.#token = server.token;
     this.#authHeaders = server.authHeaders === undefined ? undefined : Object.freeze({ ...server.authHeaders });
+    this.#resolveAuthHeaders = server.resolveAuthHeaders;
+    this.#credentialExpiry = server.profile.credentialExpiry;
+    this.#credentialExpiresAt = server.profile.credentialExpiresAt;
     this.#fetch = options.fetchImpl ?? fetch;
   }
 
@@ -327,7 +333,14 @@ export class ServerClient {
         wsUrl: `${this.wsBaseUrl}/`,
         token: '',
         appendToken: false,
-        WebSocket: authenticatedWebSocket(this.#token, WebSocket as unknown as typeof globalThis.WebSocket, this.#authHeaders),
+        WebSocket: authenticatedWebSocket(
+          this.#token,
+          WebSocket as unknown as typeof globalThis.WebSocket,
+          this.#authHeaders,
+          this.#resolveAuthHeaders,
+          this.#credentialExpiry,
+          this.#credentialExpiresAt
+        ),
         // The injected implementation, not the global one: whatever transport
         // policy a profile needs (docs/CONNECTIONS.md §9 `tls_ca_ref`,
         // `proxy_auth_ref`) must cover the kernel layer as well as REST.
@@ -337,9 +350,21 @@ export class ServerClient {
     return this.#settings;
   }
 
-  /** Internal snapshot shared by REST, RTC, and kernel connections. Never log. */
-  connectionAuth(): { token: string; authHeaders?: Readonly<Record<string, string>> } {
-    return { token: this.#token, ...(this.#authHeaders === undefined ? {} : { authHeaders: this.#authHeaders }) };
+  /** Internal authentication configuration shared by RTC and kernel connections. Never log. */
+  connectionAuth(): {
+    token: string;
+    authHeaders?: Readonly<Record<string, string>>;
+    resolveAuthHeaders?: () => Readonly<Record<string, string>>;
+    credentialExpiry?: 'jwt';
+    credentialExpiresAt?: number;
+  } {
+    return {
+      token: this.#token,
+      ...(this.#authHeaders === undefined ? {} : { authHeaders: this.#authHeaders }),
+      ...(this.#resolveAuthHeaders === undefined ? {} : { resolveAuthHeaders: this.#resolveAuthHeaders }),
+      ...(this.#credentialExpiry === undefined ? {} : { credentialExpiry: this.#credentialExpiry }),
+      ...(this.#credentialExpiresAt === undefined ? {} : { credentialExpiresAt: this.#credentialExpiresAt })
+    };
   }
 
   readonly #authenticatedFetch: typeof fetch = async (input, init) => {
@@ -347,14 +372,15 @@ export class ServerClient {
     if (new URL(request.url).origin !== new URL(this.apiBaseUrl).origin) {
       throw coreError('NETWORK_ERROR', 'kernel request targets a different origin');
     }
+    const authHeaders = this.#resolveAuthHeaders?.() ?? this.#authHeaders;
     const headers = new Headers(request.headers);
     headers.delete('Authorization');
-    for (const [name, value] of Object.entries(this.#authHeaders ?? { Authorization: `token ${this.#token}` })) {
+    for (const [name, value] of Object.entries(authHeaders ?? { Authorization: `token ${this.#token}` })) {
       headers.set(name, value);
     }
     // Refuse redirects before the underlying fetch can forward custom headers.
     const scrub = (text: string): string =>
-      Object.values(this.#authHeaders ?? { token: this.#token }).reduce(
+      Object.values(authHeaders ?? { token: this.#token }).reduce(
         (value, secret) => secret ? value.replaceAll(secret, '<redacted>') : value, text
       );
     let response: Response;
@@ -538,6 +564,7 @@ export class ServerClient {
       method: options.method,
       fetchImpl: this.#fetch,
       ...(this.#authHeaders === undefined ? {} : { authHeaders: this.#authHeaders }),
+      ...(this.#resolveAuthHeaders === undefined ? {} : { resolveAuthHeaders: this.#resolveAuthHeaders }),
       ...(options.json === undefined ? {} : { json: options.json }),
       ...(options.allowStatus === undefined ? {} : { allowStatus: options.allowStatus }),
       ...(options.notFoundCode === undefined ? {} : { notFoundCode: options.notFoundCode })

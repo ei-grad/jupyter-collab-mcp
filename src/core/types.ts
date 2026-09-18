@@ -98,6 +98,12 @@ export interface ServerProfile {
    */
   readonly browserBaseUrl?: string;
   readonly credentialRef: CredentialRef;
+  /** Re-read a file assertion for each new request or handshake. */
+  readonly credentialRefresh?: 'request';
+  /** Reject expired assertions and close sockets at their JWT expiry. */
+  readonly credentialExpiry?: 'jwt';
+  /** Optional absolute grant deadline, in epoch seconds. */
+  readonly credentialExpiresAt?: number;
   /** Omitted means Jupyter token authentication. Header values are raw. */
   readonly auth?: { readonly type: 'token' } | { readonly type: 'header'; readonly name: string };
   /** Separate Hub control API, only for explicitly allowed lifecycle calls. */
@@ -137,6 +143,7 @@ export interface ResolvedServer {
   readonly token: string;
   /** External assertion header; token is empty in this mode. */
   readonly authHeaders?: Readonly<Record<string, string>>;
+  readonly resolveAuthHeaders?: () => Readonly<Record<string, string>>;
 }
 
 // ---------------------------------------------------------------------------

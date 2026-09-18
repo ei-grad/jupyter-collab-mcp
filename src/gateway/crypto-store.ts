@@ -13,6 +13,7 @@ export interface KeyValueBackend {
   set(key: string, value: string, ttlSeconds?: number): Promise<void>;
   delete(key: string): Promise<void>;
   take(key: string): Promise<string | null>;
+  compareAndSwap(key: string, expected: string | null, value: string, ttlSeconds: number): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -127,6 +128,26 @@ export class EncryptedStore {
     }
   }
 
+  async readVersion<T>(collection: string, id: string): Promise<{ value: T; version: string } | null> {
+    const version = await this.#backend.get(storageKey(collection, id));
+    if (version === null) return null;
+    try {
+      return { value: JSON.parse(decryptValue(version, this.#key)) as T, version };
+    } catch {
+      return null;
+    }
+  }
+
+  async compareAndSwap(
+    collection: string, id: string, expected: string | null, value: unknown, ttlSeconds: number
+  ): Promise<boolean> {
+    if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) throw new Error('storage TTL must be positive');
+    return this.#backend.compareAndSwap(
+      storageKey(collection, id), expected,
+      encryptValue(JSON.stringify(value), this.#key, this.#now), Math.max(1, Math.ceil(ttlSeconds))
+    );
+  }
+
   async take<T>(collection: string, id: string): Promise<T | null> {
     const encrypted = await this.#backend.take(storageKey(collection, id));
     if (encrypted === null) return null;
@@ -183,6 +204,15 @@ export class MemoryKeyValueBackend implements KeyValueBackend {
     return found.value;
   }
 
+  async compareAndSwap(key: string, expected: string | null, value: string, ttlSeconds: number): Promise<boolean> {
+    const found = this.values.get(key);
+    const current = found === undefined || (found.expiresAt !== undefined && found.expiresAt <= this.#now())
+      ? null : found.value;
+    if (current !== expected) return false;
+    this.values.set(key, { value, expiresAt: this.#now() + ttlSeconds * 1000 });
+    return true;
+  }
+
   async close(): Promise<void> {}
 }
 
@@ -210,6 +240,16 @@ export async function createEncryptedRedisStore(
       await client.del(storageName);
     },
     take: async (storageName) => client.getDel(storageName),
+    compareAndSwap: async (storageName, expected, value, ttlSeconds) => {
+      const result = await client.eval(
+        "local old = redis.call('GET', KEYS[1]); " +
+        "if (ARGV[1] == 'absent' and old ~= false) or " +
+        "(ARGV[1] == 'present' and old ~= ARGV[2]) then return 0 end; " +
+        "redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4]); return 1",
+        { keys: [storageName], arguments: [expected === null ? 'absent' : 'present', expected ?? '', value, String(ttlSeconds)] }
+      );
+      return result === 1;
+    },
     close: async () => {
       await client.close();
     }

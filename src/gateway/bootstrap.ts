@@ -54,15 +54,16 @@ export async function runGatewayFromEnv(
 ): Promise<RunningGateway> {
   const config = loadGatewayConfig(options.env ?? process.env);
   const store = await createEncryptedRedisStore(config.redisUrl, config.storageKey);
+  const registry = new WorkerRegistry(workerSettings(config));
   let oauth;
   try {
-    oauth = await createGatewayOAuth(config, store, options.fetchImpl ?? fetch);
+    oauth = await createGatewayOAuth(config, store, options.fetchImpl ?? fetch,
+      (grantId, grantExpiresAt) => registry.retireGrant(grantId, grantExpiresAt));
   } catch (error) {
     await store.close().catch(() => undefined);
     throw error;
   }
 
-  const registry = new WorkerRegistry(workerSettings(config));
   try {
     return await runGateway({
       registry,

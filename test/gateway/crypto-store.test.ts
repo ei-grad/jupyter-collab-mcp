@@ -62,4 +62,21 @@ describe('encrypted gateway storage', () => {
     );
     expect(Buffer.from(token, 'base64url')[0]).toBe(0x80);
   });
+
+  it('atomically replaces exactly the version read, including expiry', async () => {
+    let now = 10_000;
+    const store = new EncryptedStore(new MemoryKeyValueBackend(() => now), KEY, () => now);
+    expect(await store.compareAndSwap('families', 'one', null, { generation: 0 }, 5)).toBe(true);
+    expect(await store.compareAndSwap('families', 'one', null, { generation: 9 }, 5)).toBe(false);
+    const original = (await store.readVersion<{ generation: number }>('families', 'one'))!;
+    const winners = await Promise.all([
+      store.compareAndSwap('families', 'one', original.version, { generation: 1 }, 2),
+      store.compareAndSwap('families', 'one', original.version, { generation: 2 }, 2)
+    ]);
+    expect(winners.filter(Boolean)).toHaveLength(1);
+    expect(await store.get('families', 'one')).toEqual({ generation: 1 });
+    now += 2_001;
+    expect(await store.readVersion('families', 'one')).toBeNull();
+    expect(await store.compareAndSwap('families', 'one', null, { generation: 3 }, 5)).toBe(true);
+  });
 });

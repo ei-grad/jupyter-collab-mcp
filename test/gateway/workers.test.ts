@@ -340,3 +340,93 @@ describe('WorkerRegistry', () => {
     expect(registry.size).toBe(0);
   });
 });
+
+
+describe('refresh grant worker ownership', () => {
+  it('renews the same worker and retains it across assertion expiry gaps', async () => {
+    const options = await settings();
+    const registry = new WorkerRegistry(options);
+    const first = { ...identity('alice', 'first'), grantId: 'login-one', grantExpiresAt: Date.now() / 1000 + 3600 };
+    try {
+      const a = await registry.acquire(first);
+      const worker = a.worker;
+      await a.release();
+      await registry.expire(first.expiresAt + 1);
+      expect(registry.size).toBe(1);
+      const b = await registry.acquire({ ...first, assertion: () => 'second', grantGeneration: 1, expiresAt: first.expiresAt + 300 });
+      expect(b.worker).toBe(worker);
+      expect(b.client).toBe(a.client);
+      expect(await readFile(join(worker.directory, 'assertion'), 'utf8')).toBe('second');
+      expect((await stat(join(worker.directory, 'assertion'))).mode & 0o777).toBe(0o600);
+      await b.release();
+      const independent = await registry.acquire({ ...first, grantId: 'login-two' });
+      expect(independent.worker).not.toBe(worker);
+      await independent.release();
+      await registry.retireGrant('login-one', first.grantExpiresAt);
+      expect(registry.size).toBe(1);
+      await registry.expire(first.grantExpiresAt + 1);
+      expect(registry.size).toBe(0);
+    } finally {
+      await registry.close();
+    }
+  });
+
+  it('rejects expired JWTs even while a grant worker is retained', async () => {
+    const { factory } = fakeFactory();
+    const registry = new WorkerRegistry(await settings(), factory);
+    const actor = { ...identity(), grantId: 'login', grantExpiresAt: Date.now() / 1000 + 3600 };
+    const lease = await registry.acquire(actor);
+    await lease.release();
+    await expect(registry.acquire({ ...actor, expiresAt: 1 })).rejects.toThrow('expired');
+    expect(factory).toHaveBeenCalledTimes(1);
+    await registry.close();
+  });
+
+  it('serializes credential replacement behind active requests', async () => {
+    const registry = new WorkerRegistry(await settings());
+    const actor = { ...identity('alice', 'first'), grantId: 'login', grantExpiresAt: Date.now() / 1000 + 3600 };
+    const first = await registry.acquire(actor);
+    const next = registry.acquire({ ...actor, assertion: () => 'next', grantGeneration: 1 });
+    await Promise.resolve();
+    expect(await readFile(join(first.worker.directory, 'assertion'), 'utf8')).toBe('first');
+    await first.release();
+    const renewed = await next;
+    expect(await readFile(join(first.worker.directory, 'assertion'), 'utf8')).toBe('next');
+    const stale = registry.acquire(actor);
+    await renewed.release();
+    const older = await stale;
+    expect(older.worker).toBe(first.worker);
+    expect(await readFile(join(first.worker.directory, 'assertion'), 'utf8')).toBe('next');
+    await older.release();
+    await expect(registry.acquire({ ...actor, grantGeneration: 1, assertion: () => 'conflict' }))
+      .rejects.toThrow('without a new generation');
+    await registry.close();
+  });
+});
+
+
+it('does not resurrect a grant revoked before its first worker started', async () => {
+  const { factory } = fakeFactory();
+  const registry = new WorkerRegistry(await settings(), factory);
+  const actor = { ...identity(), grantId: 'revoked', grantExpiresAt: Date.now() / 1000 + 3600 };
+  await registry.retireGrant(actor.grantId, actor.grantExpiresAt);
+  await expect(registry.acquire(actor)).rejects.toThrow('revoked');
+  expect(factory).not.toHaveBeenCalled();
+  await registry.close();
+});
+
+
+it('revalidates the request bearer deadline after waiting for a newer grant worker', async () => {
+  const { factory } = fakeFactory();
+  const registry = new WorkerRegistry(await settings(), factory);
+  const actor = { ...identity(), grantId: 'grant', grantExpiresAt: Date.now() / 1000 + 3600 };
+  const held = await registry.acquire(actor);
+  const requestExpiresAt = Date.now() / 1000 + 0.02;
+  const queued = registry.acquire({ ...actor, requestExpiresAt });
+  const rejected = expect(queued).rejects.toThrow('expired');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  await held.release();
+  await rejected;
+  expect(factory).toHaveBeenCalledTimes(1);
+  await registry.close();
+});

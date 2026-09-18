@@ -46,6 +46,8 @@ describe('gateway configuration', () => {
     expect(config.upstreamCli).toMatch(/\/src\/mcp\/cli\.ts$/);
     expect(config.runtimeDir).toBe('/run/mcp');
     expect(config.allowMissingEmailVerified).toBe(false);
+    expect(config.refreshEnabled).toBe(false);
+    expect(config.refreshGrantTtlSeconds).toBe(28800);
   });
 
   it.each(['true', 'false'])('loads explicit missing-email-claim policy %s', (value) => {
@@ -69,7 +71,10 @@ describe('gateway configuration', () => {
     ['JUPYTER_MCP_SIGNING_KEY', 'short'],
     ['JUPYTER_MCP_MAX_WORKERS', '0'],
     ['JUPYTER_MCP_MAX_WORKERS_PER_PRINCIPAL', '1.5'],
-    ['JUPYTER_MCP_REQUEST_TIMEOUT', 'NaN']
+    ['JUPYTER_MCP_REQUEST_TIMEOUT', 'NaN'],
+    ['JUPYTER_MCP_ENABLE_REFRESH', 'yes'],
+    ['JUPYTER_MCP_REFRESH_GRANT_TTL_SECONDS', '0'],
+    ['JUPYTER_MCP_REFRESH_GRANT_TTL_SECONDS', '1.5']
   ])('rejects unsafe %s configuration', (name, value) => {
     expect(() => loadGatewayConfig(environment({ [name]: value }))).toThrow();
   });

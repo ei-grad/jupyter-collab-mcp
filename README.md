@@ -154,16 +154,18 @@ The header carries the raw credential on REST, collaboration, and kernel
 connections. Its meaning and validation belong to the server. This does not
 perform a Hub OAuth exchange or authenticate a separate external proxy gate.
 Use HTTPS for remote servers; the loopback example is for a local tunnel.
-Existing profiles default to Jupyter token authentication. Credentials are read
-once per server client; after rotating a credential file, restart MCP. Restarting
+Existing profiles default to Jupyter token authentication. By default credentials
+are read once per server client; after rotating a credential file, restart MCP. Restarting
 loses MCP sessions and handles but does not stop Jupyter kernels.
+Header/file profiles can opt into per-request credential renewal; see the
+[authentication contract](SPEC.md#external-assertion-headers).
 
 ## Optional hosted HTTP mode
 
 The main executable's optional [HTTP mode](gateway/README.md) exposes the same
 tools and output resources over authenticated MCP HTTP. It uses OIDC and
 encrypted Redis token storage, with an isolated Node worker for each verified
-principal and credential generation. Existing stdio installations do not need
+principal and login grant (or credential generation without refresh). Existing stdio installations do not need
 HTTP mode or Redis.
 
 The HTTP mode's [configuration and lifecycle contract](gateway/DESIGN.md) covers

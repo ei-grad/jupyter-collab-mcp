@@ -74,6 +74,9 @@ export interface NotebookHandleInit {
   readonly wsBaseUrl: string;
   readonly token: string;
   readonly authHeaders?: Readonly<Record<string, string>>;
+  readonly resolveAuthHeaders?: () => Readonly<Record<string, string>>;
+  readonly credentialExpiry?: 'jwt';
+  readonly credentialExpiresAt?: number;
   readonly awarenessUser: { readonly name: string; readonly color: string };
   readonly journalLimit: number;
   readonly previewChars?: number;
@@ -130,6 +133,9 @@ export class NotebookHandle {
       wsBaseUrl: init.wsBaseUrl,
       token: init.token,
       ...(init.authHeaders === undefined ? {} : { authHeaders: init.authHeaders }),
+      ...(init.resolveAuthHeaders === undefined ? {} : { resolveAuthHeaders: init.resolveAuthHeaders }),
+      ...(init.credentialExpiry === undefined ? {} : { credentialExpiry: init.credentialExpiry }),
+      ...(init.credentialExpiresAt === undefined ? {} : { credentialExpiresAt: init.credentialExpiresAt }),
       fileId: init.fileId,
       sessionId: init.collaborationSessionId,
       ydoc: notebook.ydoc,

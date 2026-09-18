@@ -109,6 +109,9 @@ export interface RtcConnectionOptions {
   readonly wsBaseUrl: string;
   readonly token: string;
   readonly authHeaders?: Readonly<Record<string, string>>;
+  readonly resolveAuthHeaders?: () => Readonly<Record<string, string>>;
+  readonly credentialExpiry?: 'jwt';
+  readonly credentialExpiresAt?: number;
   readonly fileId: string;
   /** Server-wide `SERVER_SESSION` from the document session handshake. */
   readonly sessionId: string;
@@ -191,7 +194,8 @@ export class RtcConnection {
 
     // SPEC.md §11: by default the credential is not part of the URL at all, so
     // `provider.url` and `provider.params` are safe to print.
-    const transport: TokenTransport = options.authHeaders === undefined ? (options.tokenTransport ?? 'header') : 'header';
+    const transport: TokenTransport = options.authHeaders === undefined && options.resolveAuthHeaders === undefined
+      ? (options.tokenTransport ?? 'header') : 'header';
     const params: Record<string, string> =
       transport === 'query'
         ? { sessionId: options.sessionId, token: options.token }
@@ -199,7 +203,10 @@ export class RtcConnection {
     const baseSocket =
       options.webSocketPolyfill ?? (WebSocketImpl as unknown as typeof globalThis.WebSocket);
     const socketCtor =
-      transport === 'header' ? authenticatedWebSocket(options.token, baseSocket, options.authHeaders) : baseSocket;
+      transport === 'header' ? authenticatedWebSocket(
+        options.token, baseSocket, options.authHeaders, options.resolveAuthHeaders,
+        options.credentialExpiry, options.credentialExpiresAt
+      ) : baseSocket;
 
     this.#provider = new WebsocketProvider(serverUrl, this.#roomName, options.ydoc, {
       connect: false,

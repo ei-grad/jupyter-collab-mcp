@@ -18,6 +18,7 @@ import {
   type ResolvedServer,
   type ServerProfile
 } from '../core/index.js';
+import { assertionDeadline } from '../jupyter/auth-expiry.js';
 import { deriveWsBaseUrl, validateBaseUrl } from '../jupyter/paths.js';
 
 /** Everything the resolver may read; injected so tests need no real files. */
@@ -117,15 +118,35 @@ export function resolveServer(
        /^(authorization|proxy-authorization|cookie|host|connection|upgrade|content-.*|transfer-encoding|sec-websocket-.*)$/i.test(auth.name))) {
     throw coreError('INVALID_ARGUMENT', 'invalid authentication header name');
   }
-  const credential = resolveCredential(validated.credentialRef, sources);
-  if ((auth?.type === 'header' && !credential) || /[^\x20-\x7e]/.test(credential)) {
-    throw coreError('AUTH_REQUIRED', 'credential is not a valid authentication header value');
+  if (validated.credentialRefresh !== undefined &&
+      (validated.credentialRefresh !== 'request' || auth?.type !== 'header' ||
+       !validated.credentialRef.startsWith('file:'))) {
+    throw coreError('INVALID_ARGUMENT', 'request credential refresh requires file header authentication');
   }
+  if (validated.credentialExpiry !== undefined &&
+      (validated.credentialExpiry !== 'jwt' || validated.credentialRefresh !== 'request')) {
+    throw coreError('INVALID_ARGUMENT', 'JWT credential expiry requires request credential refresh');
+  }
+  if (validated.credentialExpiresAt !== undefined &&
+      (!Number.isFinite(validated.credentialExpiresAt) || validated.credentialExpiry !== 'jwt')) {
+    throw coreError('INVALID_ARGUMENT', 'credential deadline requires JWT credential expiry');
+  }
+  const readCredential = (): string => {
+    const credential = resolveCredential(validated.credentialRef, sources);
+    if ((auth?.type === 'header' && !credential) || /[^\x20-\x7e]/.test(credential)) {
+      throw coreError('AUTH_REQUIRED', 'credential is not a valid authentication header value');
+    }
+    if (validated.credentialExpiry === 'jwt') assertionDeadline(credential, validated.credentialExpiresAt);
+    return credential;
+  };
+  const credential = readCredential();
   return {
     profile: validated,
     apiBaseUrl,
     wsBaseUrl,
     token: auth?.type === 'header' ? '' : credential,
-    ...(auth?.type === 'header' ? { authHeaders: { [auth.name]: credential } } : {})
+    ...(auth?.type === 'header' ? { authHeaders: { [auth.name]: credential } } : {}),
+    ...(validated.credentialRefresh === 'request' && auth?.type === 'header'
+      ? { resolveAuthHeaders: () => ({ [auth.name]: readCredential() }) } : {})
   };
 }
