@@ -1155,3 +1155,25 @@ the allowed browser origin.
 Global and per-principal capacity limits reject new workers without evicting
 existing ones. Credentials remain in private ephemeral files; subprocess
 arguments, environment, logs, and MCP responses do not contain the assertion.
+
+Cloudflare Access mode disables the origin's OAuth endpoints and validates each
+MCP request's signed Access assertion against an explicit team issuer, application
+audience, expiry, email policy and provisioned-user allow-list. Bearer tokens,
+unsigned forwarded identity headers and transport session identifiers never
+substitute for that verification. Only the exact verified assertion reaches
+Jupyter. This mode does not require local OAuth secrets or an OAuth Redis store.
+
+Access mode uses sessionful Streamable HTTP. Each successful initialize creates
+a server-generated session bound to issuer, subject and mapped username. A
+different principal cannot use it, and independent initializations for the same
+principal cannot share workers or handles. Assertion rotation preserves a
+session's worker and atomically updates its credentials under the worker lease.
+Expired assertions cannot authorize requests. Missing or unknown sessions require
+initialization; DELETE and absolute session expiry retire the owned worker.
+Restart loses process-local handles, but does not invalidate Cloudflare-managed
+OAuth grants. Session allocation obeys global/per-principal capacity limits, and
+invalid initialization attempts do not retain capacity.
+Abandoned sessions expire after a bounded idle interval even when clients omit
+DELETE, returning their capacity. Authenticated requests reset that interval;
+in-flight requests cannot be evicted for idleness. The absolute session deadline
+still applies, and expired handles require a new initialization and reopen.

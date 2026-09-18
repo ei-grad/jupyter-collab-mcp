@@ -16,8 +16,10 @@ import { decodeRpcResponse } from './helpers.js';
 let runtime: GatewayHttpRuntime | undefined;
 let upstream: HttpServer | undefined;
 let temporaryRoot: string | undefined;
+const transportSessions = new Map<string, string>();
 
 afterEach(async () => {
+  transportSessions.clear();
   await runtime?.close();
   runtime = undefined;
   if (upstream?.listening === true) {
@@ -63,7 +65,8 @@ async function rpc(
       accept: 'application/json, text/event-stream',
       authorization: `Bearer ${token}`,
       'content-type': 'application/json',
-      'mcp-protocol-version': '2025-11-25'
+      'mcp-protocol-version': '2025-11-25',
+      ...(transportSessions.has(token) ? { 'mcp-session-id': transportSessions.get(token)! } : {})
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
   });
@@ -83,7 +86,8 @@ async function call(
 }
 
 describe('HTTP mode with the canonical stdio CLI', () => {
-  it.each([false, true])('preserves tools and grant-scoped handles (refresh=%s)', async (refresh) => {
+  it.each(['legacy', 'refresh', 'access'])('preserves tools and isolated handles (mode=%s)', async (mode) => {
+    const refresh = mode !== 'legacy';
     const assertions = ['grant-one', 'grant-two'].map((label) => refresh
       ? `e30.${Buffer.from(JSON.stringify({ exp: Date.now() / 1000 + 300, label })).toString('base64url')}.synthetic`
       : label);
@@ -140,6 +144,7 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     });
     runtime = createGatewayHttpRuntime({
       registry,
+      ...(mode === 'access' ? { accessSessionTtlSeconds: 3600 } : {}),
       allowedHostnames: ['127.0.0.1'],
       allowedOriginHostnames: [],
       authenticate: (request) => {
@@ -155,6 +160,24 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     await runtime.listen(0, '127.0.0.1');
     const gatewayAddress = runtime.server.address() as AddressInfo;
     const baseUrl = `http://127.0.0.1:${String(gatewayAddress.port)}`;
+
+    if (mode === 'access') {
+      for (const token of ['first', 'independent']) {
+        const response = await fetch(`${baseUrl}/mcp`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, accept: 'application/json, text/event-stream', 'content-type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+            protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: token, version: '1' }
+          } })
+        });
+        expect(response.status).toBe(200);
+        const session = response.headers.get('mcp-session-id');
+        expect(session).toBeTruthy();
+        transportSessions.set(token, session!);
+        if (token === 'first') transportSessions.set('rotated', session!);
+        await response.arrayBuffer();
+      }
+    }
 
     const tools = await rpc(baseUrl, 'first', 'tools/list');
     expect(tools['tools']).toHaveLength(18);

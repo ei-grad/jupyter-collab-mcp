@@ -16,7 +16,7 @@ allows an absent claim, never false/null/malformed values.
 
 ## OAuth boundary
 
-The host is a narrow OAuth proxy. It supports dynamic client registration,
+In the default mode, the host is a narrow OAuth proxy. It supports dynamic client registration,
 authorization code, and mandatory S256 PKCE, then federates the login to the
 configured upstream OIDC provider. It issues an opaque local access token and
 never returns upstream tokens. Optional refresh support requests upstream
@@ -37,6 +37,33 @@ Redirect URIs are checked against current operator
 policy at registration, authorization, and callback time. The public URL is
 authoritative; routing and OAuth metadata are never inferred from forwarded
 headers.
+
+## Cloudflare-managed boundary
+
+An alternative `cloudflare-access` mode delegates OAuth discovery, registration,
+login and refresh to the Access edge. The origin has no local OAuth endpoints or
+Redis dependency. It verifies the signed `Cf-Access-Jwt-Assertion` on every MCP
+request using the configured team's JWKS and application's audience, then applies
+the same email and provisioned-user policy. An opaque client bearer token and
+unsigned identity headers are not trusted. Downstream Jupyter receives the exact
+verified assertion and must explicitly trust its issuer/audience.
+
+The Access assertion does not supply a documented stable OAuth grant identifier,
+so it cannot safely serve as a per-agent worker key. Instead the official SDK's
+sessionful Streamable HTTP transport creates one unpredictable session ID per
+initialize. The server binds that session to issuer, subject and username, checks
+fresh identity on every request, and uses a per-session monotonic generation to
+renew worker credentials. A session ID alone never authorizes access, and two
+agents with the same assertion remain isolated. Stateless modern-only clients
+are unsupported in this mode.
+
+DELETE, idle timeout and an absolute lifetime retire sessions and their workers.
+In-flight requests prevent idle eviction, and new authenticated activity resets
+idle time without extending the absolute deadline. Both live workers and pending
+initialized sessions count against global/per-principal capacity. Idle expiry
+reclaims capacity from clients that omit DELETE. The origin must remain private
+behind the Access-enabled tunnel; restarting it loses handles but not edge-owned
+OAuth authorization.
 
 ## Worker boundary
 

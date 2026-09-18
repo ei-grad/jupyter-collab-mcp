@@ -5,17 +5,21 @@ stdio mode over authenticated MCP HTTP. It is part of the main TypeScript
 package and executable; `gateway/` contains only container and deployment
 documentation.
 
-The HTTP host federates login to a trusted OIDC provider. Each verified
-principal and exact ID-token generation owns a persistent Node stdio worker.
+The HTTP host either federates login to a trusted OIDC provider (the default)
+or validates assertions from Cloudflare Access Managed OAuth. Each authenticated
+login grant or transport session owns a persistent Node stdio worker.
 That process boundary keeps notebook handles and credentials separate while
 reusing the canonical stdio implementation and schemas.
 
 ## Configuration
 
 All variables use the `JUPYTER_MCP_` prefix.
+The OAuth credentials, Redis, redirect and refresh settings below apply only
+to the default `AUTH_MODE=oauth`.
 
 | Suffix | Value |
 | --- | --- |
+| `AUTH_MODE` | `oauth` (default) or `cloudflare-access` |
 | `PUBLIC_URL` | Public HTTPS base URL, for example `https://mcp.example.invalid` |
 | `OIDC_CONFIG_URL` | Trusted HTTPS OIDC discovery document |
 | `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | Upstream OIDC client credentials |
@@ -39,6 +43,51 @@ All variables use the `JUPYTER_MCP_` prefix.
 | `CONNECT_TIMEOUT` | Worker initialization timeout in seconds; default 10 |
 | `EXPIRY_POLL_SECONDS` | Expired-worker sweep interval; default 5 |
 | `NODE_COMMAND`, `UPSTREAM_CLI` | Optional local worker executable overrides |
+
+## Cloudflare Access Managed OAuth
+
+With `AUTH_MODE=cloudflare-access`, Cloudflare owns discovery, client registration,
+login, token issuance and refresh. The origin does not expose its own OAuth
+endpoints and does not connect to Redis. Configure:
+
+| Suffix | Value |
+| --- | --- |
+| `ACCESS_ISSUER` | Exact Access team origin, e.g. `https://team.cloudflareaccess.com` |
+| `ACCESS_AUDIENCE` | This MCP Access application's audience tag |
+| `ACCESS_SESSION_TTL_SECONDS` | Absolute in-memory transport/worker lifetime; default 28800 |
+| `ACCESS_SESSION_IDLE_SECONDS` | Idle session timeout; default 900 (15 minutes) |
+
+The common public/Jupyter URLs, username mapping, provisioned-user allow-list,
+assertion header and worker limits still apply. Set the missing-email-verification
+opt-in only when justified by the configured Access identity policy. Every MCP
+request must carry a valid RS256 `Cf-Access-Jwt-Assertion`; a client bearer token
+or unsigned email header alone is never accepted. JWKS comes from the configured
+team's `/cdn-cgi/access/certs`. Provision downstream Jupyter to accept this issuer
+and audience, since an Access assertion differs from a SaaS OIDC ID token.
+
+This mode uses the sessionful 2025 Streamable HTTP transport. Each successful
+`initialize` creates an unpredictable `Mcp-Session-Id`, bound to the verified
+issuer, subject and mapped username. Independent connections, including two
+agents for one user, have separate workers and handles. The session header is
+never sufficient authorization; every request needs a fresh validated assertion.
+Rotating that assertion preserves the worker and updates its private credential
+before a tool request. The same assertion can initialize separate connections.
+Clients must retain the session header and initialize again after a 404.
+Modern-only stateless clients without this session handshake are not supported.
+
+`DELETE` closes the transport and worker. Idle timeout reclaims abandoned
+connections even if a client disconnects without DELETE; authenticated requests
+reset it, and a running request prevents idle eviction. The absolute lifetime is
+never extended. Handles expire with their transport session, so a client returning
+after inactivity must initialize and reopen its notebook handles. Token expiry
+stops Jupyter traffic but preserves handles until the session timeout.
+Restarting the origin loses process-local handles and
+transport sessions, but does not lose Cloudflare's OAuth login or registration.
+Keep the origin private behind the tunnel and enable Managed OAuth on the Access
+application before publishing this mode. Restrict OAuth callback patterns in
+Cloudflare; the origin's `REDIRECT_URIS` setting is unused in this mode.
+
+## Built-in OAuth
 
 Enable `ALLOW_MISSING_EMAIL_VERIFIED` only for a configured issuer whose
 authentication policy establishes the signed email identity without that claim.

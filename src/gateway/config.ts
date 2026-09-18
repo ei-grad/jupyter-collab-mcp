@@ -32,6 +32,17 @@ export interface GatewayConfig {
   readonly expiryPollMs: number;
 }
 
+export type GatewayCommonConfig = Omit<GatewayConfig,
+  'oidcConfigUrl' | 'oidcClientId' | 'oidcClientSecret' | 'redisUrl' |
+  'storageKey' | 'signingKey' | 'redirectUris' | 'refreshEnabled' | 'refreshGrantTtlSeconds'>;
+
+export interface CloudflareAccessConfig extends GatewayCommonConfig {
+  readonly accessIssuer: string;
+  readonly accessAudience: string;
+  readonly sessionTtlSeconds: number;
+  readonly sessionIdleSeconds: number;
+}
+
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[`${PREFIX}${name}`];
   if (value === undefined || value === '') {
@@ -223,7 +234,7 @@ export function validateAssertionHeader(name: string): string {
   return name;
 }
 
-export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
+function loadCommonConfig(env: NodeJS.ProcessEnv): GatewayCommonConfig {
   const usernameEmailDomain = required(env, 'USERNAME_EMAIL_DOMAIN');
   if (!/^[a-z0-9.-]+$/.test(usernameEmailDomain)) {
     throw new Error('an explicit lowercase email domain is required');
@@ -240,26 +251,13 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
     throw new Error('explicit provisioned Hub user names are required');
   }
   const apiBaseUrl = validateJupyterUrl(required(env, 'API_BASE_URL'), 'API_BASE_URL');
-  const signingKey = required(env, 'SIGNING_KEY');
-  if (signingKey.length < 32) throw new Error('SIGNING_KEY requires at least 32 characters');
-  const redirectUris = required(env, 'REDIRECT_URIS').split(/\s+/).filter(Boolean).map(validateRedirectPattern);
-  if (redirectUris.length === 0) throw new Error('explicit OAuth redirect URIs are required');
   const sourceRuntime = fileURLToPath(import.meta.url).endsWith('.ts');
 
   return Object.freeze({
     publicUrl: validatePublicUrl(required(env, 'PUBLIC_URL'), 'PUBLIC_URL'),
-    oidcConfigUrl: validatePublicUrl(required(env, 'OIDC_CONFIG_URL'), 'OIDC_CONFIG_URL'),
-    oidcClientId: required(env, 'OIDC_CLIENT_ID'),
-    oidcClientSecret: required(env, 'OIDC_CLIENT_SECRET'),
-    redisUrl: validateRedisUrl(required(env, 'REDIS_URL')),
-    storageKey: decodeStorageKey(required(env, 'STORAGE_KEY')),
-    signingKey,
-    redirectUris: Object.freeze(redirectUris),
     usernameEmailDomain,
     usernameMode,
     allowMissingEmailVerified: parseBoolean(env, 'ALLOW_MISSING_EMAIL_VERIFIED'),
-    refreshEnabled: parseBoolean(env, 'ENABLE_REFRESH'),
-    refreshGrantTtlSeconds: parsePositiveNumber(env, 'REFRESH_GRANT_TTL_SECONDS', 8 * 60 * 60, true),
     allowedUsers,
     apiBaseUrl,
     browserBaseUrl: validateJupyterUrl(
@@ -283,5 +281,43 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
     requestTimeoutMs: parsePositiveNumber(env, 'REQUEST_TIMEOUT', 120, false) * 1000,
     connectTimeoutMs: parsePositiveNumber(env, 'CONNECT_TIMEOUT', 10, false) * 1000,
     expiryPollMs: parsePositiveNumber(env, 'EXPIRY_POLL_SECONDS', 5, false) * 1000
+  });
+}
+
+export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
+  const common = loadCommonConfig(env);
+  const signingKey = required(env, 'SIGNING_KEY');
+  if (signingKey.length < 32) throw new Error('SIGNING_KEY requires at least 32 characters');
+  const redirectUris = required(env, 'REDIRECT_URIS').split(/\s+/).filter(Boolean).map(validateRedirectPattern);
+  if (redirectUris.length === 0) throw new Error('explicit OAuth redirect URIs are required');
+  return Object.freeze({
+    ...common,
+    oidcConfigUrl: validatePublicUrl(required(env, 'OIDC_CONFIG_URL'), 'OIDC_CONFIG_URL'),
+    oidcClientId: required(env, 'OIDC_CLIENT_ID'),
+    oidcClientSecret: required(env, 'OIDC_CLIENT_SECRET'),
+    redisUrl: validateRedisUrl(required(env, 'REDIS_URL')),
+    storageKey: decodeStorageKey(required(env, 'STORAGE_KEY')),
+    signingKey,
+    redirectUris: Object.freeze(redirectUris),
+    refreshEnabled: parseBoolean(env, 'ENABLE_REFRESH'),
+    refreshGrantTtlSeconds: parsePositiveNumber(env, 'REFRESH_GRANT_TTL_SECONDS', 8 * 60 * 60, true)
+  });
+}
+
+export function loadCloudflareAccessConfig(env: NodeJS.ProcessEnv = process.env): CloudflareAccessConfig {
+  const issuer = validatePublicUrl(required(env, 'ACCESS_ISSUER'), 'ACCESS_ISSUER');
+  if (issuer.pathname !== '/' || !/^[a-z0-9-]+\.cloudflareaccess\.com$/.test(issuer.hostname)) {
+    throw new Error('ACCESS_ISSUER must be a Cloudflare Access team origin');
+  }
+  const sessionTtlSeconds = parsePositiveNumber(env, 'ACCESS_SESSION_TTL_SECONDS', 8 * 60 * 60, true);
+  if (sessionTtlSeconds > Math.floor((2 ** 31 - 1) / 1000)) {
+    throw new Error('ACCESS_SESSION_TTL_SECONDS exceeds the supported timer duration');
+  }
+  return Object.freeze({
+    ...loadCommonConfig(env),
+    accessIssuer: issuer.origin,
+    accessAudience: required(env, 'ACCESS_AUDIENCE'),
+    sessionTtlSeconds,
+    sessionIdleSeconds: parsePositiveNumber(env, 'ACCESS_SESSION_IDLE_SECONDS', 15 * 60, true)
   });
 }

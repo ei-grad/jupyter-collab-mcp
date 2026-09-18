@@ -1,7 +1,8 @@
 import type { RunningGateway } from './cli.js';
 import { runGateway } from './cli.js';
-import type { GatewayConfig } from './config.js';
-import { loadGatewayConfig } from './config.js';
+import type { GatewayCommonConfig, GatewayConfig } from './config.js';
+import { loadCloudflareAccessConfig, loadGatewayConfig } from './config.js';
+import { createCloudflareAccessGate } from './access.js';
 import { createEncryptedRedisStore } from './crypto-store.js';
 import { createGatewayOAuth } from './oauth.js';
 import { WorkerRegistry, type WorkerRegistrySettings } from './worker-registry.js';
@@ -31,7 +32,7 @@ function allowedOriginHostnames(config: GatewayConfig): string[] {
   return [...names];
 }
 
-function workerSettings(config: GatewayConfig): WorkerRegistrySettings {
+function workerSettings(config: GatewayCommonConfig): WorkerRegistrySettings {
   return {
     allowedUsers: config.allowedUsers,
     apiBaseUrl: config.apiBaseUrl.href,
@@ -52,7 +53,32 @@ function workerSettings(config: GatewayConfig): WorkerRegistrySettings {
 export async function runGatewayFromEnv(
   options: GatewayBootstrapOptions = {}
 ): Promise<RunningGateway> {
-  const config = loadGatewayConfig(options.env ?? process.env);
+  const env = options.env ?? process.env;
+  const mode = env.JUPYTER_MCP_AUTH_MODE ?? 'oauth';
+  if (mode === 'cloudflare-access') {
+    const config = loadCloudflareAccessConfig(env);
+    const registry = new WorkerRegistry(workerSettings(config));
+    try {
+      return await runGateway({
+        registry,
+        authenticate: createCloudflareAccessGate(config, { fetchImpl: options.fetchImpl ?? fetch }),
+        allowedHostnames: [config.publicUrl.hostname],
+        allowedOriginHostnames: [config.publicUrl.hostname],
+        mcpPath: `${basePath(config.publicUrl)}/mcp`,
+        accessSessionTtlSeconds: config.sessionTtlSeconds,
+        accessSessionIdleSeconds: config.sessionIdleSeconds,
+        ...(options.host === undefined ? {} : { host: options.host }),
+        ...(options.port === undefined ? {} : { port: options.port }),
+        ...(options.installSignalHandlers === undefined ? {} : { installSignalHandlers: options.installSignalHandlers }),
+        ...(options.onerror === undefined ? {} : { onerror: options.onerror })
+      });
+    } catch (error) {
+      await registry.close();
+      throw error;
+    }
+  }
+  if (mode !== 'oauth') throw new Error('JUPYTER_MCP_AUTH_MODE must be oauth or cloudflare-access');
+  const config = loadGatewayConfig(env);
   const store = await createEncryptedRedisStore(config.redisUrl, config.storageKey);
   const registry = new WorkerRegistry(workerSettings(config));
   let oauth;

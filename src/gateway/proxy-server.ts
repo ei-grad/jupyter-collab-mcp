@@ -37,69 +37,77 @@ export function createGatewayProxyHandler(
   return createMcpHandler(
     async ({ authInfo }) => {
       const identity = registry.validate(await resolveIdentity(authInfo));
-      const server = new Server(
-        {
-          name: options.name ?? 'jupyter-collab-mcp-http',
-          version: options.version ?? '0.1.0'
-        },
-        {
-          capabilities: { tools: {}, resources: {} },
-          instructions:
-            options.instructions ??
-            'Live Jupyter notebooks for the authenticated account. Open a working session before using notebook handles.'
-        }
-      );
-
-      server.setRequestHandler('tools/list', (request, context) =>
-        registry.withClient(identity, context.mcpReq.signal, (client) =>
-          client.request(
-            request,
-            specTypeSchemas.ListToolsResult,
-            requestOptions(registry, context)
-          )
-        )
-      );
-      server.setRequestHandler('tools/call', (request, context) =>
-        registry.withClient(identity, context.mcpReq.signal, (client) =>
-          client.request(
-            request,
-            specTypeSchemas.CallToolResult,
-            requestOptions(registry, context)
-          )
-        )
-      );
-      server.setRequestHandler('resources/list', (request, context) =>
-        registry.withClient(identity, context.mcpReq.signal, (client) =>
-          client.request(
-            request,
-            specTypeSchemas.ListResourcesResult,
-            requestOptions(registry, context)
-          )
-        )
-      );
-      server.setRequestHandler('resources/templates/list', (request, context) =>
-        registry.withClient(identity, context.mcpReq.signal, (client) =>
-          client.request(
-            request,
-            specTypeSchemas.ListResourceTemplatesResult,
-            requestOptions(registry, context)
-          )
-        )
-      );
-      server.setRequestHandler('resources/read', (request, context) =>
-        registry.withClient(identity, context.mcpReq.signal, (client) =>
-          client.request(
-            request,
-            specTypeSchemas.ReadResourceResult,
-            requestOptions(registry, context)
-          )
-        )
-      );
-      return server;
+      return createGatewayProxyServer(registry, () => identity, options);
     },
     {
       responseMode: 'json',
       ...(options.onerror === undefined ? {} : { onerror: options.onerror })
     }
   );
+}
+
+export function createGatewayProxyServer(
+  registry: WorkerRegistry,
+  resolveIdentity: (context: ServerContext) => GatewayIdentity,
+  options: GatewayProxyOptions = {}
+): Server {
+  const server = new Server(
+    {
+      name: options.name ?? 'jupyter-collab-mcp-http',
+      version: options.version ?? '0.1.0'
+    },
+    {
+      capabilities: { tools: {}, resources: {} },
+      instructions:
+        options.instructions ??
+        'Live Jupyter notebooks for the authenticated account. Open a working session before using notebook handles.'
+    }
+  );
+
+  server.setRequestHandler('tools/list', (request, context) =>
+    registry.withClient(resolveIdentity(context), context.mcpReq.signal, (client) =>
+      client.request(
+        request,
+        specTypeSchemas.ListToolsResult,
+        requestOptions(registry, context)
+      )
+    )
+  );
+  server.setRequestHandler('tools/call', (request, context) =>
+    registry.withClient(resolveIdentity(context), context.mcpReq.signal, (client) =>
+      client.request(
+        request,
+        specTypeSchemas.CallToolResult,
+        requestOptions(registry, context)
+      )
+    )
+  );
+  server.setRequestHandler('resources/list', (request, context) =>
+    registry.withClient(resolveIdentity(context), context.mcpReq.signal, (client) =>
+      client.request(
+        request,
+        specTypeSchemas.ListResourcesResult,
+        requestOptions(registry, context)
+      )
+    )
+  );
+  server.setRequestHandler('resources/templates/list', (request, context) =>
+    registry.withClient(resolveIdentity(context), context.mcpReq.signal, (client) =>
+      client.request(
+        request,
+        specTypeSchemas.ListResourceTemplatesResult,
+        requestOptions(registry, context)
+      )
+    )
+  );
+  server.setRequestHandler('resources/read', (request, context) =>
+    registry.withClient(resolveIdentity(context), context.mcpReq.signal, (client) =>
+      client.request(
+        request,
+        specTypeSchemas.ReadResourceResult,
+        requestOptions(registry, context)
+      )
+    )
+  );
+  return server;
 }

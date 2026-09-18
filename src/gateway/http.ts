@@ -6,6 +6,7 @@ import type { AuthInfo, McpHttpHandler } from '@modelcontextprotocol/server';
 import { createGatewayProxyHandler, type GatewayProxyOptions } from './proxy-server.js';
 import type { GatewayIdentity } from './worker.js';
 import type { WorkerRegistry } from './worker-registry.js';
+import { createAccessSessionHandler } from './access-sessions.js';
 
 export interface GatewayAuthentication {
   readonly authInfo: AuthInfo;
@@ -33,12 +34,14 @@ export interface GatewayHttpOptions {
   readonly closeAuth?: () => Promise<void>;
   readonly isReady?: () => boolean | Promise<boolean>;
   readonly proxy?: GatewayProxyOptions;
+  readonly accessSessionTtlSeconds?: number;
+  readonly accessSessionIdleSeconds?: number;
   readonly onerror?: (error: Error) => void;
 }
 
 export interface GatewayHttpRuntime {
   readonly server: HttpServer;
-  readonly proxy: McpHttpHandler;
+  readonly proxy: Pick<McpHttpHandler, 'fetch' | 'close'>;
   listen(port: number, host: string): Promise<void>;
   close(): Promise<void>;
 }
@@ -67,6 +70,7 @@ function exposeMcpCors(request: IncomingMessage, response: ServerResponse): void
   if (origin === undefined) return;
   response.setHeader('access-control-allow-origin', origin);
   response.setHeader('vary', 'Origin');
+  response.setHeader('access-control-expose-headers', 'mcp-session-id');
 }
 
 function respondMcpPreflight(response: ServerResponse): void {
@@ -86,21 +90,21 @@ function respondMcpPreflight(response: ServerResponse): void {
 
 export function createGatewayHttpRuntime(options: GatewayHttpOptions): GatewayHttpRuntime {
   const identities = new WeakMap<AuthInfo, GatewayIdentity>();
-  const proxy = createGatewayProxyHandler(
-    options.registry,
-    (authInfo) => {
-      if (authInfo === undefined) throw new Error('Authenticated identity required');
-      const identity = identities.get(authInfo);
-      if (identity === undefined) throw new Error('Authenticated identity required');
-      return identity;
-    },
-    {
-      ...options.proxy,
-      ...((options.proxy?.onerror ?? options.onerror) === undefined
-        ? {}
-        : { onerror: options.proxy?.onerror ?? options.onerror })
-    }
-  );
+  const resolveIdentity = (authInfo: AuthInfo | undefined): GatewayIdentity => {
+    if (authInfo === undefined) throw new Error('Authenticated identity required');
+    const identity = identities.get(authInfo);
+    if (identity === undefined) throw new Error('Authenticated identity required');
+    return identity;
+  };
+  const proxyOptions = {
+    ...options.proxy,
+    ...((options.proxy?.onerror ?? options.onerror) === undefined
+      ? {} : { onerror: options.proxy?.onerror ?? options.onerror })
+  };
+  const proxy = options.accessSessionTtlSeconds === undefined
+    ? createGatewayProxyHandler(options.registry, resolveIdentity, proxyOptions)
+    : createAccessSessionHandler(options.registry, resolveIdentity,
+      options.accessSessionTtlSeconds, options.accessSessionIdleSeconds ?? 900, proxyOptions);
   const nodeMcp = toNodeHandler(
     {
       fetch: async (request, handlerOptions) => {
