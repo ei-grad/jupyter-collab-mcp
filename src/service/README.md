@@ -64,10 +64,13 @@ number, and once inside `NotebookModel.apply`. An existing exact receipt is
 replayed before planning against state changed by the first call.
 
 For `notebook_execute`, the receipt stores **a reference to the job**, not its
-result; outputs are not copied into the replay registry (§9). If a stored result
-from another tool exceeds `receiptMaxBytes`, the receipt is removed entirely:
-`H` continues to prohibit reuse, so replay returns `REQUEST_ID_EXPIRED` rather
-than executing again.
+result; outputs are not copied into the replay registry (§9). Every other tool
+stores its value, and the room for it is reserved in step 3 from the accepted
+request - for `notebook_apply` from the operation count, whose result is one
+entry per operation. A batch whose receipt would exceed `receiptMaxBytes` is
+refused with `RESOURCE_LIMIT` before the first mutation, with the number still
+unused; completing never drops a receipt, so an operation that ran stays
+replayable until eviction frees its slot.
 
 ## Handles
 
@@ -123,7 +126,11 @@ evicted snapshot gives `HANDLE_EXPIRED`.
 
 The URI is `jupyter-output://<session_id>/<output_id>`; the short form
 `jupyter-output:<output_id>` is also accepted. Neither form contains
-credentials.
+credentials. Both resolve inside the caller's working context alone - the
+library session named by `sessionId`, or the implicit context of an MCP
+connection when none is named - so `output_read`, `resources/read`, and
+`resources/list` answer for another context's snapshot exactly as for an
+expired one.
 
 An execution cursor records the output-list version and delivered entry count
 for each cell. Pagination continues within an unchanged version. A stream

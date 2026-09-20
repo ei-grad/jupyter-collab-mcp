@@ -63,8 +63,10 @@ export interface ServiceLimits {
    */
   readonly requestMaxBytes: number;
   /**
-   * Memory a single receipt may reserve. Outputs are never copied into the
-   * dedup ledger; a receipt stores the job reference instead (SPEC.md §9).
+   * Memory a single receipt may reserve, checked at acceptance and never
+   * afterwards: a request whose answer would not fit is refused before its
+   * effect (SPEC.md §9). Outputs are never copied into the dedup ledger; a
+   * receipt stores the job reference instead.
    */
   readonly receiptMaxBytes: number;
   /**
@@ -95,7 +97,9 @@ export const DEFAULT_SERVICE_LIMITS: ServiceLimits = Object.freeze({
   maxSessions: 64,
   maxReceiptsPerSession: 4096,
   requestMaxBytes: 256 * 1024,
-  receiptMaxBytes: 4 * 1024,
+  // One receipt may hold one response-sized answer: anything larger could not
+  // be returned to the caller in the first place.
+  receiptMaxBytes: 64 * 1024,
   executionOutputMaxBytes: 750 * 1024,
   resourceReadMaxBytes: 1024 * 1024
 });

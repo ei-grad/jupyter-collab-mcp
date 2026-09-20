@@ -84,8 +84,10 @@ For every output, the adapter decides as follows (SPEC §9):
    `output_read`.
 
 The `resources` capability is declared without subscriptions:
-`resources/list` returns live snapshots, and `resources/read` delegates to
-`service.readOutputResource`. If a snapshot does not fit one `resources/read`,
+`resources/list` returns the live snapshots of this connection's working
+context, and `resources/read` delegates to `service.readOutputResource` for the
+same context - a snapshot of another context answers `HANDLE_EXPIRED` in either
+URI form. If a snapshot does not fit one `resources/read`,
 the response is JSON containing `read_more` that points to `output_read`, not
 an invented partial payload. Hosts without resource support can use the same
 `output_read` as an ordinary tool.

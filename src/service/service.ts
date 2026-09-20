@@ -169,6 +169,17 @@ const KERNEL_WATCH_MS = 2000;
 /** How long a long-poll sleeps between journal checks. */
 const POLL_INTERVAL_MS = 50;
 
+/**
+ * Receipt reservation of one `notebook_apply` batch (SPEC.md §9).
+ *
+ * The stored answer is one `OperationResult` per operation - the operation
+ * name, a cell id, an index and up to three revision digests - plus the fixed
+ * head of the result. Both terms are serialisation ceilings, not measurements:
+ * they only have to bound the receipt before the batch runs.
+ */
+const APPLY_RECEIPT_BASE_BYTES = 512;
+const APPLY_RECEIPT_BYTES_PER_OPERATION = 384;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
@@ -660,7 +671,8 @@ class CollabServiceImpl implements CollabService {
         'notebook_apply',
         handle.notebookId,
         request.requestId,
-        payload
+        payload,
+        APPLY_RECEIPT_BASE_BYTES + request.operations.length * APPLY_RECEIPT_BYTES_PER_OPERATION
       );
       if (decision.kind === 'replay') {
         return this.#replayValue<NotebookApplyResult>(session, decision.receipt);
@@ -854,13 +866,17 @@ class CollabServiceImpl implements CollabService {
   }
 
   async outputRead(request: OutputReadRequest): Promise<WithEnvelope<OutputReadResult>> {
-    const found = this.#findSnapshot(request.outputId);
-    if (found === null) {
-      throw coreError('HANDLE_EXPIRED', `output snapshot ${request.outputId} is gone`, {
-        details: { output_id: request.outputId }
-      });
+    const context = this.#callerContext(request.sessionId);
+    const snapshot = this.#findSnapshot(request.outputId, context.sessions);
+    if (snapshot === null) {
+      // A snapshot of another context is indistinguishable from an expired one.
+      throw withEnvelopeDetails(
+        coreError('HANDLE_EXPIRED', `output snapshot ${request.outputId} is gone`, {
+          details: { output_id: request.outputId }
+        }),
+        context.envelope()
+      );
     }
-    const { session, snapshot } = found;
     try {
       const limits = effectiveLimits(this.#config.limits, request.limits);
       const offset = request.cursor === undefined ? 0 : parseOutputCursor(request.cursor);
@@ -884,10 +900,10 @@ class CollabServiceImpl implements CollabService {
         truncated: end < snapshot.byteSize,
         ...(end < snapshot.byteSize ? { nextCursor: makeOutputCursor(end) } : {}),
         lifetime: SNAPSHOT_LIFETIME,
-        ...session.envelope()
+        ...context.envelope()
       };
     } catch (error) {
-      throw withEnvelopeDetails(error, session.envelope());
+      throw withEnvelopeDetails(error, context.envelope());
     }
   }
 
@@ -911,7 +927,9 @@ class CollabServiceImpl implements CollabService {
         if (handle.closed) break;
         page = handle.model.changesSince(request.cursor, limit);
       }
-      if (page.events.length === 0 && waitMs > 0) timedOut = true;
+      // Only a wait that used its whole budget timed out; an answer produced
+      // earlier - including one cut short by a closing handle - did not.
+      if (page.events.length === 0 && waitMs > 0 && Date.now() >= deadline) timedOut = true;
       const lastSequence = handle.model.journal.lastSequence;
       const delivered = parseChangesCursor(page.nextCursor) ?? lastSequence;
       return {
@@ -1091,20 +1109,26 @@ class CollabServiceImpl implements CollabService {
   // MCP resources
   // -------------------------------------------------------------------------
 
-  async readOutputResource(uri: string): Promise<OutputResourceContents> {
+  async readOutputResource(uri: string, sessionId?: string): Promise<OutputResourceContents> {
     const parsed = parseOutputUri(uri);
     if (parsed === null) {
       throw coreError('INVALID_ARGUMENT', 'not a jupyter-output URI issued by this process', {
         details: { uri }
       });
     }
-    const found = this.#findSnapshot(parsed.outputId, parsed.sessionId);
-    if (found === null) {
+    const context = this.#callerContext(sessionId);
+    // The long form names a session: it resolves only inside the caller's own
+    // context, exactly like the short form.
+    const scope =
+      parsed.sessionId === null
+        ? context.sessions
+        : context.sessions.filter((entry) => entry.id === parsed.sessionId);
+    const snapshot = this.#findSnapshot(parsed.outputId, scope);
+    if (snapshot === null) {
       throw coreError('HANDLE_EXPIRED', 'this output snapshot is no longer available', {
         details: { uri }
       });
     }
-    const snapshot = found.snapshot;
     const budget = this.#config.limits.resourceReadMaxBytes;
     if (snapshot.byteSize > budget) {
       // SPEC.md §9: no partial blob is invented here; the caller pages through
@@ -1132,9 +1156,12 @@ class CollabServiceImpl implements CollabService {
     };
   }
 
-  async listOutputResources(cursor?: string): Promise<ListOutputResourcesResult> {
+  async listOutputResources(
+    cursor?: string,
+    sessionId?: string
+  ): Promise<ListOutputResourcesResult> {
     const all: OutputResourceDescriptor[] = [];
-    for (const session of this.#sessions.all()) {
+    for (const session of this.#callerContext(sessionId).sessions) {
       for (const snapshot of session.outputs.list()) {
         all.push({
           uri: snapshot.uri,
@@ -1230,14 +1257,38 @@ class CollabServiceImpl implements CollabService {
     return { session, record };
   }
 
-  #findSnapshot(
-    outputId: string,
-    sessionId?: string | null
-  ): { session: WorkingSession; snapshot: OutputSnapshot } | null {
-    for (const session of this.#sessions.all()) {
-      if (sessionId !== undefined && sessionId !== null && session.id !== sessionId) continue;
+  /**
+   * The working context of one caller: the sessions it may address and the
+   * envelope its answers carry (SPEC.md §4).
+   *
+   * An MCP connection names no session and addresses its implicit context -
+   * every session bound to the connection-wide ledger. A library caller names
+   * its own session. Nothing of another context is reachable either way.
+   *
+   * @throws CoreError `HANDLE_EXPIRED` - unknown or closed session.
+   */
+  #callerContext(sessionId?: string | null): {
+    sessions: readonly WorkingSession[];
+    envelope: (extra?: Omit<SessionEnvelope, 'nextRequestId'>) => SessionEnvelope;
+  } {
+    if (sessionId !== undefined && sessionId !== null) {
+      const session = this.#sessions.require(sessionId);
+      return { sessions: [session], envelope: (extra = {}) => session.envelope(extra) };
+    }
+    return {
+      sessions: this.#sessions.all().filter((entry) => entry.ledger === this.#implicitLedger),
+      envelope: (extra = {}) => ({
+        nextRequestId: this.#implicitLedger.nextRequestId,
+        ...extra
+      })
+    };
+  }
+
+  /** The snapshot, if one of the caller's sessions owns it. */
+  #findSnapshot(outputId: string, scope: readonly WorkingSession[]): OutputSnapshot | null {
+    for (const session of scope) {
       const snapshot = session.outputs.peek(outputId);
-      if (snapshot !== undefined) return { session, snapshot };
+      if (snapshot !== undefined) return snapshot;
     }
     return null;
   }
@@ -1265,10 +1316,17 @@ class CollabServiceImpl implements CollabService {
     tool: DedupTool,
     target: string | null,
     requestId: string,
-    payload: unknown
+    payload: unknown,
+    reserveBytes?: number
   ): ReturnType<RequestLedger['begin']> {
     try {
-      return session.ledger.begin({ requestId, tool, target, payload });
+      return session.ledger.begin({
+        requestId,
+        tool,
+        target,
+        payload,
+        ...(reserveBytes === undefined ? {} : { reserveBytes })
+      });
     } catch (error) {
       const accepted = isCoreError(error) && error.code === 'REQUEST_ID_EXPIRED' ? null : false;
       throw withEnvelopeDetails(error, session.envelope({ requestAccepted: accepted }));
@@ -1630,11 +1688,19 @@ class CollabServiceImpl implements CollabService {
     // measured from the state it is being handed right now (SPEC.md §8).
     const since = parsed?.registryCursor ?? first.cursor;
     let snapshot = first;
-    if (waitMs > 0 && (options.cursor !== undefined || !TERMINAL_JOB_STATES.has(first.job.state))) {
+    // Nothing to wait for when undelivered changes are already there, and
+    // nothing can arrive for a terminal job: both answer at once, so neither
+    // reports a timeout (SPEC.md §8).
+    const settled = first.cursor > since || TERMINAL_JOB_STATES.has(first.job.state);
+    let waitTimedOut = false;
+    if (waitMs > 0 && !settled) {
       const deadline = Date.now() + waitMs;
       for (;;) {
         const remaining = deadline - Date.now();
-        if (remaining <= 0) break;
+        if (remaining <= 0) {
+          waitTimedOut = true;
+          break;
+        }
         snapshot = await record.registry.waitForChange(record.executionId, since, remaining);
         if (snapshot.cursor > since || TERMINAL_JOB_STATES.has(snapshot.job.state)) break;
       }
@@ -1645,7 +1711,7 @@ class CollabServiceImpl implements CollabService {
       limits: this.#config.limits,
       requested: options.limits,
       positions: parsed?.positions ?? null,
-      waitTimedOut: waitMs > 0 && snapshot.cursor <= since,
+      waitTimedOut,
       outputs: session.outputs
     });
   }

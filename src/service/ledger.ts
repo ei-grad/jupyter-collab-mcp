@@ -20,9 +20,11 @@
  *
  * Outputs are never copied here. A receipt stores either a small result value
  * or a reference to the job that owns the data (SPEC.md §9: "outputs are not
- * copied into the retry ledger"); a result that does not fit
- * `receiptMaxBytes` drops its receipt, which leaves the number known to `H`
- * and therefore `REQUEST_ID_EXPIRED` on a replay - never a second execution.
+ * copied into the retry ledger"). The memory a receipt may need is reserved at
+ * acceptance through {@link BeginRequest.reserveBytes}: a request whose answer
+ * would not fit `receiptMaxBytes` is refused with `RESOURCE_LIMIT` while its
+ * number is still unused. Completing never drops a receipt, so an operation
+ * that ran stays replayable until its slot is evicted by the count limit.
  *
  * @module
  */
@@ -79,6 +81,13 @@ export interface BeginRequest {
   readonly target: string | null;
   /** The tool arguments, minus the `request_id` itself. */
   readonly payload: unknown;
+  /**
+   * Upper bound, in bytes, of the receipt this request may produce. Reserved
+   * before the first effect; above `receiptMaxBytes` the request is refused
+   * with `RESOURCE_LIMIT` and the number stays unused (SPEC.md §9). Omitted by
+   * tools whose answer has a small fixed shape.
+   */
+  readonly reserveBytes?: number;
 }
 
 /** Budgets this ledger enforces before any effect (SPEC.md §9). */
@@ -203,8 +212,9 @@ export class RequestLedger {
    * @throws CoreError `REQUEST_ID_EXPIRED` - unknown number `<= H`.
    * @throws CoreError `REQUEST_OUT_OF_ORDER` - a number beyond `H + 1`.
    * @throws CoreError `RESOURCE_LIMIT` - the request does not fit the input
-   * budget, or no receipt slot can be freed. Nothing ran and the number stays
-   * unused in every one of these cases.
+   * budget, its receipt does not fit the reservation budget, or no receipt slot
+   * can be freed. Nothing ran and the number stays unused in every one of these
+   * cases.
    */
   begin(request: BeginRequest): LedgerDecision {
     const preflight = this.preflight(request);
@@ -219,6 +229,16 @@ export class RequestLedger {
         details: {
           request_bytes: requestBytes,
           limit: this.#limits.requestMaxBytes,
+          next_request_id: this.nextRequestId
+        }
+      });
+    }
+    const reserveBytes = request.reserveBytes ?? 0;
+    if (reserveBytes > this.#limits.receiptMaxBytes) {
+      throw coreError('RESOURCE_LIMIT', 'the answer of this request would not fit its receipt', {
+        details: {
+          receipt_bytes: reserveBytes,
+          limit: this.#limits.receiptMaxBytes,
           next_request_id: this.nextRequestId
         }
       });
@@ -244,20 +264,13 @@ export class RequestLedger {
   /**
    * Record the answer of an accepted operation.
    *
-   * A stored value above `receiptMaxBytes` is not kept: the receipt is dropped
-   * and `H` keeps forbidding a re-send, so a later replay is
-   * `REQUEST_ID_EXPIRED` rather than a second execution (SPEC.md §9).
+   * The size of the answer is never a reason to forget the receipt: what a
+   * receipt may cost was reserved at acceptance, so an operation that ran stays
+   * replayable until eviction frees its slot (SPEC.md §9).
    */
   complete(receipt: Receipt, replay: ReplayPayload, effects: SideEffects = 'applied'): void {
     receipt.state = 'completed';
     receipt.effects = effects;
-    if (replay.kind === 'value') {
-      const size = Buffer.byteLength(JSON.stringify(replay.value) ?? 'null', 'utf8');
-      if (size > this.#limits.receiptMaxBytes) {
-        this.#receipts.delete(receipt.requestId);
-        return;
-      }
-    }
     receipt.replay = replay;
   }
 

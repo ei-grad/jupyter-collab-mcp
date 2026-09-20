@@ -581,8 +581,13 @@ Execution states are `queued`, `running`, `succeeded`, `failed`, `cancelled`,
 `interrupted`, and `unknown`. Python errors and kernel `aborted` have distinct
 causes; by default an error stops the remaining cells. `wait_ms` limits only
 how long the MCP response waits; computation may continue. `execution_get` can
-wait for a state change and retrieve new output. A long computation does not
-block reads, RTC updates, or kernel control.
+wait for a state change and retrieve new output. A waiting read is answered at
+once when the state it waits for is already there - undelivered changes after
+the cursor, or a job in a terminal state, from which no further change can
+come. `wait_timed_out` is true only when the call consumed the whole `wait_ms`
+without observing a change; every earlier answer, including such an immediate
+one, reports false. A long computation does not block reads, RTC updates, or
+kernel control.
 
 Cell completion requires the matching `execute_reply` and IOPub `idle`, in
 either arrival order. The output handler must support `stream`,
@@ -769,8 +774,12 @@ When full, the registry removes its oldest completed receipt; active operations
 are not evicted. A compact terminal receipt with `unknown` may expire, but `H`
 still prohibits replay. If all slots contain active operations or the result
 reservation does not fit, reject the new request with `RESOURCE_LIMIT` before
-effects. `H` never decreases or resets; an exhausted range accepts no new
-mutations. Results/errors expose `request_accepted: true|false|null`,
+effects. That reservation is bounded from the accepted request, before the
+first effect; retention afterwards does not depend on how large the answer
+turned out to be. An accepted operation therefore stays replayable until its
+slot is evicted, and the size of its result alone never turns an exact resend
+into `REQUEST_ID_EXPIRED`. `H` never decreases or resets; an exhausted range
+accepts no new mutations. Results/errors expose `request_accepted: true|false|null`,
 `next_request_id`, and retention policy. `null` means the receipt expired and
 payload equality can no longer be established; on range exhaustion,
 `next_request_id` is `null`. `REQUEST_ID_EXPIRED` does not permit retrying an
@@ -836,8 +845,13 @@ in every text response.
 For its own `jupyter-output:` URIs, the server declares `resources: {}` and
 implements `resources/read` and `resources/list` (the list may be empty; tool
 links need not be listed). `output_id`/URI identifies a specific snapshot,
-states its lifetime, and contains no credentials. Hosts without resource reads
-use `output_read`; an unchanged snapshot is not recreated on every read.
+states its lifetime, and contains no credentials. A snapshot is addressable
+only from the working context that produced it, in either URI form:
+`output_read`, `resources/read`, and `resources/list` of another context
+disclose neither its bytes nor its metadata and answer `HANDLE_EXPIRED`,
+indistinguishable from an expired snapshot, and no answer carries another
+context's `next_request_id`. Hosts without resource reads use `output_read`;
+an unchanged snapshot is not recreated on every read.
 `resources/read` has a separate limit: oversized objects are read in chunks via
 `output_read` within response limits. Subscriptions/notifications are optional.
 The `resource_link` type alone does not universally require a capability for

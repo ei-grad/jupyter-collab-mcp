@@ -83,6 +83,17 @@ timings are intentionally omitted because they become stale as coverage grows.
     events with the same address.
 11. `AREA_CACHE_LIMIT = 1024` and `LATE_ROUTE_LIMIT = 128` are internal
     `src/kernel` constants outside §9's configurable limits.
+12. A `notebook_apply` receipt is reserved at acceptance from the operation
+    count (512 B plus 384 B per operation, serialisation ceilings), so a batch
+    whose receipt would not fit `receiptMaxBytes` is refused with
+    `RESOURCE_LIMIT` before the first mutation and with its number unused.
+    `receiptMaxBytes` defaults to 64 KiB - one response-sized answer - and the
+    ledger is still bounded only by `maxReceiptsPerSession` x `receiptMaxBytes`;
+    there is no per-session receipt byte budget with eviction.
+13. Output snapshots are addressable only from the working context that made
+    them. A library embedder must name its session on `outputRead`,
+    `readOutputResource`, and `listOutputResources`; omitting it addresses the
+    implicit per-connection context, which is what the MCP adapter wants.
 ## 4. Public API
 
 Complete lists are in each module's `index.ts`. The package root exports the

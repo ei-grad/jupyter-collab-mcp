@@ -806,6 +806,12 @@ export interface ExecutionCancelResult {
 /** Arguments of `output_read`. */
 export interface OutputReadRequest {
   readonly outputId: OutputId;
+  /**
+   * The working context the caller reads from. A library caller names its own
+   * session; an MCP connection omits it and addresses its implicit context. A
+   * snapshot of any other context is not visible (SPEC.md §4).
+   */
+  readonly sessionId?: SessionId;
   /** Continue an earlier read; already delivered parts are not resent. */
   readonly cursor?: OutputCursor;
   readonly limits?: ResponseLimits;
@@ -1433,10 +1439,11 @@ export interface CollabService {
    * MCP resources - and for payloads too large for a single answer
    * (SPEC.md §9). Continuing with `cursor` never resends delivered parts.
    *
-   * Not deduplicated. Session-scoped through the job that owns the snapshot.
+   * Not deduplicated. Scoped to the caller's working context: an `output_id`
+   * produced by another context is not readable here.
    *
-   * @throws {CoreError} `HANDLE_EXPIRED` - the snapshot expired or its session
-   * closed.
+   * @throws {CoreError} `HANDLE_EXPIRED` - the snapshot expired, its session
+   * closed, or it belongs to another working context.
    * @throws {CoreError} `CURSOR_EXPIRED` - unusable output cursor.
    * @throws {CoreError} `INVALID_ARGUMENT`, `INTERNAL_ERROR`.
    */
@@ -1542,27 +1549,30 @@ export interface CollabService {
    * above `ServiceLimits.resourceReadMaxBytes` is not inlined: the answer is
    * marked `truncated` and points at `output_read`.
    *
-   * Not session-scoped in the first version, so no envelope. A future shared
-   * HTTP adapter must bind the URI to its authenticated owner before calling
-   * this (SPEC.md §4).
+   * Resolved inside one working context, in either URI form: a library caller
+   * names its session, an MCP connection omits it and reads its implicit
+   * context. A URI of another context resolves to nothing. No envelope: the
+   * answer is the snapshot alone (SPEC.md §4).
    *
-   * @throws {CoreError} `HANDLE_EXPIRED` - the snapshot expired, or its
-   * working session was closed.
+   * @throws {CoreError} `HANDLE_EXPIRED` - the snapshot expired, its working
+   * session was closed, or it belongs to another working context.
    * @throws {CoreError} `INVALID_ARGUMENT` - the URI is not a
    * `jupyter-output:` URI this process issued.
    * @throws {CoreError} `INTERNAL_ERROR`.
    */
-  readOutputResource(uri: string): Promise<OutputResourceContents>;
+  readOutputResource(uri: string, sessionId?: SessionId): Promise<OutputResourceContents>;
 
   /**
-   * List the live output snapshots for `resources/list`. May legitimately be
-   * empty - snapshots handed out as tool `resource_link`s need not appear here
-   * (SPEC.md §9). Subscriptions and notifications are not implemented.
+   * List the live output snapshots of one working context for `resources/list`
+   * - the caller's session, or the implicit context when none is named. May
+   * legitimately be empty; snapshots handed out as tool `resource_link`s need
+   * not appear here (SPEC.md §9). Subscriptions are not implemented.
    *
+   * @throws {CoreError} `HANDLE_EXPIRED` - unknown or closed session.
    * @throws {CoreError} `INVALID_ARGUMENT` - unusable cursor.
    * @throws {CoreError} `INTERNAL_ERROR`.
    */
-  listOutputResources(cursor?: string): Promise<ListOutputResourcesResult>;
+  listOutputResources(cursor?: string, sessionId?: SessionId): Promise<ListOutputResourcesResult>;
 
   // -- process --------------------------------------------------------------
 

@@ -611,6 +611,7 @@ describe('kernels and execution', () => {
     expect(snapshot.uri).not.toContain(stand.token);
 
     const firstChunk = await service.outputRead({
+      sessionId: session.sessionId,
       outputId: snapshot.outputId,
       limits: { maxBytes: 8 }
     });
@@ -623,6 +624,7 @@ describe('kernels and execution', () => {
     let cursor = firstChunk.nextCursor;
     while (cursor !== undefined) {
       const next = await service.outputRead({
+        sessionId: session.sessionId,
         outputId: snapshot.outputId,
         cursor,
         limits: { maxBytes: 8 }
@@ -638,10 +640,10 @@ describe('kernels and execution', () => {
     expect(assembled.byteLength).toBe(snapshot.byteSize);
 
     // -- the same snapshot serves resources/read and resources/list ---------
-    const resource = await service.readOutputResource(snapshot.uri);
+    const resource = await service.readOutputResource(snapshot.uri, session.sessionId);
     expect(resource.outputId).toBe(snapshot.outputId);
     expect(resource.truncated).toBe(false);
-    const resources = await service.listOutputResources();
+    const resources = await service.listOutputResources(undefined, session.sessionId);
     expect(resources.resources.some((entry) => entry.outputId === snapshot.outputId)).toBe(true);
 
     // -- execution_get with the job cursor delivers nothing twice -----------
@@ -657,9 +659,11 @@ describe('kernels and execution', () => {
     expect(await codeOf(() => service.executionGet({ executionId: job.executionId }))).toBe(
       'HANDLE_EXPIRED'
     );
-    expect(await codeOf(() => service.outputRead({ outputId: snapshot.outputId }))).toBe(
-      'HANDLE_EXPIRED'
-    );
+    expect(
+      await codeOf(() =>
+        service.outputRead({ sessionId: session.sessionId, outputId: snapshot.outputId })
+      )
+    ).toBe('HANDLE_EXPIRED');
 
     // The kernel outlives every close (SPEC.md §4).
     const kernels = await apiFetchOk({ baseUrl: stand.baseUrl, token: stand.token }, '/api/kernels');

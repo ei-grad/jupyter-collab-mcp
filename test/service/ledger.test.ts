@@ -142,16 +142,27 @@ describe('RequestLedger', () => {
     expect(active.kind).toBe('accept');
   });
 
-  it('drops the receipt when the stored result exceeds receiptMaxBytes', () => {
+  it('4c. RESOURCE_LIMIT when the receipt reservation does not fit', () => {
+    const l = ledger({ receiptMaxBytes: 64 });
+    expect(
+      codeOf(() =>
+        l.begin({ requestId: '1', tool: 'notebook_apply', target: 'nb', payload: {}, reserveBytes: 400 })
+      )
+    ).toBe('RESOURCE_LIMIT');
+    // Refused before acceptance: the number is still available.
+    expect(l.nextRequestId).toBe('1');
+    expect(l.get('1')).toBeUndefined();
+  });
+
+  it('keeps the receipt whatever the answer turned out to weigh', () => {
     const l = ledger({ receiptMaxBytes: 64 });
     const decision = l.begin({ requestId: '1', tool: 'notebook_apply', target: 'nb', payload: {} });
     if (decision.kind !== 'accept') throw new Error('expected acceptance');
-    l.complete(decision.receipt, { kind: 'value', value: { blob: 'y'.repeat(400) } });
-    expect(l.get('1')).toBeUndefined();
-    // The number stays spent, so a replay is EXPIRED, never a second run.
-    expect(codeOf(() => l.begin({ requestId: '1', tool: 'notebook_apply', target: 'nb', payload: {} }))).toBe(
-      'REQUEST_ID_EXPIRED'
-    );
+    const value = { blob: 'y'.repeat(400) };
+    l.complete(decision.receipt, { kind: 'value', value });
+    const again = l.begin({ requestId: '1', tool: 'notebook_apply', target: 'nb', payload: {} });
+    expect(again.kind).toBe('replay');
+    expect(again.receipt.replay).toEqual({ kind: 'value', value });
   });
 
   it('an execution receipt keeps only the job reference', () => {

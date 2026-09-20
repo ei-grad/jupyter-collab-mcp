@@ -342,7 +342,11 @@ describe('output snapshots', () => {
 
     let insufficient: unknown;
     try {
-      await rig.service.outputRead({ outputId: snapshot.outputId, limits: { maxBytes: 1 } });
+      await rig.service.outputRead({
+        sessionId: session.sessionId,
+        outputId: snapshot.outputId,
+        limits: { maxBytes: 1 }
+      });
     } catch (error) {
       insufficient = error;
     }
@@ -355,6 +359,7 @@ describe('output snapshots', () => {
     expect(
       await codeOf(() =>
         rig.service.outputRead({
+          sessionId: session.sessionId,
           outputId: snapshot.outputId,
           cursor: 'oc_1' as never,
           limits: { maxBytes: 4 }
@@ -368,6 +373,7 @@ describe('output snapshots', () => {
     let cursor: string | undefined;
     do {
       const chunk = await rig.service.outputRead({
+        sessionId: session.sessionId,
         outputId: snapshot.outputId,
         ...(cursor === undefined ? {} : { cursor: cursor as never }),
         limits: { maxBytes: 4 }
