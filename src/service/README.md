@@ -138,6 +138,15 @@ append, display replacement, or clear creates a new version, so the next
 `execution_get` returns `outputs_reset: true` with the current replacement
 state even after the job itself is terminal.
 
+`notebook_save` captures a full normalized notebook snapshot before waiting,
+then after RAW success compares independent Contents API reads to that fixed
+snapshot. Matching readback returns the snapshot digest and observation time;
+this is storage-provider evidence at that moment, not a guarantee about the
+latest RTC state or filesystem durability. The save and readback share one
+deadline; neither holds the mutation lock. Capture and streamed responses have
+a separate 16 MiB confirmation cap. Oversize, failed, unsupported or mismatched
+readback leaves persistence unknown without changing the RAW save status.
+
 ## Budgets
 
 `ServiceLimits` (§9) defines 100 cells in a summary, 64 KiB per response, a

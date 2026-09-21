@@ -69,6 +69,10 @@ Before the first execution, call `kernel_status {notebook_id}`. If it returns
 "start", expected_kernel_id: null, notebook_id, request_id}` using the returned
 `next_request_id`. If a kernel is already bound, use it; do not start or switch
 one speculatively. Never guess `expected_kernel_id`.
+When starting without `kernel_name`, an available advertised default is used;
+if it is unavailable, the sole installed kernelspec is used. Multiple available
+specs with no valid default require an explicit choice from `kernel_list`.
+An explicitly requested unavailable name is an error, not a fallback.
 
 **request_id discipline.** `server_start`, `notebook_create`, `notebook_apply`,
 `notebook_execute` and `kernel_control` are deduplicated per connection context.
@@ -91,6 +95,10 @@ one speculatively. Never guess `expected_kernel_id`.
 
 ## 4. Plots, errors, concurrent changes
 
+- `execution_get` returns updates after its cursor. If a cell has
+  `outputs_reset: true`, replace its previous output state with the returned
+  snapshot; do not append it. Coalesced streams and updated displays can repeat
+  a previously delivered prefix, including after execution completes.
 - Images arrive as MCP image content when small enough; larger outputs come as
   `output_id` / `resource_link`. Read them with `output_read {output_id,
   cursor?}` (or the resource, if the host reads resources). Do not ask for full
@@ -125,7 +133,20 @@ one speculatively. Never guess `expected_kernel_id`.
   `notebook_read view: outputs`) and tell the user what you found. Do not
   re-run the cell on your own.
 - `notebook_save {notebook_id}` returns `save_status` and
-  `revision_persistence`; `skipped` and `timeout` are not success. Every open
+  `revision_persistence`. It captures the full normalized snapshot at
+  `requested_at`, saves via RTC, and reads back through the Contents API within
+  one `timeout_ms` budget. `confirmed` includes `persistence_confirmation`
+  with `method: "contents-api-readback"`, `snapshot_digest` and `observed_at`.
+  This confirms that captured snapshot was observed through the storage API;
+  it does not verify an earlier read or execution you checked, the latest RTC
+  state, filesystem durability, or future persistence. Custom Contents managers
+  may cache internally. `structure_revision` covers structure only; there is
+  no `expected_revision` save input. On mismatch, unsupported readback or timeout,
+  confirmation is null and persistence is `unknown`; do not report that as a
+  verified save of your checked content. `skipped` and `timeout` are not success.
+  Capture and each readback have a 16 MiB byte cap; exceeding it also leaves
+  persistence `unknown` even if the server reported save success.
+  Every open
   MCP replica advertises `autosave: true`, which keeps Jupyter collaboration
   autosave enabled even when another participant advertises `autosave: false`.
   Keep the handle open until the requested save or autosave opportunity has

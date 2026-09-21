@@ -906,19 +906,25 @@ export interface NotebookSaveRequest {
  * Result of `notebook_save`.
  *
  * The two facts are deliberately separate: `saveStatus` reports what the
- * server said about *its* save operation, `revisionPersistence` says whether
- * a specific local revision is provably on disk. Without a verified ordering
- * of updates against the save, the honest answer is `unknown` - and `skipped`
- * is never presented as success (SPEC.md §6, §9).
+ * server said about *its* save operation. `revisionPersistence` is confirmed
+ * only when a subsequent Contents API read matches the normalized snapshot
+ * captured at request entry. This is point-in-time storage-provider evidence,
+ * not a filesystem durability guarantee or proof of an earlier caller read.
  */
 export interface NotebookSaveResult {
   readonly notebookId: NotebookId;
   /** `failed` never appears here: it is thrown as `SAVE_FAILED`. */
   readonly saveStatus: Exclude<SaveStatus, 'failed'>;
   readonly revisionPersistence: PersistenceState;
+  readonly persistenceConfirmation: {
+    readonly method: 'contents-api-readback';
+    /** SHA-256 of the normalized snapshot captured at requestedAt, not raw file bytes. */
+    readonly snapshotDigest: string;
+    readonly observedAt: string;
+  } | null;
   /** Structural revision at the moment the save was requested. */
   readonly structureRevision: StructureRevision;
-  /** RFC 3339 UTC time the RAW save request was sent. */
+  /** RFC 3339 UTC time the immutable target snapshot was captured. */
   readonly requestedAt: string;
   /**
    * `true` when the server may also have saved by its own `document_save_delay`

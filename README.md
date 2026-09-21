@@ -102,7 +102,13 @@ Output snapshots are also exposed as `jupyter-output:` MCP resources
 - **Delivery is not persistence.** `notebook_apply` reports `delivery` and
   `persistence` separately: a sent update proves neither that the server
   applied it nor that the file was written. Only `notebook_save` speaks about
-  the file, and `skipped`/`timeout` are not success.
+  the file, and `skipped`/`timeout` are not success. Save confirmation compares
+  an immutable snapshot captured at save entry with an independent Contents
+  API readback and returns its digest and observation time. It does not confirm
+  an earlier caller read, latest RTC state, fsync or future durability; custom
+  storage providers may cache. Save and readback share one timeout, with a
+  16 MiB capture/readback cap; mismatch, errors or limits leave persistence
+  `unknown` and confirmation null without changing the server's save status.
 - **Deduplication is per connection context.** `server_start`, `notebook_create`,
   `notebook_apply`, `notebook_execute` and `kernel_control` take a
   `request_id` - a decimal counter that starts at `"1"` and is always taken

@@ -307,7 +307,7 @@ describe('create, open, read, apply, save', () => {
     // -- save ---------------------------------------------------------------
     const saved = await service.notebookSave({ notebookId, timeoutMs: 20_000 });
     expect(saved.saveStatus).toBe('success');
-    expect(saved.revisionPersistence).toBe('unknown');
+    expect(saved.revisionPersistence).toBe('confirmed');
     expect(saved.autosaveEnabled).toBe(true);
 
     // -- a second working session on the same notebook is a second replica --

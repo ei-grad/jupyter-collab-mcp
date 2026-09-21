@@ -428,6 +428,47 @@ acknowledgement establishes that a server save operation ran, but must not be
 presented as proof that a particular local revision persisted without a
 validated ordering of updates relative to save. The response separates these
 facts (`save_status`, `revision_persistence: confirmed|unknown`).
+
+At `notebook_save` entry, before any asynchronous wait, capture an immutable
+full persisted-notebook projection and its SHA-256 digest. `requested_at` is
+that capture time; `structure_revision` still identifies only cell structure.
+There is no `expected_revision` input: this operation does not verify that the
+captured snapshot equals an earlier read or execution observed by the caller.
+
+After RAW `success`, independently GET the notebook through the Contents API
+with HTTP caching disabled. Within the single `timeout_ms` budget for save and
+readback, bounded polling may observe the captured snapshot. Only an exact
+normalized match returns `revision_persistence: confirmed` with
+`persistence_confirmation: {method: "contents-api-readback", snapshot_digest:
+"sha256:<hex>", observed_at: <RFC3339>}`. Otherwise return `unknown` and null
+confirmation while preserving `save_status`. RAW `failed` still throws
+`SAVE_FAILED`; `skipped`, `timeout`, readback errors, unsupported representations
+and deadline exhaustion do not confirm persistence. Aborting a readback must
+also abort its response-body read. Waiting holds no mutation lock and does
+not consume a request ID. Concurrent RTC edits never replace the target snapshot.
+Snapshot capture and each streamed Contents response are limited to 16 MiB.
+Exceeding either limit skips confirmation and returns `unknown` with null
+confirmation; it does not change the RAW save status or mean saving failed.
+Raw shared values must be traversed within the byte cap before complete cells
+or metadata are materialized. Stop visiting later values when the cap is
+exceeded. Also count actual response bytes, regardless of Content-Length.
+
+The projection retains notebook format, metadata, cell order/IDs/types/sources,
+attachments, counts, every output and persistent extra cell fields. Object-key
+order and notebook multiline string serialization are normalized; JSON MIME
+arrays remain arrays. Exclude only transient cell `execution_state` and
+server-decorated cell metadata `trusted`. Follow the notebook serializer's
+omission of empty optional raw/markdown attachments and cell IDs for nbformat
+4.0–4.4. Do not ignore other metadata or persistent fields to obtain a match.
+Own keys such as `__proto__` are persistent content and must survive capture,
+normalization and hashing, not alter dictionary prototypes or disappear.
+
+Confirmation is point-in-time evidence of the Contents provider's reported
+stored representation, not a raw-file hash, fsync/durability guarantee, latest
+RTC state, or promise against a later write. A custom Contents manager may
+cache internally despite HTTP cache directives; that provider's storage
+semantics remain the boundary. Standard Jupyter file Contents reads access
+the file independently of the RTC room.
 [Server save handler](https://github.com/jupyterlab/jupyter-collaboration/blob/v5.0.2/projects/jupyter-server-ydoc/jupyter_server_ydoc/handlers.py)
 
 The server also saves automatically after the `document_save_delay` debounce.
@@ -515,6 +556,12 @@ path. An existing session is reused; ambiguous bindings return a selection
 error. Reading or opening a notebook does not start a kernel. Start, switch,
 restart, interrupt, and shutdown are explicit `kernel_control` operations.
 Successful `start` and `switch` operations write the selected kernelspec
+name into the Sessions API request. For an unbound notebook, `start` with an
+omitted `kernel_name` uses the advertised default when available. If that default
+is unavailable and exactly one kernelspec is installed, it uses that sole spec.
+Explicit unavailable names, no installed specs, or multiple specs without an
+available default fail before consuming a request ID or creating a session.
+Successful `start` and `switch` operations also write the selected kernelspec
 (`name`, `display_name`, `language`) into shared notebook metadata. After
 `notebook_save`, it is present in the `.ipynb`; opening that path in JupyterLab
 uses the bound session without showing the kernel picker again.
@@ -979,6 +1026,9 @@ delivered stream or display is updated, or the output area is cleared, the
 next response sets `outputs_reset: true` and returns the current replacement
 state (which may be an empty list). This remains observable after the job has
 entered a terminal state.
+Replacement snapshots may repeat a previously delivered stream prefix. Clients
+must replace that cell's prior output state when `outputs_reset` is true,
+rather than append the replacement and duplicate earlier text.
 
 The response byte limit applies to the final serialized `structuredContent`,
 including truncation markers and continuation instructions. The adapter may
