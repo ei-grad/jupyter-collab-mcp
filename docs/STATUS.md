@@ -1,6 +1,6 @@
 # Implementation status
 
-Release snapshot: v0.2.0, 2026-09-21. The verified integration stack is JupyterLab
+Release snapshot: v0.2.2, 2026-09-21. The verified integration stack is JupyterLab
 4.6.3, jupyter-server 2.21.0, jupyter-collaboration 5.0.2,
 jupyter-server-ydoc 3.0.2, jupyter-ydoc 4.1.1, Node.js 24,
 `@jupyter/ydoc` 4.1.1, and `@jupyterlab/services` 7.6.3.
