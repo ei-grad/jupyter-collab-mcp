@@ -152,8 +152,10 @@ generation, so an old token cannot select a new object. Full opaque values
 remain accepted for compatible callers and remain the values used for identity
 and revision comparisons. A cell or revision without an enclosing notebook
 handle remains a full value rather than receiving a portable short reference.
-`@` begins the reserved reference namespace; a valid
-custom identifier beginning with `@` is passed as `raw:<base64url(UTF-8)>`.
+`@` and `raw:` begin reserved reference syntax; a valid custom identifier
+beginning with either prefix is passed as the single-level escape
+`raw:<base64url(UTF-8)>`. The decoded literal must itself begin with `@` or
+`raw:`, so a bare `raw:<base64url>` can never silently select its decoded value.
 Creation-tool descriptions and responses state lifetimes: notebook handles
 last until explicitly closed or the connection context ends. Jobs are released
 with their notebook; bounded output snapshots expire on eviction or context

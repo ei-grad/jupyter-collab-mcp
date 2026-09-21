@@ -107,8 +107,8 @@ export class ReferenceAliases {
 
   /**
    * Preserve literal compatibility while keeping references connection-scoped.
-   * A custom value beginning with `@` must use `raw:<base64url(UTF-8)>` so it
-   * cannot be mistaken for an alias from this connection.
+   * A custom value beginning with `@` or `raw:` must use a single
+   * `raw:<base64url(UTF-8)>` escape so it cannot be mistaken for syntax.
    */
   resolve(kind: ReferenceKind, value: string, notebook?: string): string {
     if (value.startsWith(LITERAL_PREFIX)) return decodeLiteral(value);
@@ -178,14 +178,22 @@ function decodeLiteral(value: string): string {
     throw coreError('INVALID_ARGUMENT', 'raw: must contain a base64url UTF-8 value');
   }
   const bytes = Buffer.from(encoded, 'base64url');
-  if (bytes.toString('base64url') !== encoded) {
+  const decoded = bytes.toString('utf8');
+  if (Buffer.from(decoded, 'utf8').toString('base64url') !== encoded) {
     throw coreError('INVALID_ARGUMENT', 'raw: must contain canonical base64url UTF-8');
   }
-  return bytes.toString('utf8');
+  if (!needsLiteralEscaping(decoded)) {
+    throw coreError('INVALID_ARGUMENT', 'raw: must encode a value beginning with @ or raw:');
+  }
+  return decoded;
 }
 
 function literalValue(value: string): string {
-  return value.startsWith('@')
+  return needsLiteralEscaping(value)
     ? `${LITERAL_PREFIX}${Buffer.from(value, 'utf8').toString('base64url')}`
     : value;
+}
+
+function needsLiteralEscaping(value: string): boolean {
+  return value.startsWith('@') || value.startsWith(LITERAL_PREFIX);
 }

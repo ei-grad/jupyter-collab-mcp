@@ -180,29 +180,36 @@ describe('implicit MCP working context', () => {
     })).isError).not.toBe(true);
   });
 
-  it('addresses alias-like raw cell ids only through the literal grammar', async () => {
+  it('addresses reserved-looking raw cell ids only through the literal grammar', async () => {
     const aliasLike = '@foreign.1.c1';
+    const decodesToOtherId = 'raw:YQ';
+    const malformedRaw = 'raw:not-base64!';
     const { connection } = await rig(['one'], {
       nbformat: 4,
       nbformat_minor: 5,
       metadata: {},
       cells: [
-        { id: 'cell_1', cell_type: 'code', source: 'ordinary raw id', metadata: {}, outputs: [], execution_count: null },
+        { id: 'a', cell_type: 'code', source: 'same source', metadata: {}, outputs: [], execution_count: null },
+        { id: decodesToOtherId, cell_type: 'code', source: 'same source', metadata: {}, outputs: [], execution_count: null },
+        { id: malformedRaw, cell_type: 'code', source: 'malformed raw id', metadata: {}, outputs: [], execution_count: null },
         { id: aliasLike, cell_type: 'code', source: 'alias-like raw id', metadata: {}, outputs: [], execution_count: null }
       ]
     });
     const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
     const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
     const literal = `raw:${Buffer.from(aliasLike, 'utf8').toString('base64url')}`;
+    const escapedDecodingId = `raw:${Buffer.from(decodesToOtherId, 'utf8').toString('base64url')}`;
+    const escapedMalformedRaw = `raw:${Buffer.from(malformedRaw, 'utf8').toString('base64url')}`;
 
     const read = await connection.call('notebook_read', {
       notebook_id: notebookId,
       view: 'cells',
-      cell_ids: ['cell_1', literal]
+      cell_ids: [escapedDecodingId, escapedMalformedRaw, literal]
     });
     expect(read.isError).not.toBe(true);
     expect((read.structuredContent?.['cells'] as Record<string, unknown>[]).map((cell) => cell['source'])).toEqual([
-      'ordinary raw id',
+      'same source',
+      'malformed raw id',
       'alias-like raw id'
     ]);
     expect(metaError(await connection.call('notebook_read', {
@@ -210,6 +217,37 @@ describe('implicit MCP working context', () => {
       view: 'cells',
       cell_ids: [aliasLike]
     }))['code']).toBe('HANDLE_EXPIRED');
+    expect(metaError(await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_ids: [decodesToOtherId]
+    }))['code']).toBe('INVALID_ARGUMENT');
+    expect(metaError(await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_ids: [malformedRaw]
+    }))['code']).toBe('INVALID_ARGUMENT');
+
+    const sourceRevision = String((read.structuredContent?.['cells'] as Record<string, unknown>[])[0]!['source_revision']);
+    expect((await connection.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '1',
+      operations: [{
+        op: 'replace_source',
+        cell_id: escapedDecodingId,
+        expected_source_revision: sourceRevision,
+        source: 'changed raw-prefixed id'
+      }]
+    })).isError).not.toBe(true);
+    const after = await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_ids: [escapedDecodingId, 'a']
+    });
+    expect((after.structuredContent?.['cells'] as Record<string, unknown>[]).map((cell) => cell['source'])).toEqual([
+      'changed raw-prefixed id',
+      'same source'
+    ]);
   });
 
   it('scopes cell and revision aliases to one notebook handle generation', async () => {

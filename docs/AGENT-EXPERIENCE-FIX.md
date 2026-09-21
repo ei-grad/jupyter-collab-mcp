@@ -27,9 +27,10 @@ Acceptance criteria:
   text as well as structured metadata.
 - Text content alone exposes valid aliases/cursors plus cell source and
   revisions, output data, and execution recovery references.
-- Full IDs and revision hashes remain accepted for compatibility. Aliases only
-  apply to typed protocol fields and cannot select a new object after closure
-  or process restart.
+- Full IDs and revision hashes remain accepted for compatibility. IDs beginning
+  with `@` or `raw:` use the documented `raw:<base64url(UTF-8)>` escape.
+  Aliases only apply to typed protocol fields and cannot select a new object
+  after closure or process restart.
 
 The existing distinct revision guards remain unchanged: source for edit/run,
 cell for delete, outputs for clearing, notebook metadata for metadata, and

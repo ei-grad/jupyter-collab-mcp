@@ -244,9 +244,9 @@ const KERNEL_STATUS: Record<string, JsonSchema> = {
 // ---------------------------------------------------------------------------
 
 const serverId = z.string().min(1).optional().describe('Jupyter server profile. Omit only when exactly one server is available; otherwise SERVER_SELECTION_REQUIRED.');
-const notebookId = z.string().min(1).describe('notebook_id from notebook_open or notebook_create. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. A custom literal beginning with @ must be raw:<base64url(UTF-8)> to avoid ambiguity.');
-const executionId = z.string().min(1).describe('execution_id from notebook_execute. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. A custom literal beginning with @ must be raw:<base64url(UTF-8)>.');
-const outputId = z.string().min(1).describe('output_id from an outputs read or an execution result. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. A custom literal beginning with @ must be raw:<base64url(UTF-8)>.');
+const notebookId = z.string().min(1).describe('notebook_id from notebook_open or notebook_create. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. Custom literals beginning with @ or raw: must use the single-level raw:<base64url(UTF-8)> escape.');
+const executionId = z.string().min(1).describe('execution_id from notebook_execute. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. Custom literals beginning with @ or raw: must use the single-level raw:<base64url(UTF-8)> escape.');
+const outputId = z.string().min(1).describe('output_id from an outputs read or an execution result. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. Custom literals beginning with @ or raw: must use the single-level raw:<base64url(UTF-8)> escape.');
 
 const requestId = z
   .string()
