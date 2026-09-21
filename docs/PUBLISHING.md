@@ -1,6 +1,6 @@
 # Publishing the `jupyter-collab-mcp` package
 
-Public unscoped npm package, account **ei-grad**, MIT license.
+Public unscoped npm package, MIT license.
 The version is set in `package.json`.
 
 ## 1. Tarball contents
@@ -41,8 +41,8 @@ repository root.
 Interactively:
 
 ```sh
-npm login            # account ei-grad, 2FA
-npm whoami           # must print ei-grad
+npm login            # the npm account that owns the package, 2FA
+npm whoami           # must print that account
 ```
 
 Alternatively, put an automation token in the user-level file:
@@ -142,7 +142,7 @@ npm OIDC. Configure this trusted publisher in the npm package settings:
 | Field | Value |
 | --- | --- |
 | Provider | GitHub Actions |
-| GitHub user or organization | `ei-grad` |
+| GitHub user or organization | the owner of this repository |
 | Repository | `jupyter-collab-mcp` |
 | Workflow filename | `publish.yml` |
 | Environment | `npm` |
