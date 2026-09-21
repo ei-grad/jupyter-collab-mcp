@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { coreError, type ServerProfile } from '../../src/core/index.js';
 import { ChangeJournal } from '../../src/core/notebook/index.js';
-import { DEDUPLICATED_TOOLS, TOOL_SPECS, jsonByteSize } from '../../src/mcp/index.js';
+import { DEDUPLICATED_TOOLS, TOOL_SPECS, jsonByteSize, renderText } from '../../src/mcp/index.js';
 import { createCollabService } from '../../src/service/index.js';
 import { FakeCollabService, TINY_PNG } from './fake-service.js';
 import { connect, metaError } from './harness.js';
@@ -162,6 +162,70 @@ describe('every tool round-trips', () => {
   });
 });
 
+describe('text rendering', () => {
+  it('renders every record in each bounded service page', () => {
+    const cells = Array.from({ length: 31 }, (_unused, index) => ({
+      cell_id: `cell-${String(index)}`,
+      index,
+      state: 'succeeded',
+      outputs: index === 0
+        ? Array.from({ length: 11 }, (_output, outputIndex) => ({
+            index: outputIndex,
+            output_type: 'stream',
+            snapshot: { output_id: `output-${String(outputIndex)}` }
+          }))
+        : []
+    }));
+    expect(renderText('notebook_read', {
+      view: 'summary',
+      summary: { cell_count: 21, cells: cells.slice(0, 21) }
+    })).toContain('cell-20');
+    expect(renderText('notebook_apply', {
+      results: cells.map((cell) => ({ op: 'add_cell', ...cell }))
+    })).toContain('cell-30');
+    const execution = renderText('execution_get', { execution_id: 'execution', state: 'succeeded', cells });
+    expect(execution).toContain('cell-30');
+    expect(execution).toContain('output_id=output-10');
+    expect(renderText('notebook_changes', {
+      events: Array.from({ length: 41 }, (_unused, index) => ({ sequence: index + 1, kind: 'source_changed' }))
+    })).toContain('41 source_changed');
+    expect(renderText('server_list', {
+      servers: Array.from({ length: 21 }, (_unused, index) => ({ descriptor: { id: `server-${String(index)}` } }))
+    })).toContain('server-20');
+    expect(renderText('notebook_list', {
+      entries: Array.from({ length: 31 }, (_unused, index) => ({ type: 'notebook', path: `notebook-${String(index)}` }))
+    })).toContain('notebook-30');
+    expect(renderText('kernel_list', {
+      running: Array.from({ length: 31 }, (_unused, index) => ({ kernel_id: `kernel-${String(index)}` }))
+    })).toContain('kernel-30');
+  });
+});
+
+describe('reference ownership', () => {
+  it('keeps cell references usable when a supported raw execution id has no adapter history', async () => {
+    harness = await connect();
+    const cancelled = await harness.call('execution_cancel', { execution_id: 'exe_1' });
+    const notebookId = String(cancelled.structuredContent?.['notebook_id']);
+    const cancelledCell = String((cancelled.structuredContent?.['cancelled_cell_ids'] as string[])[0]);
+    expect(notebookId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.n1$/u);
+    expect(cancelledCell).toMatch(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.c1$/u);
+    expect(cancelled.structuredContent?.['already_sent_cell_ids']).toEqual([
+      expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.c2$/u)
+    ]);
+
+    const read = await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_ids: [cancelledCell]
+    });
+    expect(read.isError).not.toBe(true);
+    expect(harness.fake.lastRequest('notebookRead')).toMatchObject({
+      notebookId: 'nb_1',
+      cellIds: ['cell_b']
+    });
+  });
+});
+
 describe('argument validation', () => {
   it.each(['interrupt', 'restart', 'shutdown'])('ignores kernel_name for %s before dispatch', async (action) => {
     harness = await connect();
@@ -230,18 +294,18 @@ describe('error mapping', () => {
       side_effects: 'none',
       next_request_id: '4',
       request_accepted: false,
-      execution_id: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e1$/u),
+      execution_id: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e1$/u),
       execution_ids: [
-        expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e1$/u),
-        expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e2$/u)
+        expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e1$/u),
+        expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e2$/u)
       ],
-      revision: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.r1$/u)
+      revision: 's1_x'
     });
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
     expect(text).toContain('KERNEL_NOT_BOUND');
     expect(text).toContain('next_request_id=4');
-    expect(text).toMatch(/execution_ids=@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e1,@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e2/u);
-    expect(text).toMatch(/"cell_id":"@[A-Za-z0-9_-]+\.[1-9][0-9]*\.c1"/u);
+    expect(text).toMatch(/execution_ids=@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e1,@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e2/u);
+    expect(text).toContain('"cell_id":"cell_a"');
   });
 
   it('maps an unknown throw to INTERNAL_ERROR with side_effects unknown', async () => {
@@ -266,6 +330,69 @@ describe('error mapping', () => {
     expect(JSON.stringify(error)).not.toContain('s3cret');
     expect(String(error['message'])).toContain('token=<redacted>');
     expect(JSON.stringify(error['details'])).toContain('token=<redacted>');
+  });
+
+  it('bounds deep error details, redacts nested tokens and retains recovery facts', async () => {
+    const nested = { level: { level: { level: { level: { level: { level: { url: 'https://h/?token=should-redact' } } } } } } };
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookExecute',
+          error: coreError('REVISION_CONFLICT', 'request failed at https://h/?token=should-redact', {
+            details: {
+              next_request_id: '3',
+              request_accepted: false,
+              current_source_revision: 's1_current',
+              expected_source_revision: 's1_expected',
+              nested,
+              bulky: 'x'.repeat(100_000)
+            }
+          })
+        }
+      }
+    });
+    const answer = await harness.call('notebook_execute', VALID_ARGS['notebook_execute']);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    const error = metaError(answer);
+    expect(answer.isError).toBe(true);
+    expect(jsonByteSize(answer._meta)).toBeLessThanOrEqual(64 * 1024);
+    expect(jsonByteSize(text)).toBeLessThanOrEqual(64 * 1024);
+    expect(`${text}\n${JSON.stringify(error)}`).not.toContain('should-redact');
+    expect(error).toMatchObject({
+      code: 'REVISION_CONFLICT',
+      retryable: false,
+      side_effects: 'none',
+      next_request_id: '3',
+      request_accepted: false,
+      details: { details_truncated: true }
+    });
+    expect(text).toContain('next_request_id=3');
+    expect(text).toContain('request_accepted=false');
+  });
+
+  it('does not rewrite generic FILE_ID_CHANGED fields as revision aliases', async () => {
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookSave',
+          error: coreError('FILE_ID_CHANGED', 'the path now names another file', {
+            details: { expected: 'file-id-before', actual: 'file-id-after', room: 'json:notebook:file-id-before' }
+          })
+        }
+      }
+    });
+    const answer = await harness.call('notebook_save', { notebook_id: 'nb_1' });
+    expect(metaError(answer)).toMatchObject({
+      code: 'FILE_ID_CHANGED',
+      details: {
+        expected: 'file-id-before',
+        actual: 'file-id-after',
+        room: 'json:notebook:file-id-before'
+      }
+    });
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(text).toContain('"expected":"file-id-before"');
+    expect(text).toContain('"actual":"file-id-after"');
   });
 
   it('rejects credential-bearing configured URLs before server_list serialization', async () => {

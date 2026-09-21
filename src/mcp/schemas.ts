@@ -700,12 +700,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     output: result(
       {
         execution_id: str(),
+        notebook_id: str('Owning notebook handle for the returned cell references.'),
         state: str(),
         cancelled_cell_ids: arr(str(), 'Removed from the queue; now not_sent with reason cancelled.'),
         already_sent_cell_ids: arr(str(), 'Already handed to the kernel; their outcome is whatever the kernel reports.'),
         kernel_interrupted: bool('Always false.')
       },
-      ['execution_id', 'state', 'cancelled_cell_ids', 'already_sent_cell_ids', 'kernel_interrupted']
+      ['execution_id', 'notebook_id', 'state', 'cancelled_cell_ids', 'already_sent_cell_ids', 'kernel_interrupted']
     ),
     readOnly: false,
     deduplicated: false

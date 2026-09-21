@@ -431,7 +431,7 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
   }, 120_000);
 
   it('continues a large source through the live RTC document before later cells', async () => {
-    const source = `chunk-${RUN}\n`.repeat(10_000);
+    const source = `${'\\'.repeat(100_000)}\"\u0000\u0001\t\r\n${`界🙂-${RUN}\n`.repeat(2_000)}`;
     const added = await mcp.call('notebook_apply', {
       notebook_id: docId,
       request_id: main.counter.value,

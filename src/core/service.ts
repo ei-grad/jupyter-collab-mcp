@@ -812,6 +812,8 @@ export interface ExecutionCancelRequest {
  */
 export interface ExecutionCancelResult {
   readonly executionId: ExecutionId;
+  /** Owning notebook handle for the returned cell identities. */
+  readonly notebookId: NotebookId;
   readonly state: JobState;
   /** Cells removed from the queue, now `not_sent` with reason `cancelled`. */
   readonly cancelledCellIds: readonly string[];

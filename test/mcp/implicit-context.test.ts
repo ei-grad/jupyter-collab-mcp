@@ -16,7 +16,7 @@ afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.shutdown('client_request')));
 });
 
-async function rig(ids = ['one']) {
+async function rig(ids = ['one'], source?: Record<string, unknown>) {
   const servers = ids.map(() => makeFakeServer({ files: [{ path: 'a.ipynb', type: 'notebook' }] }));
   const handles: NotebookHandle[] = [];
   const service = createCollabService({ servers: ids.map((id, index) => ({
@@ -29,6 +29,7 @@ async function rig(ids = ['one']) {
     },
     openHandle: async (init) => {
       const handle = makeFakeHandle(init).handle;
+      if (source !== undefined) handle.notebook.setSource(source as never);
       handles.push(handle);
       return handle;
     }
@@ -119,9 +120,9 @@ describe('implicit MCP working context', () => {
     const cellId = String(cell['cell_id']);
     const revision = String(cell['source_revision']);
 
-    expect(notebookId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.n1$/u);
-    expect(cellId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.c1$/u);
-    expect(revision).toMatch(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.r1$/u);
+    expect(notebookId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.n1$/u);
+    expect(cellId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.c1$/u);
+    expect(revision).toMatch(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.r1$/u);
     expect((await connection.call('notebook_read', {
       notebook_id: notebookId,
       view: 'cells',
@@ -144,13 +145,13 @@ describe('implicit MCP working context', () => {
     });
     expect(applied.isError).not.toBe(true);
     expect(String(((applied.structuredContent?.['results'] as Record<string, unknown>[])[0]!)['source_revision'])).toMatch(
-      /^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.r[1-9][0-9]*$/u
+      /^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.r[1-9][0-9]*$/u
     );
 
     await connection.call('notebook_close', { notebook_id: notebookId });
     const reopened = await connection.call('notebook_open', { path: 'a.ipynb' });
     expect((reopened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']).toMatch(
-      /^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.n2$/u
+      /^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.n2$/u
     );
     expect(metaError(await connection.call('notebook_read', {
       notebook_id: notebookId,
@@ -160,6 +161,171 @@ describe('implicit MCP working context', () => {
       notebook_id: handles[0]!.notebookId,
       view: 'summary'
     }))['code']).toBe('HANDLE_EXPIRED');
+  });
+
+  it('rejects a stale destructive alias from another populated connection', async () => {
+    const { connection: first } = await rig();
+    const { connection: second } = await rig();
+    const firstOpen = await first.call('notebook_open', { path: 'a.ipynb' });
+    const secondOpen = await second.call('notebook_open', { path: 'a.ipynb' });
+    const firstId = String((firstOpen.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const secondId = String((secondOpen.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    expect(firstId).not.toBe(secondId);
+
+    expect((await first.call('notebook_close', { notebook_id: firstId })).isError).not.toBe(true);
+    expect(metaError(await second.call('notebook_close', { notebook_id: firstId }))['code']).toBe('HANDLE_EXPIRED');
+    expect((await second.call('notebook_read', {
+      notebook_id: secondId,
+      view: 'summary'
+    })).isError).not.toBe(true);
+  });
+
+  it('addresses alias-like raw cell ids only through the literal grammar', async () => {
+    const aliasLike = '@foreign.1.c1';
+    const { connection } = await rig(['one'], {
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [
+        { id: 'cell_1', cell_type: 'code', source: 'ordinary raw id', metadata: {}, outputs: [], execution_count: null },
+        { id: aliasLike, cell_type: 'code', source: 'alias-like raw id', metadata: {}, outputs: [], execution_count: null }
+      ]
+    });
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const literal = `raw:${Buffer.from(aliasLike, 'utf8').toString('base64url')}`;
+
+    const read = await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_ids: ['cell_1', literal]
+    });
+    expect(read.isError).not.toBe(true);
+    expect((read.structuredContent?.['cells'] as Record<string, unknown>[]).map((cell) => cell['source'])).toEqual([
+      'ordinary raw id',
+      'alias-like raw id'
+    ]);
+    expect(metaError(await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_ids: [aliasLike]
+    }))['code']).toBe('HANDLE_EXPIRED');
+  });
+
+  it('scopes cell and revision aliases to one notebook handle generation', async () => {
+    const { connection } = await rig(['one'], {
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{ id: 'durable-cell', cell_type: 'code', source: 'same source', metadata: {}, outputs: [], execution_count: null }]
+    });
+    const first = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const firstNotebookId = String((first.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const firstCell = ((first.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!;
+    const firstCellId = String(firstCell['cell_id']);
+    const firstRevision = String(firstCell['source_revision']);
+    await connection.call('notebook_close', { notebook_id: firstNotebookId });
+
+    const reopened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const reopenedNotebookId = String((reopened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const reopenedCell = ((reopened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!;
+    const reopenedCellId = String(reopenedCell['cell_id']);
+    const reopenedRevision = String(reopenedCell['source_revision']);
+    expect(reopenedCellId).not.toBe(firstCellId);
+    expect(reopenedRevision).not.toBe(firstRevision);
+
+    expect(metaError(await connection.call('notebook_read', {
+      notebook_id: reopenedNotebookId,
+      view: 'cells',
+      cell_ids: [firstCellId]
+    }))['code']).toBe('HANDLE_EXPIRED');
+    expect(metaError(await connection.call('notebook_apply', {
+      notebook_id: reopenedNotebookId,
+      request_id: '1',
+      operations: [{
+        op: 'replace_source',
+        cell_id: reopenedCellId,
+        expected_source_revision: firstRevision,
+        source: 'must not run'
+      }]
+    }))['code']).toBe('HANDLE_EXPIRED');
+
+    const request = {
+      notebook_id: reopenedNotebookId,
+      request_id: '1',
+      operations: [{
+        op: 'replace_source',
+        cell_id: reopenedCellId,
+        expected_source_revision: reopenedRevision,
+        source: 'valid replacement'
+      }]
+    };
+    const applied = await connection.call('notebook_apply', request);
+    expect(applied.isError).not.toBe(true);
+    const replay = await connection.call('notebook_apply', request);
+    expect(replay.isError).not.toBe(true);
+    expect(replay.structuredContent).toMatchObject({ replayed: true, next_request_id: '2' });
+  });
+
+  it('losslessly pages adversarial source text within the MCP response budget', async () => {
+    const source = `${'\\'.repeat(100_000)}\"\u0000\u0001\t\r\n${'界🙂'.repeat(2_000)}`;
+    const { connection } = await rig(['one'], {
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [{ id: 'adversarial', cell_type: 'code', source, metadata: {}, outputs: [], execution_count: null }]
+    });
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const cellId = String((((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!)['cell_id']);
+    const chunks: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await connection.call('notebook_read', {
+        notebook_id: notebookId,
+        view: 'cells',
+        ...(cursor === undefined ? { cell_ids: [cellId] } : { cursor })
+      });
+      expect(page.isError).not.toBe(true);
+      expect(jsonByteSize(page.structuredContent)).toBeLessThanOrEqual(64 * 1024);
+      chunks.push(...(page.structuredContent?.['cells'] as Record<string, unknown>[]).map((cell) => String(cell['source'])));
+      cursor = page.structuredContent?.['next_cursor'] as string | undefined;
+    } while (cursor !== undefined);
+    expect(chunks.join('')).toBe(source);
+  });
+
+  it('bounds and redacts a real invalid-revision error without losing recovery facts', async () => {
+    const { connection } = await rig();
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const cellId = String((((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!)['cell_id']);
+    const invalidRevision = `s1_${'x'.repeat(50_000)}?token=should-redact&continuation=${'y'.repeat(50_000)}`;
+
+    const answer = await connection.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '1',
+      operations: [{
+        op: 'replace_source',
+        cell_id: cellId,
+        expected_source_revision: invalidRevision,
+        source: 'must not run'
+      }]
+    });
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    const error = metaError(answer);
+    expect(answer.isError).toBe(true);
+    expect(jsonByteSize(answer._meta)).toBeLessThanOrEqual(64 * 1024);
+    expect(jsonByteSize(text)).toBeLessThanOrEqual(64 * 1024);
+    expect(`${text}\n${JSON.stringify(error)}`).not.toContain('should-redact');
+    expect(error).toMatchObject({
+      code: 'INVALID_ARGUMENT',
+      retryable: false,
+      side_effects: 'none',
+      next_request_id: '1',
+      request_accepted: false
+    });
+    expect(text).toContain('next_request_id=1');
+    expect(text).toContain('request_accepted=false');
   });
 
   it('reduces a 100-cell UUID-and-revision summary without changing identities', async () => {
@@ -189,8 +355,8 @@ describe('implicit MCP working context', () => {
     expect(fullCells).toHaveLength(100);
     expect(fullCells.every((cell) => String(cell['cell_id']).length === 36)).toBe(true);
     expect(fullCells.every((cell) => String(cell['source_revision']).length === 46 && String(cell['cell_revision']).length === 46 && String(cell['outputs_revision']).length === 46)).toBe(true);
-    expect(compactCells.every((cell) => /^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.c[1-9][0-9]*$/u.test(String(cell['cell_id'])))).toBe(true);
-    expect(compactCells.every((cell) => /^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.r[1-9][0-9]*$/u.test(String(cell['source_revision'])))).toBe(true);
+    expect(compactCells.every((cell) => /^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.c[1-9][0-9]*$/u.test(String(cell['cell_id'])))).toBe(true);
+    expect(compactCells.every((cell) => /^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.r[1-9][0-9]*$/u.test(String(cell['source_revision'])))).toBe(true);
     expect(jsonByteSize(compact.structuredContent)).toBeLessThan(jsonByteSize(toWire(full)));
   });
 

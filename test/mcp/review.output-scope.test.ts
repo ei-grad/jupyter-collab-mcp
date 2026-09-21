@@ -24,6 +24,17 @@ const SECRET_OUTPUT = 'private to the library session\n';
 const services: CollabService[] = [];
 const connections: Harness[] = [];
 
+function textOf(answer: Awaited<ReturnType<Harness['call']>>): string {
+  return answer.content
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text ?? '')
+    .join('');
+}
+
+function textField(text: string, name: string): string | undefined {
+  return new RegExp(`^${name}=([^\\s]+)$`, 'mu').exec(text)?.[1];
+}
+
 afterEach(async () => {
   await Promise.all(connections.splice(0).map((connection) => connection.close()));
   await Promise.all(services.splice(0).map((service) => service.shutdown('client_request')));
@@ -175,5 +186,98 @@ describe('output snapshots stay inside their working context', () => {
 
     const recovered = await connection.call('output_read', { output_id: outputId });
     expect(recovered.structuredContent?.['data']).toBe(output);
+  });
+
+  it('lets a text-only host recover every rendered record, source byte and output byte', async () => {
+    const { connection, handles } = await rig();
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const openText = textOf(opened);
+    const notebookId = /notebook (\S+) /u.exec(openText)?.[1];
+    expect(notebookId).toBeDefined();
+
+    const largeSource = 'source continuation line\n'.repeat(5_000);
+    const outputs = Array.from({ length: 12 }, (_unused, index) => {
+      const text = index === 0
+        ? 'i'.repeat(1_024)
+        : index === 10
+          ? 'large-output-line\n'.repeat(8_000)
+          : `output-${String(index)}`;
+      return { output_type: 'stream', name: 'stdout', text };
+    });
+    handles[0]!.notebook.setSource({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: Array.from({ length: 25 }, (_unused, index) => ({
+        id: `text-cell-${String(index)}`,
+        cell_type: 'code',
+        source: index === 0 ? largeSource : `source-${String(index)}`,
+        metadata: {},
+        outputs: index === 0 ? outputs : [],
+        execution_count: null
+      }))
+    } as never);
+
+    const summaryText = textOf(await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'summary'
+    }));
+    expect(summaryText).toContain('index=24 ');
+    const firstCellId = /^\s*index=0 cell_id=(\S+)/mu.exec(summaryText)?.[1];
+    expect(firstCellId).toBeDefined();
+
+    const recoveredSources: string[] = [];
+    let sourceCursor: string | undefined;
+    do {
+      const text = textOf(await connection.call('notebook_read', {
+        notebook_id: notebookId,
+        view: 'cells',
+        ...(sourceCursor === undefined ? {} : { cursor: sourceCursor })
+      }));
+      for (const match of text.matchAll(/^\s*source=(".*")$/gmu)) {
+        recoveredSources.push(JSON.parse(match[1]!) as string);
+      }
+      sourceCursor = textField(text, 'next_cursor');
+    } while (sourceCursor !== undefined);
+    expect(recoveredSources.join('')).toBe(
+      largeSource + Array.from({ length: 24 }, (_unused, index) => `source-${String(index + 1)}`).join('')
+    );
+
+    const outputText = textOf(await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'outputs',
+      cell_ids: [firstCellId]
+    }));
+    const outputIds = [...outputText.matchAll(/output_id=(\S+) — call output_read/gmu)].map((match) => match[1]!);
+    expect(outputIds).toHaveLength(12);
+    expect(new Set(outputIds).size).toBe(12);
+
+    for (let index = 0; index < outputIds.length; index += 1) {
+      const chunks: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const text = textOf(await connection.call('output_read', {
+          output_id: outputIds[index],
+          ...(cursor === undefined ? {} : { cursor })
+        }));
+        const data = /^data=(".*")$/mu.exec(text)?.[1];
+        expect(data).toBeDefined();
+        chunks.push(JSON.parse(data!) as string);
+        cursor = textField(text, 'next_cursor');
+      } while (cursor !== undefined);
+      expect(chunks.join('')).toBe((outputs[index] as { text: string }).text);
+    }
+
+    const applyText = textOf(await connection.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '1',
+      operations: Array.from({ length: 31 }, (_unused, index) => ({
+        op: 'add_cell',
+        cell_type: 'raw',
+        source: `added-${String(index)}`,
+        position: 'end'
+      }))
+    }));
+    expect(applyText.match(/^\s*add_cell /gmu)).toHaveLength(31);
   });
 });

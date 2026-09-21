@@ -86,12 +86,18 @@ export class ReferenceAliases {
 
   /** Present a full service reference without shortening arbitrary payload text. */
   present(kind: ReferenceKind, full: string, notebook?: string): string {
-    const existing = this.#byFull.get(kind)!.get(full);
+    // A cell or its revision is meaningful only with its notebook handle. Do
+    // not create a portable alias when a legacy result omitted that context.
+    if ((kind === 'cell' || kind === 'revision') && notebook === undefined) {
+      return literalValue(full);
+    }
+    const fullKey = referenceKey(kind, full, notebook);
+    const existing = this.#byFull.get(kind)!.get(fullKey);
     if (existing !== undefined) return existing;
     const number = this.#next.get(kind)!;
     const alias = `@${PROCESS_EPOCH}.${this.#scope}.${PREFIX[kind]}${String(number)}`;
     this.#next.set(kind, number + 1);
-    this.#byFull.get(kind)!.set(full, alias);
+    this.#byFull.get(kind)!.set(fullKey, alias);
     this.#byAlias.get(kind)!.set(alias, full);
     if (notebook !== undefined && (kind === 'cell' || kind === 'revision')) {
       this.#notebookOwner.set(`${kind}\u0000${alias}`, notebook);
@@ -160,6 +166,12 @@ export class ReferenceAliases {
   }
 }
 
+function referenceKey(kind: ReferenceKind, full: string, notebook?: string): string {
+  return kind === 'cell' || kind === 'revision'
+    ? `${notebook ?? ''}\u0000${full}`
+    : full;
+}
+
 function decodeLiteral(value: string): string {
   const encoded = value.slice(LITERAL_PREFIX.length);
   if (encoded.length === 0) {
@@ -170,4 +182,10 @@ function decodeLiteral(value: string): string {
     throw coreError('INVALID_ARGUMENT', 'raw: must contain canonical base64url UTF-8');
   }
   return bytes.toString('utf8');
+}
+
+function literalValue(value: string): string {
+  return value.startsWith('@')
+    ? `${LITERAL_PREFIX}${Buffer.from(value, 'utf8').toString('base64url')}`
+    : value;
 }

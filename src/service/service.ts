@@ -972,6 +972,7 @@ class CollabServiceImpl implements CollabService {
       }
       return {
         executionId: request.executionId,
+        notebookId: record.notebookId,
         state: snapshot.job.state,
         cancelledCellIds: cancelled,
         alreadySentCellIds: alreadySent,

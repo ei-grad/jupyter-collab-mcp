@@ -44,7 +44,8 @@ execution, output, and revision values. Pass them back exactly as returned;
 they preserve the full underlying identity and expire with the connection.
 Full values remain valid for compatible callers. Values beginning with `@` are
 reserved references; pass a custom literal with that prefix as
-`raw:<base64url(UTF-8)>`. If a cells read reports a source cursor, continue it
+`raw:<base64url(UTF-8)>`. A cell or revision can remain a full value when its
+response has no notebook context. If a cells read reports a source cursor, continue it
 before acting on the incomplete source.
 
 Use the revision named by each guarded operation from the answer you just read:
@@ -145,8 +146,9 @@ one speculatively. Never guess `expected_kernel_id`.
 
 - `notebook_close` and connection teardown release *our* handles only. The kernel
   keeps running and the user's JupyterLab is untouched.
-- `execution_cancel {execution_id}` drops cells we have not sent yet. Cells
-  already handed to the kernel keep running.
+- `execution_cancel {execution_id}` drops cells we have not sent yet and returns
+  the owning `notebook_id` with the affected cell references. Cells already
+  handed to the kernel keep running.
 - `kernel_control {action: "interrupt", expected_kernel_id, request_id}` stops
   the whole kernel's current work, possibly someone else's. Only on request.
 - `restart` clears no outputs and re-runs nothing; variables are gone.

@@ -61,7 +61,7 @@ describe('jupyter-output resources (SPEC §9)', () => {
     expect(first.mimeType).toBe('application/json');
     const payload = JSON.parse(first.text) as Record<string, unknown>;
     expect(payload).toMatchObject({
-      output_id: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.o1$/u),
+      output_id: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.o1$/u),
       truncated: true
     });
     expect(String(payload['read_more'])).toContain('output_read');
@@ -78,7 +78,7 @@ describe('jupyter-output resources (SPEC §9)', () => {
     harness = await connect();
     const answer = await harness.call('output_read', { output_id: 'out_1' });
     expect(answer.structuredContent).toMatchObject({
-      output_id: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.o1$/u),
+      output_id: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.o1$/u),
       uri: 'jupyter-output:out_1',
       encoding: 'base64',
       data: TINY_PNG,

@@ -513,6 +513,7 @@ export class FakeCollabService implements CollabService {
   async executionCancel(request: ExecutionCancelRequest): Promise<WithEnvelope<ExecutionCancelResult>> {
     return this.record('executionCancel', request, {
       executionId: request.executionId,
+      notebookId: 'nb_1',
       state: 'cancelled' as const,
       cancelledCellIds: ['cell_b'],
       alreadySentCellIds: ['cell_a'],

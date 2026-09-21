@@ -150,7 +150,9 @@ the connection that issued it, never in notebook payload data, and is never
 reused after close or restart. Its token carries a process epoch and connection
 generation, so an old token cannot select a new object. Full opaque values
 remain accepted for compatible callers and remain the values used for identity
-and revision comparisons. `@` begins the reserved reference namespace; a valid
+and revision comparisons. A cell or revision without an enclosing notebook
+handle remains a full value rather than receiving a portable short reference.
+`@` begins the reserved reference namespace; a valid
 custom identifier beginning with `@` is passed as `raw:<base64url(UTF-8)>`.
 Creation-tool descriptions and responses state lifetimes: notebook handles
 last until explicitly closed or the connection context ends. Jobs are released
@@ -709,7 +711,7 @@ read results and changes.
 | `notebook_execute` | `notebook_id`, `request_id`, `cells[]`, `wait_ms?` | `execution_id`, state, initial results |
 | `execution_get` | `execution_id`, `cursor?`, `wait_ms?`, `limits?` | State, new outputs, and content references |
 | `output_read` | `output_id`, `cursor?`, `limits?` | Chunks of a specific output snapshot, MIME/size, next cursor |
-| `execution_cancel` | `execution_id` | Cancel remaining unsent cells |
+| `execution_cancel` | `execution_id` | Cancel remaining unsent cells; owning `notebook_id` and affected cells |
 | `notebook_changes` | `notebook_id`, `cursor`, `wait_ms?`, `limit?` | Changes after the cursor or `CURSOR_EXPIRED` |
 | `notebook_save` | `notebook_id` | Server save acknowledgement or uncertainty |
 | `kernel_list` | `server_id?` | Kernelspecs and running kernels, without executing code |

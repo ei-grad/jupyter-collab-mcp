@@ -420,9 +420,9 @@ function envelopeLine(payload: WireObject): string[] {
   return parts.length === 0 ? [] : [parts.join(' ')];
 }
 
-function cellLines(cells: WireValue | undefined, limit = 20): string[] {
+function cellLines(cells: WireValue | undefined): string[] {
   if (!Array.isArray(cells)) return [];
-  return cells.slice(0, limit).flatMap((cell) => {
+  return cells.flatMap((cell) => {
     if (!isObject(cell)) return '  -';
     const state = cell['state'] ?? cell['execution_state'];
     const refs = [
@@ -449,7 +449,7 @@ export function renderText(tool: string, payload: WireObject): string {
       const servers = payload['servers'];
       lines.push(`${Array.isArray(servers) ? servers.length : 0} server(s); discovery=${s(payload['discovery_enabled'])} selection_required=${s(payload['selection_required'])}`);
       if (Array.isArray(servers)) {
-        for (const entry of servers.slice(0, 20)) {
+        for (const entry of servers) {
           if (!isObject(entry)) continue;
           const d = nested(entry, 'descriptor');
           lines.push(`  ${s(d['id'])} ${s(d['kind'])} ${s(d['api_base_url'])} origin=${s(entry['origin'])}${entry['default_choice'] === true ? ' default' : ''}`);
@@ -461,7 +461,7 @@ export function renderText(tool: string, payload: WireObject): string {
       const entries = payload['entries'];
       lines.push(`${s(payload['directory'])}: ${Array.isArray(entries) ? entries.length : 0} entr(ies) truncated=${s(payload['truncated'])}`);
       if (Array.isArray(entries)) {
-        for (const entry of entries.slice(0, 30)) {
+        for (const entry of entries) {
           if (!isObject(entry)) continue;
           const session = isObject(entry['session']) ? entry['session'] : undefined;
           lines.push(`  ${s(entry['type'])} ${s(entry['path'])}${session === undefined ? '' : ` kernel=${s(session['kernel_name'])}`}`);
@@ -502,7 +502,7 @@ export function renderText(tool: string, payload: WireObject): string {
       const results = payload['results'];
       lines.push(`${Array.isArray(results) ? results.length : 0} operation(s) applied_locally=${s(payload['applied_locally'])} delivery=${s(payload['delivery'])} persistence=${s(payload['persistence'])}${payload['partial'] === true ? ' PARTIAL — re-read the affected cells' : ''}`);
       if (Array.isArray(results)) {
-        for (const entry of results.slice(0, 30)) {
+        for (const entry of results) {
           if (!isObject(entry)) continue;
           lines.push(`  ${s(entry['op'])} ${s(entry['cell_id'])} source=${s(entry['source_revision'])} cell=${s(entry['cell_revision'])}`);
         }
@@ -517,7 +517,7 @@ export function renderText(tool: string, payload: WireObject): string {
       );
       const cells = payload['cells'];
       if (Array.isArray(cells)) {
-        for (const cell of cells.slice(0, 30)) {
+        for (const cell of cells) {
           if (!isObject(cell)) continue;
           const outputs = cell['outputs'];
           const reason = cell['not_sent_reason'] ?? cell['aborted_reason'];
@@ -525,7 +525,7 @@ export function renderText(tool: string, payload: WireObject): string {
             `  ${s(cell['cell_id'])} ${s(cell['state'])}${reason === undefined ? '' : `/${s(reason)}`} count=${s(cell['execution_count'])} outputs=${Array.isArray(outputs) ? outputs.length : 0}${cell['output_incomplete'] === true ? ' output_incomplete' : ''}${cell['source_changed'] === true ? ' source_changed' : ''}`
           );
           if (Array.isArray(outputs)) {
-            for (const output of outputs.slice(0, 10)) {
+            for (const output of outputs) {
               if (!isObject(output)) continue;
               lines.push(`    ${s(output['output_type'])} ${renderOutputReference(output)}`);
             }
@@ -543,14 +543,14 @@ export function renderText(tool: string, payload: WireObject): string {
       break;
     case 'execution_cancel':
       lines.push(
-        `execution ${s(payload['execution_id'])} ${s(payload['state'])}; cancelled=${s(payload['cancelled_cell_ids'])} already_sent=${s(payload['already_sent_cell_ids'])}; the kernel was not interrupted`
+        `execution ${s(payload['execution_id'])} notebook=${s(payload['notebook_id'])} ${s(payload['state'])}; cancelled=${s(payload['cancelled_cell_ids'])} already_sent=${s(payload['already_sent_cell_ids'])}; the kernel was not interrupted`
       );
       break;
     case 'notebook_changes': {
       const events = payload['events'];
       lines.push(`${Array.isArray(events) ? events.length : 0} event(s) next_cursor=${s(payload['next_cursor'])} truncated=${s(payload['truncated'])} ${s(payload['connection_state'])} wait_timed_out=${s(payload['wait_timed_out'])}`);
       if (Array.isArray(events)) {
-        for (const event of events.slice(0, 40)) {
+        for (const event of events) {
           if (!isObject(event)) continue;
           lines.push(`  ${s(event['sequence'])} ${s(event['kind'])} ${s(event['cell_id'])} ${s(event['origin'])}`);
         }
@@ -567,7 +567,7 @@ export function renderText(tool: string, payload: WireObject): string {
       const running = payload['running'];
       lines.push(`${Array.isArray(specs) ? specs.length : 0} kernelspec(s), default=${s(payload['default_kernel_name'])}, ${Array.isArray(running) ? running.length : 0} running`);
       if (Array.isArray(running)) {
-        for (const kernel of running.slice(0, 20)) {
+        for (const kernel of running) {
           if (!isObject(kernel)) continue;
           lines.push(`  ${s(kernel['kernel_id'])} ${s(kernel['kernel_name'])} ${s(kernel['execution_status'])} paths=${s(kernel['bound_paths'])}`);
         }
@@ -630,9 +630,9 @@ function renderOutputReference(output: WireObject): string {
 function outputLines(cells: WireValue | undefined): string[] {
   if (!Array.isArray(cells)) return [];
   const lines: string[] = [];
-  for (const cell of cells.slice(0, 20)) {
+  for (const cell of cells) {
     if (!isObject(cell) || !Array.isArray(cell['outputs'])) continue;
-    for (const output of cell['outputs'].slice(0, 10)) {
+    for (const output of cell['outputs']) {
       if (!isObject(output)) continue;
       lines.push(`  cell_id=${s(cell['cell_id'])} output_index=${s(output['index'])} ${renderOutputReference(output)}`);
     }
