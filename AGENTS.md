@@ -9,3 +9,10 @@
 - Add a regression test for the invariant. When the defect crosses an external
   boundary such as Jupyter RTC, kernels, persistence, or the browser, also
   verify that boundary with the real integration fixture.
+
+## Skill maintenance
+
+- Whenever a tool interface or behavior changes, update `skill/SKILL.md` in the
+  same change so its workflow, safety and recovery guidance, and examples match
+  the current contract. Do not merge a tool change with stale skill
+  instructions.

@@ -1,6 +1,6 @@
 ---
 name: jupyter-collab
-description: Work inside a live JupyterLab notebook through the jupyter-collab-mcp server - open a notebook over RTC, read the summary and cells by ID and revision, apply edits, run cells so the user sees them run, read plots and errors, follow the user's own changes, and control the kernel. Use whenever the user wants a real notebook edited, executed or inspected instead of a script.
+description: Work inside a live JupyterLab notebook through the jupyter-collab-mcp server - open a notebook over RTC, read the summary and cells by ID and revision, apply edits, run cells so the user sees them run, read plots and errors, follow concurrent changes, and control the kernel. Use whenever the user wants a real notebook edited, executed or inspected instead of a script.
 ---
 
 # Jupyter collaboration (RTC)
@@ -39,10 +39,12 @@ Work from IDs and revisions, never from remembered line numbers.
 - `outputs` - output entries with `mime_types`, `byte_size`, `truncated`,
   `output_id`.
 
-Every guarded operation needs the revision from the answer you just read:
-`source_revision` (text), `cell_revision` (whole cell), `outputs_revision`,
-`notebook_metadata_revision`, `structure_revision`. Page cursors and
-`changes_cursor` are different types and are not interchangeable.
+Use the revision named by each guarded operation from the answer you just read:
+`source_revision` (text), `cell_revision` (whole cell), `outputs_revision`, or
+`notebook_metadata_revision`. `structure_revision` identifies the structure
+snapshot and binds page cursors; current apply operations do not accept it as a
+guard. Page cursors and `changes_cursor` are different types and are not
+interchangeable.
 
 ## 3. Edits and visible execution
 
@@ -62,15 +64,21 @@ with `execution_get {execution_id, cursor?, wait_ms?}` until `state` is terminal
 that read-only tool still waits for the next update rather than completion.
 Never run notebook code with a shell tool instead: it would be invisible.
 
-**request_id discipline.** `notebook_create`, `notebook_apply`,
+Before the first execution, call `kernel_status {notebook_id}`. If it returns
+`kernel_id: null`, bind/start the notebook kernel with `kernel_control {action:
+"start", expected_kernel_id: null, notebook_id, request_id}` using the returned
+`next_request_id`. If a kernel is already bound, use it; do not start or switch
+one speculatively. Never guess `expected_kernel_id`.
+
+**request_id discipline.** `server_start`, `notebook_create`, `notebook_apply`,
 `notebook_execute` and `kernel_control` are deduplicated per connection context.
 
 - Take the number from the `next_request_id` of the last answer of *this*
   session. Never invent, increment or remember it yourself.
 - Send these calls one at a time: the next one only after the previous answer.
 - If you lost the counter (compaction, restart of your context), make a
-  read-only call in the same session first - `notebook_read` or `kernel_list` -
-  and use the `next_request_id` it returns.
+  read-only call in the same session first - `server_list`, `notebook_read` or
+  `kernel_list` - and use the `next_request_id` it returns.
 - If the answer to a mutation was lost, resend the *same* `request_id` with the
   *same* payload to learn what happened. `replayed: true` plus
   `first_accepted_at` means the operation was accepted earlier: do not report
@@ -81,7 +89,7 @@ Never run notebook code with a shell tool instead: it would be invisible.
   `REQUEST_OUT_OF_ORDER` (jumped ahead), `REQUEST_ID_EXPIRED` (receipt gone -
   check the document or the job, never blindly retry).
 
-## 4. Plots, errors, the user's changes
+## 4. Plots, errors, concurrent changes
 
 - Images arrive as MCP image content when small enough; larger outputs come as
   `output_id` / `resource_link`. Read them with `output_read {output_id,
@@ -92,16 +100,17 @@ Never run notebook code with a shell tool instead: it would be invisible.
 - `notebook_changes {notebook_id, cursor, wait_ms?, limit?}` reports adds,
   deletes, source/metadata/outputs edits, reordering, kernel changes and
   connection state - not a full IOPub transcript, and output updates are
-  coalesced. A background update does not mean you have seen it: before any
-  edit that depends on current content, read changes or re-read the cell.
+  coalesced. `origin: remote` means another participant, not a known person. A
+  background update does not mean you have seen it: before any edit that depends
+  on current content, read changes or re-read the cell.
 - `CURSOR_EXPIRED` -> take a fresh snapshot (`notebook_read`) and continue from
   its `changes_cursor`.
 
 ## 5. Conflicts, reconnect, uncertain execution
 
 - `REVISION_CONFLICT`, `MATCH_NOT_FOUND`, `MATCH_NOT_UNIQUE`, `CELL_REPLACED`:
-  the user (or another agent) changed the cell. Re-read, decide again, then
-  re-apply with the new revision. Do not force the old text back.
+  another participant changed the cell. Re-read, decide again, then re-apply
+  with the new revision. Do not force the old text back.
 - `NOT_READY` is retryable; `RTC_SESSION_REJECTED`, `RTC_CONFLICT`,
   `FILE_ID_CHANGED` mean this replica is dead. Do not call `notebook_open`
   immediately: the same session would reuse the terminal handle. First let
@@ -173,18 +182,26 @@ Tell the user the server is up and let them configure the token themselves.
 // 1. server_list {} -> servers, next_request_id "1"
 // 2. notebook_open {"path":"analysis.ipynb"}
 //    -> notebook_id "nb_A", summary, changes_cursor "c7"
-// 3. notebook_apply
-{"notebook_id":"nb_A","request_id":"1","operations":[
+// 3. kernel_status {"notebook_id":"nb_A"}
+//    -> kernel_id null, next_request_id "1"
+// 4. kernel_control (skip when kernel_id is already non-null)
+{"notebook_id":"nb_A","action":"start","expected_kernel_id":null,
+ "request_id":"1"}
+// -> kernel_id "k_1", next_request_id "2"
+// 5. notebook_apply
+{"notebook_id":"nb_A","request_id":"2","operations":[
   {"op":"replace_text","cell_id":"cell_B","expected_source_revision":"rev_1",
    "old_text":"df.head()","new_text":"df.head(20)"}]}
-// -> results[0].source_revision "rev_2", next_request_id "2"
-// 4. notebook_execute
-{"notebook_id":"nb_A","request_id":"2",
+// -> results[0].source_revision "rev_2", next_request_id "3"
+// 6. notebook_execute
+{"notebook_id":"nb_A","request_id":"3",
  "cells":[{"cell_id":"cell_B","expected_source_revision":"rev_2"}],
  "wait_ms":2000}
-// -> execution_id "ex_1", state "running", next_request_id "3"
-// 5. execution_get {"execution_id":"ex_1","cursor":"...","wait_ms":5000}
+// -> execution_id "ex_1", terminal state or wait_timed_out true,
+//    cursor "...", next_request_id "4"
+// 7. If wait_timed_out: execution_get
+{"execution_id":"ex_1","cursor":"...","wait_ms":5000}
 //    -> state "succeeded" | "failed", outputs, output_id for the plot
-// 6. notebook_changes {"notebook_id":"nb_A","cursor":"c7"} to see what the
-//    user did meanwhile; notebook_save {"notebook_id":"nb_A"} if asked.
+// 8. notebook_changes {"notebook_id":"nb_A","cursor":"c7"} to see what
+//    changed meanwhile; notebook_save {"notebook_id":"nb_A"} if asked.
 ```
