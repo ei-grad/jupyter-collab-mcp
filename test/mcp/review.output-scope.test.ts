@@ -41,7 +41,7 @@ afterEach(async () => {
 });
 
 /** One service over a fake Jupyter, plus one MCP connection to it. */
-async function rig(): Promise<{
+async function rig(options: { readonly outputStoreMaxBytes?: number } = {}): Promise<{
   service: CollabService;
   connection: Harness;
   handles: NotebookHandle[];
@@ -61,6 +61,7 @@ async function rig(): Promise<{
     },
     {
       guardStdout: false,
+      ...(options.outputStoreMaxBytes === undefined ? {} : { outputStoreMaxBytes: options.outputStoreMaxBytes }),
       fetchImpl: server.fetchImpl,
       openHandle: async (init) => {
         const handle = makeFakeHandle(init).handle;
@@ -186,6 +187,30 @@ describe('output snapshots stay inside their working context', () => {
 
     const recovered = await connection.call('output_read', { output_id: outputId });
     expect(recovered.structuredContent?.['data']).toBe(output);
+  });
+
+  it('returns a bounded RESOURCE_LIMIT instead of advertising an evicted output id', async () => {
+    const { connection, handles } = await rig({ outputStoreMaxBytes: 1000 });
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const cellId = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_id']);
+    const cell = handles[0]!.notebook.getCell(0) as unknown as { setOutputs(outputs: unknown[]): void };
+    cell.setOutputs([
+      { output_type: 'stream', name: 'stdout', text: 'x'.repeat(700) },
+      { output_type: 'stream', name: 'stdout', text: 'y'.repeat(700) }
+    ]);
+
+    const answer = await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'outputs',
+      cell_ids: [cellId],
+      limits: { max_bytes: 1 }
+    });
+    expect(answer.isError).toBe(true);
+    expect(answer.structuredContent).toBeUndefined();
+    expect(metaError(answer)).toMatchObject({ code: 'RESOURCE_LIMIT' });
+    expect(jsonByteSize(answer._meta)).toBeLessThanOrEqual(64 * 1024);
+    expect(jsonByteSize(textOf(answer))).toBeLessThanOrEqual(64 * 1024);
   });
 
   it('lets a text-only host recover every rendered record, source byte and output byte', async () => {

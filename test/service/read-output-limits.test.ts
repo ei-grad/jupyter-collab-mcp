@@ -1,20 +1,30 @@
 import { afterEach, expect, it } from 'vitest';
-import type { CollabService, NotebookOutputsReadResult } from '../../src/core/index.js';
+import { isCoreError, type CollabService, type NotebookOutputsReadResult } from '../../src/core/index.js';
 import { createCollabService, type NotebookHandle } from '../../src/service/index.js';
 import { makeFakeHandle, makeFakeServer } from './helpers.js';
 
 const services: CollabService[] = [];
 afterEach(async () => { await Promise.all(services.splice(0).map((service) => service.shutdown('client_request'))); });
 
-async function rig() {
+async function rig(options: {
+  readonly outputStoreMaxBytes?: number;
+  readonly outputTexts?: readonly string[];
+  readonly cellCount?: number;
+} = {}) {
   const fake = makeFakeServer({ files: [{ path: 'limits.ipynb', type: 'notebook' }] });
   let handle: NotebookHandle | undefined;
   const service = createCollabService({ servers: [{ id: 'test', kind: 'standalone', apiBaseUrl: 'http://fixture.invalid', credentialRef: 'literal:synthetic' }] }, {
-    guardStdout: false, fetchImpl: fake.fetchImpl, openHandle: async (init) => {
+    guardStdout: false,
+    fetchImpl: fake.fetchImpl,
+    ...(options.outputStoreMaxBytes === undefined ? {} : { outputStoreMaxBytes: options.outputStoreMaxBytes }),
+    openHandle: async (init) => {
       handle = makeFakeHandle(init).handle;
-      const output = { output_type: 'stream', name: 'stdout', text: 'x'.repeat(75) };
-      handle.notebook.setSource({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: ['one', 'two'].map((id) => ({
-        id, cell_type: 'code', source: 'print(1)', metadata: {}, outputs: [output], execution_count: 1
+      const outputs = (options.outputTexts ?? ['x'.repeat(75)]).map((text) => ({
+        output_type: 'stream', name: 'stdout', text
+      }));
+      const ids = ['one', 'two'].slice(0, options.cellCount ?? 2);
+      handle.notebook.setSource({ nbformat: 4, nbformat_minor: 5, metadata: {}, cells: ids.map((id) => ({
+        id, cell_type: 'code', source: 'print(1)', metadata: {}, outputs, execution_count: 1
       })) } as never);
       return handle;
     }
@@ -51,4 +61,49 @@ it.each(['explicit', 'implicit', 'cursor'] as const)('bounds notebook outputs fo
   expect(recovered.data).toBe('x'.repeat(75));
   const again = await service.notebookRead({ notebookId: notebook.notebookId, view: 'outputs', cellIds: [result.cells[0]!.cellId], limits: { maxOutputBytes: 40 } });
   expect(again.cells[0]!.outputs[0]!.snapshot!.outputId).toBe(entry.snapshot!.outputId);
+});
+
+it('advertises only a complete retainable set of notebook output snapshots', async () => {
+  const outputTexts = [`a${'x'.repeat(699)}`, `b${'y'.repeat(699)}`];
+  const { service, notebook, ids } = await rig({ outputStoreMaxBytes: 1500, outputTexts, cellCount: 1 });
+  const read = await service.notebookRead({
+    notebookId: notebook.notebookId,
+    view: 'outputs',
+    cellIds: ids,
+    limits: { maxBytes: 1 }
+  });
+  const entries = read.cells[0]!.outputs;
+  expect(entries).toHaveLength(2);
+  for (let index = 0; index < entries.length; index += 1) {
+    const outputId = entries[index]!.snapshot!.outputId;
+    expect((await service.outputRead({ outputId })).data).toBe(outputTexts[index]);
+  }
+});
+
+it('rejects a notebook output response whose advertised snapshot set cannot be retained', async () => {
+  const { service, notebook, ids } = await rig({
+    outputStoreMaxBytes: 1000,
+    outputTexts: ['x'.repeat(700), 'y'.repeat(700)],
+    cellCount: 1
+  });
+  await expect(service.notebookRead({
+    notebookId: notebook.notebookId,
+    view: 'outputs',
+    cellIds: ids,
+    limits: { maxBytes: 1 }
+  })).rejects.toSatisfy((error: unknown) => isCoreError(error) && error.code === 'RESOURCE_LIMIT');
+});
+
+it('rejects one notebook output snapshot larger than the whole store', async () => {
+  const { service, notebook, ids } = await rig({
+    outputStoreMaxBytes: 1000,
+    outputTexts: ['x'.repeat(1001)],
+    cellCount: 1
+  });
+  await expect(service.notebookRead({
+    notebookId: notebook.notebookId,
+    view: 'outputs',
+    cellIds: ids,
+    limits: { maxBytes: 1 }
+  })).rejects.toSatisfy((error: unknown) => isCoreError(error) && error.code === 'RESOURCE_LIMIT');
 });

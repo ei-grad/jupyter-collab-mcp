@@ -205,6 +205,52 @@ describe('buildExecutionView', () => {
     expect(store.size).toBe(1);
   });
 
+  it('publishes an execution view only after retaining every advertised snapshot', () => {
+    const store = new OutputStore('sess_1', 1500);
+    const view = buildExecutionView(recordFor(store), snapshotOf([
+      { output_type: 'stream', name: 'stdout', text: 'x'.repeat(700) },
+      { output_type: 'stream', name: 'stdout', text: 'y'.repeat(700) }
+    ]), {
+      limits: DEFAULT_SERVICE_LIMITS,
+      requested: { maxOutputBytes: 1 },
+      waitTimedOut: false,
+      outputs: store
+    });
+    const entries = view.cells[0]!.outputs;
+    expect(entries).toHaveLength(2);
+    expect(entries.map((entry) => store.require(entry.snapshot!.outputId).bytes.toString('utf8'))).toEqual([
+      'x'.repeat(700),
+      'y'.repeat(700)
+    ]);
+  });
+
+  it('rejects an execution view whose complete snapshot set cannot be retained', () => {
+    const store = new OutputStore('sess_1', 1000);
+    expect(() => buildExecutionView(recordFor(store), snapshotOf([
+      { output_type: 'stream', name: 'stdout', text: 'x'.repeat(700) },
+      { output_type: 'stream', name: 'stdout', text: 'y'.repeat(700) }
+    ]), {
+      limits: DEFAULT_SERVICE_LIMITS,
+      requested: { maxOutputBytes: 1 },
+      waitTimedOut: false,
+      outputs: store
+    })).toThrowError(expect.objectContaining({ code: 'RESOURCE_LIMIT' }));
+    expect(store.size).toBe(0);
+  });
+
+  it('rejects one execution snapshot larger than the whole store', () => {
+    const store = new OutputStore('sess_1', 1000);
+    expect(() => buildExecutionView(recordFor(store), snapshotOf([
+      { output_type: 'stream', name: 'stdout', text: 'x'.repeat(1001) }
+    ]), {
+      limits: DEFAULT_SERVICE_LIMITS,
+      requested: { maxOutputBytes: 1 },
+      waitTimedOut: false,
+      outputs: store
+    })).toThrowError(expect.objectContaining({ code: 'RESOURCE_LIMIT' }));
+    expect(store.size).toBe(0);
+  });
+
   it('a cursor skips the outputs already delivered', () => {
     const store = new OutputStore('sess_1', 1024 * 1024);
     const snapshot = snapshotOf(outputs(5));

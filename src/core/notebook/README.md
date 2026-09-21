@@ -59,8 +59,8 @@ object.
   no `await` between reading the model and recording the journal boundary
   (SPEC.md §9).
 - `readCells(selector?, limits?)` returns source text, metadata, attachments,
-  and truncation flags; `selector` is either `{cellIds}` or `{cursor}` (a page
-  cursor).
+  and truncation flags; `selector` is either `{cellIds}` or `{cursor}`. A
+  cursor continues either a cell page or a truncated source on its current cell.
 - `readOutputs(cellIds, limits?)` returns outputs with a MIME list and per-item
   size. Data that does not fit the budget is not inlined; it has
   `truncated: true`, `byteSize`, and, for text, a short `textPreview`.

@@ -106,6 +106,10 @@ one speculatively. Never guess `expected_kernel_id`.
   cursor?}` (or the resource, if the host reads resources). Do not ask for full
   base64 in text. `output_read` pages its encoded payload within the response
   budget; keep following `next_cursor` until `truncated:false`.
+- Every `output_id` in a successful result is readable when returned. A
+  `RESOURCE_LIMIT` can mean the server could not retain that complete output
+  set; after an accepted execution, keep its returned `execution_id` and
+  `request_accepted` state and continue observation rather than resubmitting.
 - A Python error is a *result*, not a tool error: the job is `failed` with a
   reason and the traceback is in the cell outputs.
 - `notebook_changes {notebook_id, cursor, wait_ms?, limit?}` reports adds,

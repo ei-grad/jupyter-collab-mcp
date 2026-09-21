@@ -124,6 +124,7 @@ import type { NotebookHandleInit } from './notebook-handle.js';
 import {
   SNAPSHOT_LIFETIME,
   parseOutputUri,
+  type OutputSnapshotWriter,
   type OutputSnapshot
 } from './outputs.js';
 import { RequestLedger, type DedupTool, type Receipt } from './ledger.js';
@@ -199,6 +200,7 @@ function withEnvelopeDetails(error: unknown, envelope: SessionEnvelope): CoreErr
     ...(envelope.requestAccepted === undefined
       ? {}
       : { request_accepted: envelope.requestAccepted }),
+    ...(envelope.replayed === undefined ? {} : { replayed: envelope.replayed }),
     ...(envelope.firstAcceptedAt === undefined
       ? {}
       : { first_accepted_at: envelope.firstAcceptedAt })
@@ -207,6 +209,17 @@ function withEnvelopeDetails(error: unknown, envelope: SessionEnvelope): CoreErr
     retryable: core.retryable,
     sideEffects: core.sideEffects,
     details,
+    cause: core
+  });
+}
+
+/** Preserve the submitted job as recovery information when its first view fails. */
+function withAcceptedExecutionDetails(error: unknown, executionId: string): CoreError {
+  const core = toCoreError(error);
+  return coreError(core.code, core.message, {
+    retryable: core.retryable,
+    sideEffects: 'applied',
+    details: { ...(core.details ?? {}), execution_id: executionId },
     cause: core
   });
 }
@@ -723,10 +736,12 @@ class CollabServiceImpl implements CollabService {
         maxBytes: limits.maxBytes,
         maxOutputBytes: limits.maxOutputBytes
       });
+      const snapshots = session.outputs.begin();
       const cells: CellOutputsView[] = read.cells.map((cell) => ({
         ...cell,
-        outputs: this.#outputEntries(session, handle, cell)
+        outputs: this.#outputEntries(handle, cell, snapshots)
       }));
+      snapshots.commit();
       const result: NotebookOutputsReadResult = {
         ...common,
         view: 'outputs',
@@ -915,10 +930,15 @@ class CollabServiceImpl implements CollabService {
         watchJob(record, () => stopped);
         this.#startKernelWatch();
 
-        const view = await this.#executionView(session, record, {
-          waitMs: 0,
-          ...(request.limits === undefined ? {} : { limits: request.limits })
-        });
+        let view: ExecutionView;
+        try {
+          view = await this.#executionView(session, record, {
+            waitMs: 0,
+            ...(request.limits === undefined ? {} : { limits: request.limits })
+          });
+        } catch (error) {
+          throw withAcceptedExecutionDetails(error, executionId);
+        }
         return { result: view, replay: { kind: 'execution', executionId } };
       });
     });
@@ -936,7 +956,10 @@ class CollabServiceImpl implements CollabService {
     } catch (error) {
       // Submission is already receipted. Observation failure cannot make a
       // retry eligible to send code again or change the accepted outcome.
-      throw withEnvelopeDetails(error, { ...submitted, ...session.envelope() });
+      throw withEnvelopeDetails(
+        withAcceptedExecutionDetails(error, submitted.executionId),
+        { ...submitted, ...session.envelope() }
+      );
     }
   }
 
@@ -1499,10 +1522,22 @@ class CollabServiceImpl implements CollabService {
     if (receipt.replay?.kind === 'execution') {
       const record = session.executions.get(receipt.replay.executionId);
       if (record !== undefined) {
-        const view = await this.#executionView(session, record, {
-          waitMs: 0,
-          ...(request.limits === undefined ? {} : { limits: request.limits })
-        });
+        let view: ExecutionView;
+        try {
+          view = await this.#executionView(session, record, {
+            waitMs: 0,
+            ...(request.limits === undefined ? {} : { limits: request.limits })
+          });
+        } catch (error) {
+          throw withEnvelopeDetails(
+            withAcceptedExecutionDetails(error, receipt.replay.executionId),
+            session.envelope({
+              requestAccepted: true,
+              replayed: true,
+              firstAcceptedAt: receipt.firstAcceptedAt
+            })
+          );
+        }
         return {
           ...view,
           ...session.envelope({
@@ -1708,7 +1743,6 @@ class CollabServiceImpl implements CollabService {
    * the cell are read at most once, and only when something was cut.
    */
   #outputEntries(
-    session: WorkingSession,
     handle: NotebookHandle,
     cell: {
       readonly cellId: string;
@@ -1721,7 +1755,8 @@ class CollabServiceImpl implements CollabService {
         readonly output?: NbOutput;
         readonly textPreview?: string;
       }[];
-    }
+    },
+    snapshots: OutputSnapshotWriter
   ): OutputEntry[] {
     const anyTruncated = cell.outputs.some((output) => output.truncated);
     const full = anyTruncated
@@ -1735,7 +1770,7 @@ class CollabServiceImpl implements CollabService {
           read.index,
           { remaining: Number.MAX_SAFE_INTEGER, maxOutputBytes: Number.MAX_SAFE_INTEGER },
           { notebookId: handle.notebookId, executionId: 'read', cellId: cell.cellId },
-          session.outputs
+          snapshots
         );
       }
       const payload = full.find((entry) => entry.index === read.index)?.output;
@@ -1754,7 +1789,7 @@ class CollabServiceImpl implements CollabService {
         read.index,
         { remaining: 0, maxOutputBytes: 0 },
         { notebookId: handle.notebookId, executionId: 'read', cellId: cell.cellId },
-        session.outputs
+        snapshots
       );
       return {
         ...entry,

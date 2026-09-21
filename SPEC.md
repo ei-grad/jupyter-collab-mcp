@@ -968,6 +968,14 @@ host resource support does not make the execution result inaccessible.
 [MCP resource links](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#resource-links),
 [MCP resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources)
 
+Every `output_id` advertised by a successful `notebook_read(view: outputs)`,
+`notebook_execute`, or `execution_get` remains readable when that response is
+returned. The bounded snapshot store reserves the full advertised set before
+publishing a result; if the set or one snapshot cannot be retained, the call
+returns `RESOURCE_LIMIT` instead of a dead reference. An execution that was
+already accepted retains its receipt, `execution_id`, and acceptance envelope
+on that observation failure.
+
 `notebook_read(view: "outputs")` enforces `max_output_bytes` independently for
 each inlined output, in addition to the aggregate `max_bytes` budget, whether
 cells are selected explicitly, implicitly, or through a paging cursor. An

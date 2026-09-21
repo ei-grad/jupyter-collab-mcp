@@ -86,9 +86,9 @@ describe('OutputStore', () => {
   });
 
   it('an evicted snapshot answers HANDLE_EXPIRED', () => {
-    const store = new OutputStore('sess_1', 16);
+    const store = new OutputStore('sess_1', 64);
     const first = store.intern(ADDRESS, { ...stream, text: 'a'.repeat(64) } as NbOutput);
-    store.intern({ ...ADDRESS, index: 1 }, { ...stream, text: 'b'.repeat(64) } as NbOutput);
+    const second = store.intern({ ...ADDRESS, index: 1 }, { ...stream, text: 'b'.repeat(64) } as NbOutput);
     let code = 'no-error';
     try {
       store.require(first.outputId);
@@ -96,6 +96,7 @@ describe('OutputStore', () => {
       code = isCoreError(error) ? error.code : 'other';
     }
     expect(code).toBe('HANDLE_EXPIRED');
+    expect(store.require(second.outputId).bytes.toString('utf8')).toBe('b'.repeat(64));
   });
 
   it('clear() drops everything, as session_close does', () => {

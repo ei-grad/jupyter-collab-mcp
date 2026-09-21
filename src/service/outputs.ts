@@ -66,6 +66,16 @@ export interface OutputAddress {
   readonly index: number;
 }
 
+/** A destination that assigns stable snapshots while a response is built. */
+export interface OutputSnapshotWriter {
+  intern(address: OutputAddress, output: NbOutput): OutputSnapshot;
+}
+
+/** A response-scoped snapshot writer that publishes all entries atomically. */
+export interface OutputSnapshotTransaction extends OutputSnapshotWriter {
+  commit(): void;
+}
+
 /** MIME types a host can render as image content (SPEC.md §9). */
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg']);
 
@@ -193,6 +203,36 @@ export class OutputStore {
    * it returns the same snapshot rather than a second copy.
    */
   intern(address: OutputAddress, output: NbOutput): OutputSnapshot {
+    const transaction = this.begin();
+    const snapshot = transaction.intern(address, output);
+    transaction.commit();
+    return snapshot;
+  }
+
+  /** Build a response's snapshots before publishing any of their IDs. */
+  begin(): OutputSnapshotTransaction {
+    const candidates = new Map<string, OutputSnapshot>();
+    let committed = false;
+    return {
+      intern: (address, output) => {
+        if (committed) throw new Error('an output snapshot transaction is already committed');
+        const candidate = this.#candidate(address, output);
+        const known = candidates.get(candidate.key);
+        if (known !== undefined) return known;
+        const existing = this.#snapshotForKey(candidate.key);
+        const snapshot = existing ?? candidate.snapshot;
+        candidates.set(candidate.key, snapshot);
+        return snapshot;
+      },
+      commit: () => {
+        if (committed) return;
+        this.#commit(candidates);
+        committed = true;
+      }
+    };
+  }
+
+  #candidate(address: OutputAddress, output: NbOutput): { key: string; snapshot: OutputSnapshot } {
     const payload = payloadOf(output);
     const digest = createHash('sha256').update(payload.bytes).digest('hex').slice(0, 32);
     const key = [
@@ -202,12 +242,6 @@ export class OutputStore {
       payload.mimeType,
       digest
     ].join(' ');
-    const existingId = this.#byKey.get(key);
-    if (existingId !== undefined) {
-      const existing = this.#byId.get(existingId);
-      if (existing !== undefined) return existing;
-      this.#byKey.delete(key);
-    }
     const outputId = `out_${randomUUID()}`;
     const mimeTypes = mimeTypesOf(output);
     const snapshot: OutputSnapshot = {
@@ -227,11 +261,7 @@ export class OutputStore {
       name: `cell ${address.cellId} (${payload.mimeType})`,
       inlineImageAdvised: IMAGE_TYPES.has(payload.mimeType)
     };
-    this.#byId.set(outputId, snapshot);
-    this.#byKey.set(key, outputId);
-    this.#used += snapshot.byteSize;
-    this.#evict(outputId);
-    return snapshot;
+    return { key, snapshot };
   }
 
   /**
@@ -267,16 +297,56 @@ export class OutputStore {
     this.#used = 0;
   }
 
-  /** Evict oldest snapshots until the budget holds; never the newest one. */
-  #evict(keepId: string): void {
+  #snapshotForKey(key: string): OutputSnapshot | undefined {
+    const outputId = this.#byKey.get(key);
+    if (outputId === undefined) return undefined;
+    const snapshot = this.#byId.get(outputId);
+    if (snapshot !== undefined) return snapshot;
+    this.#byKey.delete(key);
+    return undefined;
+  }
+
+  #commit(candidates: ReadonlyMap<string, OutputSnapshot>): void {
+    const snapshots = [...candidates.values()];
+    const retainedBytes = snapshots.reduce((total, snapshot) => total + snapshot.byteSize, 0);
+    if (retainedBytes > this.#maxBytes) {
+      throw coreError('RESOURCE_LIMIT', 'output snapshots for one response exceed the retained-output budget', {
+        details: { output_bytes: retainedBytes, output_store_max_bytes: this.#maxBytes }
+      });
+    }
+    const retainedIds = new Set(snapshots
+      .filter((snapshot) => this.#byId.get(snapshot.outputId) === snapshot)
+      .map((snapshot) => snapshot.outputId));
+    const additions = snapshots.filter((snapshot) => !retainedIds.has(snapshot.outputId));
+    const additionalBytes = additions.reduce((total, snapshot) => total + snapshot.byteSize, 0);
+    this.#evictFor(additionalBytes, retainedIds);
+    for (const [key, snapshot] of candidates) {
+      if (retainedIds.has(snapshot.outputId)) continue;
+      this.#byId.set(snapshot.outputId, snapshot);
+      this.#byKey.set(key, snapshot.outputId);
+      this.#used += snapshot.byteSize;
+    }
+  }
+
+  /** Evict oldest unrequested snapshots until the response can be retained. */
+  #evictFor(additionalBytes: number, retainedIds: ReadonlySet<string>): void {
     for (const [id, snapshot] of this.#byId) {
-      if (this.#used <= this.#maxBytes) return;
-      if (id === keepId) continue;
-      this.#byId.delete(id);
-      this.#used -= snapshot.byteSize;
-      for (const [key, value] of this.#byKey) {
-        if (value === id) this.#byKey.delete(key);
-      }
+      if (this.#used + additionalBytes <= this.#maxBytes) return;
+      if (retainedIds.has(id)) continue;
+      this.#drop(id, snapshot);
+    }
+    if (this.#used + additionalBytes > this.#maxBytes) {
+      throw coreError('RESOURCE_LIMIT', 'output snapshots for one response exceed the retained-output budget', {
+        details: { output_store_max_bytes: this.#maxBytes }
+      });
+    }
+  }
+
+  #drop(id: string, snapshot: OutputSnapshot): void {
+    this.#byId.delete(id);
+    this.#used -= snapshot.byteSize;
+    for (const [key, value] of this.#byKey) {
+      if (value === id) this.#byKey.delete(key);
     }
   }
 }

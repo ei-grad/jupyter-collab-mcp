@@ -1,11 +1,12 @@
 import { afterAll, afterEach, beforeAll, expect, it } from 'vitest';
-import type { CollabService, ExecutionView, NotebookExecuteRequest } from '../../src/core/index.js';
+import { isCoreError, type CollabService, type ExecutionView, type NotebookExecuteRequest } from '../../src/core/index.js';
 import { createCollabService } from '../../src/service/index.js';
 import { startStand, type Stand } from '../helpers/stand.js';
 
 let stand: Stand;
 let service: CollabService;
-const opened: Array<{ notebookId: string; kernelId: string }> = [];
+const opened: Array<{ owner: CollabService; notebookId: string; kernelId: string }> = [];
+const extraServices: CollabService[] = [];
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'unknown']);
 
 beforeAll(async () => {
@@ -15,19 +16,20 @@ beforeAll(async () => {
 
 afterEach(async () => {
   for (const entry of opened.splice(0)) {
-    await service.kernelControl({ notebookId: entry.notebookId, requestId: (await service.serverList()).nextRequestId!, action: 'shutdown', expectedKernelId: entry.kernelId });
-    await service.notebookClose({ notebookId: entry.notebookId, force: true });
+    await entry.owner.kernelControl({ notebookId: entry.notebookId, requestId: (await entry.owner.serverList()).nextRequestId!, action: 'shutdown', expectedKernelId: entry.kernelId });
+    await entry.owner.notebookClose({ notebookId: entry.notebookId, force: true });
   }
+  await Promise.all(extraServices.splice(0).map((entry) => entry.shutdown('client_request')));
 });
 
 afterAll(async () => { await service?.shutdown('client_request'); await stand?.stop(); }, 120_000);
 
-async function prepare(sources: string[]): Promise<NotebookExecuteRequest> {
-  const created = await service.notebookCreate({ requestId: (await service.serverList()).nextRequestId!, directory: '', name: `completion-${Date.now()}-${Math.random().toString(36).slice(2)}.ipynb` });
-  const applied = await service.notebookApply({ notebookId: created.notebook.notebookId, requestId: created.nextRequestId!,
+async function prepare(sources: string[], owner = service): Promise<NotebookExecuteRequest> {
+  const created = await owner.notebookCreate({ requestId: (await owner.serverList()).nextRequestId!, directory: '', name: `completion-${Date.now()}-${Math.random().toString(36).slice(2)}.ipynb` });
+  const applied = await owner.notebookApply({ notebookId: created.notebook.notebookId, requestId: created.nextRequestId!,
     operations: sources.map((source) => ({ op: 'add_cell', cellType: 'code', source, position: 'end' })) });
-  const started = await service.kernelControl({ notebookId: created.notebook.notebookId, requestId: applied.nextRequestId!, action: 'start', expectedKernelId: null, kernelName: 'python3' });
-  opened.push({ notebookId: created.notebook.notebookId, kernelId: started.kernelId! });
+  const started = await owner.kernelControl({ notebookId: created.notebook.notebookId, requestId: applied.nextRequestId!, action: 'start', expectedKernelId: null, kernelName: 'python3' });
+  opened.push({ owner, notebookId: created.notebook.notebookId, kernelId: started.kernelId! });
   return { notebookId: created.notebook.notebookId, requestId: started.nextRequestId!, cells: applied.results.map((entry) => ({ cellId: entry.cellId!, expectedSourceRevision: entry.sourceRevision! })) };
 }
 
@@ -66,6 +68,67 @@ it('waits for quick success, replays once, and bounds persisted notebook outputs
   expect(entry.output).toBeUndefined();
   expect(entry.byteSize).toBeGreaterThan(40);
   expect((await service.outputRead({ outputId: entry.snapshot!.outputId })).data).toBe(`${'x'.repeat(75)}\n`);
+});
+
+it('preserves accepted execution recovery when its output snapshot set cannot fit', async () => {
+  const limited = createCollabService({
+    servers: [{ id: 'stand', kind: 'standalone', apiBaseUrl: stand.baseUrl, credentialRef: `literal:${stand.token}` }]
+  }, { guardStdout: false, outputStoreMaxBytes: 1000 });
+  extraServices.push(limited);
+  const request = await prepare([
+    'from IPython.display import display\nretention_runs = globals().get("retention_runs", 0) + 1\ndisplay("x" * 700)\ndisplay("y" * 700)'
+  ], limited);
+  const execute = { ...request, waitMs: 5000, limits: { maxOutputBytes: 1 } };
+
+  let firstError: unknown;
+  try {
+    await limited.notebookExecute(execute);
+  } catch (error) {
+    firstError = error;
+  }
+  expect(isCoreError(firstError) && firstError.code).toBe('RESOURCE_LIMIT');
+  expect(isCoreError(firstError) && firstError.sideEffects).toBe('applied');
+  const firstDetails = isCoreError(firstError) ? firstError.details ?? {} : {};
+  expect(firstDetails).toMatchObject({ request_accepted: true, replayed: false });
+  expect(firstDetails['execution_id']).toBeTypeOf('string');
+  expect(firstDetails['next_request_id']).toBeTypeOf('string');
+  expect(firstDetails['first_accepted_at']).toBeTypeOf('string');
+  const executionId = String(firstDetails['execution_id']);
+  const nextRequestId = String(firstDetails['next_request_id']);
+  const firstAcceptedAt = String(firstDetails['first_accepted_at']);
+
+  await expect(limited.executionGet({ executionId, limits: { maxOutputBytes: 1 } })).rejects.toSatisfy(
+    (error: unknown) => isCoreError(error) && error.code === 'RESOURCE_LIMIT'
+  );
+
+  let replayError: unknown;
+  try {
+    await limited.notebookExecute(execute);
+  } catch (error) {
+    replayError = error;
+  }
+  expect(isCoreError(replayError) && replayError.code).toBe('RESOURCE_LIMIT');
+  expect(isCoreError(replayError) && replayError.sideEffects).toBe('applied');
+  expect(isCoreError(replayError) ? replayError.details : {}).toMatchObject({
+    execution_id: executionId,
+    next_request_id: nextRequestId,
+    request_accepted: true,
+    replayed: true,
+    first_accepted_at: firstAcceptedAt
+  });
+
+  const probeCell = await limited.notebookApply({
+    notebookId: request.notebookId,
+    requestId: nextRequestId,
+    operations: [{ op: 'add_cell', cellType: 'code', source: 'assert retention_runs == 1', position: 'end' }]
+  });
+  const probe = await limited.notebookExecute({
+    notebookId: request.notebookId,
+    requestId: probeCell.nextRequestId!,
+    cells: [{ cellId: probeCell.results[0]!.cellId!, expectedSourceRevision: probeCell.results[0]!.sourceRevision! }],
+    waitMs: 5000
+  });
+  expect(probe.state).toBe('succeeded');
 });
 
 it('returns a quick Python failure as a terminal result without a timeout', async () => {

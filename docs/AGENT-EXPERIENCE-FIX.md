@@ -23,6 +23,9 @@ Acceptance criteria:
   replaced cell invalidates its source continuation.
 - Every successful `output_read` response, including escaped text and base64,
   fits its configured MCP budget and paged chunks reassemble exactly.
+- Every output reference advertised by a successful read or execution result is
+  immediately readable; a response that cannot retain its complete snapshot
+  set reports `RESOURCE_LIMIT` instead.
 - Sanitized recovery details that are needed to continue are visible in error
   text as well as structured metadata.
 - Text content alone exposes valid aliases/cursors plus cell source and

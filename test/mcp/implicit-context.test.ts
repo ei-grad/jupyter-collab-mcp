@@ -227,6 +227,13 @@ describe('implicit MCP working context', () => {
       view: 'cells',
       cell_ids: [malformedRaw]
     }))['code']).toBe('INVALID_ARGUMENT');
+    for (const invalidUtf8 of ['raw:_w', 'raw:QP8']) {
+      expect(metaError(await connection.call('notebook_read', {
+        notebook_id: notebookId,
+        view: 'cells',
+        cell_ids: [invalidUtf8]
+      }))['code']).toBe('INVALID_ARGUMENT');
+    }
 
     const sourceRevision = String((read.structuredContent?.['cells'] as Record<string, unknown>[])[0]!['source_revision']);
     expect((await connection.call('notebook_apply', {

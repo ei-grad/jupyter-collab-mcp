@@ -38,6 +38,7 @@ import {
   mimeTypesOf,
   nbText,
   outputByteSize,
+  type OutputSnapshotWriter,
   type OutputStore
 } from './outputs.js';
 
@@ -257,7 +258,7 @@ export function toOutputEntry(
   index: number,
   budget: { remaining: number; maxOutputBytes: number },
   address: { notebookId: string; executionId: string; cellId: string },
-  store: OutputStore
+  store: OutputSnapshotWriter
 ): OutputEntry {
   const byteSize = outputByteSize(output);
   const mimeTypes = mimeTypesOf(output);
@@ -308,7 +309,7 @@ function cellView(
   outputsReset: boolean,
   budget: { remaining: number; maxOutputBytes: number },
   address: { notebookId: string; executionId: string },
-  store: OutputStore
+  store: OutputSnapshotWriter
 ): ExecutionCellView {
   const entries: OutputEntry[] = [];
   let truncated = false;
@@ -355,6 +356,7 @@ export function buildExecutionView(
   const address = { notebookId: record.notebookId, executionId: record.executionId };
   const cells: ExecutionCellView[] = [];
   const positions: ExecutionOutputPosition[] = [];
+  const outputs = options.outputs.begin();
   snapshot.job.cells.forEach((cell, position) => {
     const previous = options.positions?.[position];
     const sameVersion = previous?.version === cell.outputVersion;
@@ -370,12 +372,13 @@ export function buildExecutionView(
       previous !== undefined && !sameVersion,
       budget,
       address,
-      options.outputs
+      outputs
     );
     cells.push(view);
     const last = view.outputs.length === 0 ? from : view.outputs[view.outputs.length - 1]!.index + 1;
     positions.push({ version: cell.outputVersion, delivered: Math.max(from, last) });
   });
+  outputs.commit();
   return {
     executionId: record.executionId,
     notebookId: record.notebookId,
