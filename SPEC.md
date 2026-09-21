@@ -580,11 +580,16 @@ state; UI validation is required for the selected version combination.
 Execution states are `queued`, `running`, `succeeded`, `failed`, `cancelled`,
 `interrupted`, and `unknown`. Python errors and kernel `aborted` have distinct
 causes; by default an error stops the remaining cells. `wait_ms` limits only
-how long the MCP response waits; computation may continue. `execution_get` can
+how long the MCP response waits; computation may continue. `notebook_execute`
+may return on the first kernel update, including startup or state updates,
+with a running job and `wait_timed_out: false`. It does not wait specifically
+for completion. Follow its cursor with `execution_get` to observe progress.
+`execution_get` can
 wait for a state change and retrieve new output. A waiting read is answered at
 once when the state it waits for is already there - undelivered changes after
-the cursor, or a job in a terminal state, from which no further change can
-come. `wait_timed_out` is true only when the call consumed the whole `wait_ms`
+the cursor, or a job in a terminal state. Terminal reads do not long-poll;
+late output may still arrive and can be retrieved in a subsequent read.
+`wait_timed_out` is true only when the call consumed the whole `wait_ms`
 without observing a change; every earlier answer, including such an immediate
 one, reports false. A long computation does not block reads, RTC updates, or
 kernel control.
@@ -659,6 +664,13 @@ including for code with external effects.
 ## 9. MCP interface
 
 Tools have static names, JSON Schemas for input/output, and effect descriptions.
+Every tool input schema exposes its parameters as top-level `properties` of
+an object, without root-level `oneOf`, `anyOf`, or `allOf`. Action- or view-specific
+constraints are described on the fields and validated before service dispatch;
+in particular, switch requires a kernel name and interrupt/restart/shutdown
+require a non-null expected kernel id.
+Ignored action fields, such as `kernel_name` for interrupt/restart/shutdown,
+must not affect request identity or replay.
 Common kernel operations are grouped, and reads are separated from writes. No
 tool depends on host-supported background notifications; ordinary tool calls
 read results and changes.

@@ -187,6 +187,13 @@ describe('HTTP mode with the canonical stdio CLI', () => {
 
     const tools = await rpc(baseUrl, 'first', 'tools/list');
     expect(tools['tools']).toHaveLength(16);
+    for (const tool of tools['tools'] as Array<{ name: string; inputSchema: Record<string, unknown> }>) {
+      expect(tool.inputSchema['type'], tool.name).toBe('object');
+      expect(tool.inputSchema['properties'], tool.name).toBeDefined();
+      for (const keyword of ['oneOf', 'anyOf', 'allOf']) {
+        expect(tool.inputSchema, tool.name).not.toHaveProperty(keyword);
+      }
+    }
     // An accepted Contents failure consumes exactly one number. The implicit
     // context must survive credential renewal and remain private to its worker.
     const first = await call(baseUrl, 'first', 'notebook_create', { directory: '', request_id: '1' });

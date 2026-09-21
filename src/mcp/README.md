@@ -33,11 +33,15 @@ The following points are explicit:
   error after acceptance consumes it even when the operation fails;
 - for `notebook_execute` and `execution_get`, a Python error, `aborted`,
   `interrupted`, or `unknown` is a job state rather than a tool error;
-- `kernel_control` is a discriminated union on `action`
-  (`start`/`interrupt`/`restart`/`shutdown`/`switch`), with branch-specific
-  required fields; `expected_kernel_id` is always required;
-- `notebook_read` is a discriminated union on `view`
-  (`summary`/`cells`/`outputs`).
+- every input schema exposes top-level object properties, including
+  `kernel_control.action` (`start`/`interrupt`/`restart`/`shutdown`/`switch`)
+  and `notebook_read.view` (`summary`/`cells`/`outputs`);
+- `kernel_control` validates action-specific requirements in the adapter:
+  `expected_kernel_id` is always required and must be non-null for
+  interrupt/restart/shutdown; switch also requires `kernel_name`;
+- `notebook_execute.wait_ms` waits for the next kernel update, which may be a
+  startup message. Follow the returned cursor with `execution_get` until the
+  job reaches a terminal state.
 
 ### Session envelope
 

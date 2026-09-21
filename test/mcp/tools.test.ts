@@ -60,6 +60,11 @@ describe('tools/list', () => {
     expect(names).toHaveLength(16);
     for (const tool of listed.tools) {
       expect(tool.inputSchema, tool.name).toBeDefined();
+      expect(tool.inputSchema.type, tool.name).toBe('object');
+      expect(tool.inputSchema.properties, tool.name).toBeDefined();
+      for (const keyword of ['oneOf', 'anyOf', 'allOf']) {
+        expect(tool.inputSchema, tool.name).not.toHaveProperty(keyword);
+      }
       expect(tool.outputSchema, tool.name).toBeDefined();
       expect(tool.description ?? '', tool.name).not.toBe('');
     }
@@ -74,11 +79,8 @@ describe('tools/list', () => {
       .sort();
     expect(deduplicated).toEqual([...DEDUPLICATED_TOOLS].sort());
     for (const name of deduplicated) {
-      const schema = listed.tools.find((tool) => tool.name === name)?.inputSchema as
-        | { properties?: Record<string, unknown>; oneOf?: { properties?: Record<string, unknown> }[] }
-        | undefined;
-      const branch = schema?.properties ?? schema?.oneOf?.[0]?.properties ?? {};
-      expect(Object.keys(branch), name).toContain('request_id');
+      const schema = listed.tools.find((tool) => tool.name === name)?.inputSchema;
+      expect(Object.keys(schema?.properties ?? {}), name).toContain('request_id');
     }
   });
 
@@ -159,12 +161,28 @@ describe('every tool round-trips', () => {
 });
 
 describe('argument validation', () => {
+  it.each(['interrupt', 'restart', 'shutdown'])('ignores kernel_name for %s before dispatch', async (action) => {
+    harness = await connect();
+    const args = { notebook_id: 'nb_1', request_id: '1', action, expected_kernel_id: 'kernel_1' };
+    const first = await harness.call('kernel_control', args);
+    expect(first.isError ?? false).toBe(false);
+    const original = harness.fake.lastRequest('kernelControl');
+    const replay = await harness.call('kernel_control', { ...args, kernel_name: 'ignored' });
+    expect(replay.isError ?? false).toBe(false);
+    expect(harness.fake.calls).toHaveLength(2);
+    expect(harness.fake.lastRequest('kernelControl')).toEqual(original);
+  });
+
   const bad: [string, Record<string, unknown>, RegExp][] = [
     ['notebook_read', { view: 'summary' }, /notebook_id/u],
     ['notebook_read', { notebook_id: 'nb_1', view: 'nonsense' }, /view/u],
     ['notebook_apply', { notebook_id: 'nb_1', request_id: '1', operations: [] }, /operations/u],
     ['notebook_execute', { notebook_id: 'nb_1', request_id: '007', cells: [] }, /request_id|cells/u],
     ['kernel_control', { notebook_id: 'nb_1', request_id: '1', action: 'interrupt' }, /expected_kernel_id/u],
+    ...['interrupt', 'restart', 'shutdown'].map((action): [string, Record<string, unknown>, RegExp] =>
+      ['kernel_control', { notebook_id: 'nb_1', request_id: '1', action, expected_kernel_id: null }, /expected_kernel_id/u]),
+    ['kernel_control', { notebook_id: 'nb_1', request_id: '1', action: 'switch', expected_kernel_id: null }, /kernel_name/u],
+    ['kernel_control', { notebook_id: 'nb_1', request_id: '1', action: 'unknown', expected_kernel_id: null }, /action/u],
     ['kernel_list', { server_id: 42 }, /server_id/u]
   ];
 

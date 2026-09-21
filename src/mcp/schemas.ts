@@ -509,28 +509,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     title: 'Read a notebook',
     description:
       'Read the live replica: view "summary" (one row per cell with revisions and a preview), "cells" (source, metadata, attachments) or "outputs" (bounded outputs with an output_id for anything large). The snapshot and changes_cursor are taken together, so nothing can slip between them. Before readiness the current snapshot is served and marked stale. Read-only, takes no request_id — and the cheapest way to recover next_request_id after losing your counter.',
-    input: z.discriminatedUnion('view', [
-      z.object({
-        notebook_id: notebookId,
-        view: z.literal('summary'),
-        cursor: z.string().optional().describe('page_cursor from a previous page. Bound to the structural revision: a structural change gives CURSOR_EXPIRED.'),
-        limits
-      }),
-      z.object({
-        notebook_id: notebookId,
-        view: z.literal('cells'),
-        cell_ids: z.array(z.string()).optional().describe('Explicit selection. Mutually exclusive with cursor.'),
-        cursor: z.string().optional(),
-        limits
-      }),
-      z.object({
-        notebook_id: notebookId,
-        view: z.literal('outputs'),
-        cell_ids: z.array(z.string()).optional(),
-        cursor: z.string().optional(),
-        limits
-      })
-    ]),
+    input: z.object({
+      notebook_id: notebookId,
+      view: z.enum(['summary', 'cells', 'outputs']),
+      cell_ids: z.array(z.string()).optional().describe('Explicit selection for cells or outputs. Mutually exclusive with cursor; ignored for summary.'),
+      cursor: z.string().optional().describe('page_cursor from a previous page. Bound to the structural revision: a structural change gives CURSOR_EXPIRED.'),
+      limits
+    }),
     output: result(
       {
         notebook_id: str(),
@@ -614,7 +599,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_execute',
     title: 'Run cells',
     description:
-      `Queue code cells on the notebook's bound kernel, in order, one at a time. Before each cell its outputs are cleared and execution_state is set to running; the final execution_count and idle are written when it completes. ${SEQUENTIAL} wait_ms bounds the answer only — when it elapses the job keeps running and execution_get reads the rest; nothing is interrupted and nothing is re-sent. ${NOT_A_TOOL_ERROR} Requires a bound kernel (kernel_control action:"start"), otherwise KERNEL_NOT_BOUND before any output is touched. The execution handle lives until notebook_close or connection close; output snapshots remain available until bounded-store eviction or connection close.`,
+      `Queue code cells on the notebook's bound kernel, in order, one at a time. Before each cell its outputs are cleared and execution_state is set to running; the final execution_count and idle are written when it completes. ${SEQUENTIAL} wait_ms waits for the next kernel update, not necessarily completion: startup, state or output updates can return running immediately with wait_timed_out:false. Follow the returned cursor with execution_get until a terminal state. When the wait elapses the job keeps running; nothing is interrupted and nothing is re-sent. ${NOT_A_TOOL_ERROR} Requires a bound kernel (kernel_control action:"start"), otherwise KERNEL_NOT_BOUND before any output is touched. The execution handle lives until notebook_close or connection close; output snapshots remain available until bounded-store eviction or connection close.`,
     input: z.object({
       notebook_id: notebookId,
       request_id: requestId,
@@ -804,40 +789,25 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     title: 'Control the kernel',
     description:
       `Bind or act on the notebook's kernel. "start" reuses the single existing Jupyter session for this path or creates one; "interrupt", "restart" and "shutdown" act on the whole kernel and may hit another participant's code; "switch" rebinds to another kernelspec. Restart clears no outputs and re-runs no cells. Every action requires expected_kernel_id so it cannot land on a kernel you did not mean — a mismatch is KERNEL_CHANGED. ${SEQUENTIAL} A lost confirmation is OPERATION_UNCERTAIN and the effect is never re-issued.`,
-    input: z.discriminatedUnion('action', [
-      z.object({
-        notebook_id: notebookId,
-        request_id: requestId,
-        action: z.literal('start'),
-        expected_kernel_id: z.union([z.string().min(1), z.null()]).describe('null is the verified statement "nothing is bound".'),
-        kernel_name: z.string().min(1).optional().describe('Omitted, the server default kernelspec is used.')
-      }),
-      z.object({
-        notebook_id: notebookId,
-        request_id: requestId,
-        action: z.literal('interrupt'),
-        expected_kernel_id: z.string().min(1)
-      }),
-      z.object({
-        notebook_id: notebookId,
-        request_id: requestId,
-        action: z.literal('restart'),
-        expected_kernel_id: z.string().min(1)
-      }),
-      z.object({
-        notebook_id: notebookId,
-        request_id: requestId,
-        action: z.literal('shutdown'),
-        expected_kernel_id: z.string().min(1)
-      }),
-      z.object({
-        notebook_id: notebookId,
-        request_id: requestId,
-        action: z.literal('switch'),
-        expected_kernel_id: z.union([z.string().min(1), z.null()]),
-        kernel_name: z.string().min(1)
-      })
-    ]),
+    input: z.object({
+      notebook_id: notebookId,
+      request_id: requestId,
+      action: z.enum(['start', 'interrupt', 'restart', 'shutdown', 'switch']),
+      expected_kernel_id: z.string().min(1).nullable().describe('Required for every action. null means "nothing is bound" and is allowed only for start or switch; interrupt, restart and shutdown require a nonempty kernel id.'),
+      kernel_name: z.string().min(1).optional().describe('Required for switch. Optional for start (defaults to the server kernelspec); ignored for other actions.')
+    }).superRefine((args, context) => {
+      if (args.action !== 'start' && args.action !== 'switch' && args.expected_kernel_id === null) {
+        context.addIssue({ code: 'custom', path: ['expected_kernel_id'], message: 'expected_kernel_id must be a nonempty kernel id for this action' });
+      }
+      if (args.action === 'switch' && args.kernel_name === undefined) {
+        context.addIssue({ code: 'custom', path: ['kernel_name'], message: 'kernel_name is required for switch' });
+      }
+    }).overwrite((args) => {
+      if (args.action === 'start' || args.action === 'switch') return args;
+      // Ignored fields must not change the service's idempotency payload.
+      const { kernel_name: _ignored, ...normalized } = args;
+      return normalized;
+    }),
     output: result(
       {
         notebook_id: str(),

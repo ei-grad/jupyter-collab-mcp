@@ -140,16 +140,18 @@ describe('protocol surface', () => {
     );
     for (const tool of tools) {
       expect(tool.inputSchema, `${tool.name} inputSchema`).toBeDefined();
+      expect(tool.inputSchema.type, tool.name).toBe('object');
+      expect(tool.inputSchema.properties, tool.name).toBeDefined();
+      for (const keyword of ['oneOf', 'anyOf', 'allOf']) {
+        expect(tool.inputSchema, tool.name).not.toHaveProperty(keyword);
+      }
       expect(tool.outputSchema, `${tool.name} outputSchema`).toBeDefined();
       expect(String(tool.description ?? '').length).toBeGreaterThan(40);
     }
     // The four deduplicated mutations, and only those, take a request_id.
-    // A discriminated union publishes `anyOf`, so look one level down too.
     const takesRequestId = (schema: unknown): boolean => {
       const node = obj(schema);
-      if ('request_id' in obj(node['properties'])) return true;
-      const branches = node['anyOf'] ?? node['oneOf'];
-      return Array.isArray(branches) && branches.every((branch) => takesRequestId(branch));
+      return 'request_id' in obj(node['properties']);
     };
     const withRequestId = tools
       .filter((tool) => takesRequestId(tool.inputSchema))
@@ -781,7 +783,7 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
       expected_kernel_id: switched['kernel_id']
     };
     const stopped = await mcp.call('kernel_control', shutdownPayload);
-    const shutdownReplay = await mcp.call('kernel_control', shutdownPayload);
+    const shutdownReplay = await mcp.call('kernel_control', { ...shutdownPayload, kernel_name: 'ignored' });
     expect(stopped['kernel_id']).toBeNull();
     expect(shutdownReplay['replayed']).toBe(true);
     expect(shutdownReplay['kernel_id']).toBeNull();
@@ -1008,17 +1010,18 @@ describe('Interruption and cancellation (SPEC §12)', () => {
       request_id: session.counter.value,
       cells,
       stop_on_error: false,
-      wait_ms: 500
+      wait_ms: 20_000
     };
+    const submittedAt = Date.now();
     const job = await mcp.call('notebook_execute', executionPayload);
+    expect(Date.now() - submittedAt).toBeLessThan(20_000);
+    expect(job['wait_timed_out']).toBe(false);
     const replay = await mcp.call('notebook_execute', executionPayload);
     expect(replay['replayed']).toBe(true);
     expect(replay['execution_id']).toBe(job['execution_id']);
     session.counter.take(job);
     const executionId = str(job['execution_id']);
-    // Still running when the wait ended - the answer is bounded, the job is
-    // not. (`wait_timed_out` is only true when nothing changed during the
-    // wait; the marker output normally arrives first.)
+    // Startup or output updates answer the wait before execution finishes.
     expect(job['state']).toBe('running');
 
     // The wait ending killed nothing: the kernel is still busy with our cell.
@@ -1033,6 +1036,20 @@ describe('Interruption and cancellation (SPEC §12)', () => {
       sawMarker = JSON.stringify(list(list(view['cells'])[0]?.['outputs'])).includes('running');
     }
     expect(sawMarker, 'the long cell started printing').toBe(true);
+
+    let quiet = await mcp.call('execution_get', { execution_id: executionId });
+    const quietDeadline = Date.now() + 10_000;
+    while (quiet['wait_timed_out'] !== true && Date.now() < quietDeadline) {
+      const waitingAt = Date.now();
+      quiet = await mcp.call('execution_get', {
+        execution_id: executionId,
+        cursor: quiet['cursor'],
+        wait_ms: 300
+      });
+      if (quiet['wait_timed_out'] === true) expect(Date.now() - waitingAt).toBeGreaterThanOrEqual(280);
+    }
+    expect(quiet['state']).toBe('running');
+    expect(quiet['wait_timed_out']).toBe(true);
 
     // -- execution_cancel drops what was not sent, and interrupts nothing ---
     const cancelled = await mcp.call('execution_cancel', { execution_id: executionId });
