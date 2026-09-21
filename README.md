@@ -12,7 +12,7 @@ meanwhile. One long-lived process holds the sessions, the replicas and the
 kernel bindings; every tool call is an ordinary request/response.
 
 Status: the RTC client, notebook model, execution layer, stateful service and
-16-tool MCP adapter are implemented. Unit, integration, acceptance and
+18-tool MCP adapter are implemented. Unit, integration, acceptance and
 end-to-end suites cover the package; remaining limitations are tracked in
 [docs/STATUS.md](docs/STATUS.md) and the normative behavior is in
 [SPEC.md](SPEC.md).
@@ -64,6 +64,8 @@ see [skill/README.md](skill/README.md).
 | Tool | Purpose |
 | --- | --- |
 | `server_list` | Configured/discovered servers, credential-free descriptors |
+| `server_status` | Read readiness and available Hub start profiles |
+| `server_start` | Explicitly start or join the configured own-user Hub server |
 | `notebook_list` | List notebooks in a directory, with kernel session info |
 | `notebook_create` | Untitled -> optional rename -> open; returns the real path |
 | `notebook_open` | Join the shared document; reusable handle + summary |
@@ -101,7 +103,7 @@ Output snapshots are also exposed as `jupyter-output:` MCP resources
   `persistence` separately: a sent update proves neither that the server
   applied it nor that the file was written. Only `notebook_save` speaks about
   the file, and `skipped`/`timeout` are not success.
-- **Deduplication is per connection context.** `notebook_create`,
+- **Deduplication is per connection context.** `server_start`, `notebook_create`,
   `notebook_apply`, `notebook_execute` and `kernel_control` take a
   `request_id` - a decimal counter that starts at `"1"` and is always taken
   from the previous response's `next_request_id`. Resending the same number

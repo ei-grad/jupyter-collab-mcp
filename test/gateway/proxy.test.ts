@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 import { createGatewayProxyHandler } from '../../src/gateway/proxy-server.js';
 import {
@@ -38,6 +39,13 @@ async function call(method: string, params: Record<string, unknown> = {}) {
 }
 
 describe('gateway MCP proxy', () => {
+  it('reports the package version during HTTP initialization', async () => {
+    const version = (JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version: string }).version;
+    const initialized = await call('initialize', {
+      protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'release-test', version: '1' }
+    });
+    expect('result' in initialized && initialized.result).toMatchObject({ serverInfo: { version } });
+  });
   it('preserves tool definitions, content, structured output, metadata and errors', async () => {
     const listed = await call('tools/list');
     expect('result' in listed && listed.result).toEqual({

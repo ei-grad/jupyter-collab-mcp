@@ -6,6 +6,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import type { WorkerSession } from './worker-registry.js';
+import { packageVersion } from '../version.js';
 
 export interface GatewayIdentity {
   readonly issuer: string;
@@ -174,7 +175,7 @@ export async function startNodeWorker(
       stderr: 'ignore'
     });
     client = new Client(
-      { name: 'jupyter-collab-mcp-gateway', version: '0.1.0' },
+      { name: 'jupyter-collab-mcp-gateway', version: packageVersion() },
       { versionNegotiation: { mode: 'legacy' } }
     );
     await client.connect(transport, {

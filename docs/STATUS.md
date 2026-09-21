@@ -1,6 +1,6 @@
 # Implementation status
 
-Status snapshot: 2026-09-17. The verified integration stack is JupyterLab
+Release snapshot: v0.2.0, 2026-09-21. The verified integration stack is JupyterLab
 4.6.3, jupyter-server 2.21.0, jupyter-collaboration 5.0.2,
 jupyter-server-ydoc 3.0.2, jupyter-ydoc 4.1.1, Node.js 24,
 `@jupyter/ydoc` 4.1.1, and `@jupyterlab/services` 7.6.3.
@@ -25,6 +25,7 @@ timings are intentionally omitted because they become stale as coverage grows.
 | §8 job queue, reducer, routing | `src/kernel` | done |
 | §8 kernel binding through Sessions API | `src/service` | done |
 | §9 MCP tools, resources, limits, and deduplication | `src/mcp`, `src/service` | done |
+| §9 optional Hub singleuser lifecycle | `src/jupyter`, `src/service`, `src/mcp` | explicit status/start, Hub 5/6 token auth and optional adapter |
 | §11 stdout guard, token redaction | `src/jupyter`, `src/core` | done |
 | §4 server/session/notebook/kernel registries | `src/service` | done |
 
@@ -49,7 +50,7 @@ timings are intentionally omitted because they become stale as coverage grows.
 | Headless and save | done | `pnpm smoke`, steps 1–10 |
 | Save uncertainty, Autosave | partial | `timeout`/`skipped`/`OPERATION_UNCERTAIN` and `{autosave:true}` exist; update/save race and debounce do not |
 | Document data | done | `roundtrip.test.ts` |
-| Tool coverage | done | all 16 tools have schemas, dispatch, and adapter tests |
+| Tool coverage | done | all 18 tools have schemas, dispatch, and adapter tests |
 | Create name | done | rename, `ALREADY_EXISTS`, and retained untitled result are covered |
 | Cursors and outputs | done | change/page/execution/output cursors, `output_read`, and resources |
 | Limits, cleanup, and credentials | done | service budgets, bounded receipts/snapshots, stdout isolation, redaction, and disposal tests |

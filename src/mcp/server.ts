@@ -26,6 +26,7 @@ import type { CallToolResult, ContentBlock, StandardSchemaWithJSON } from '@mode
 import type { z } from 'zod';
 
 import { coreError, redactCredentials, toCoreError } from '../core/index.js';
+import { packageVersion } from '../version.js';
 import type {
   CollabService,
   ServerStatusRequest,
@@ -117,7 +118,7 @@ interface ResolvedOptions {
 function resolve(options: McpServerOptions): ResolvedOptions {
   return {
     name: options.name ?? 'jupyter-collab-mcp',
-    version: options.version ?? '0.1.0',
+    version: options.version ?? packageVersion(),
     responseMaxBytes: options.responseMaxBytes ?? DEFAULT_RESPONSE_MAX_BYTES,
     imageMaxBytes: options.imageMaxBytes ?? 128 * 1024,
     maxImages: options.maxImages ?? 4,

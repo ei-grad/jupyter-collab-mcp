@@ -8,6 +8,7 @@ import {
 
 import type { GatewayIdentity } from './worker.js';
 import type { WorkerRegistry } from './worker-registry.js';
+import { packageVersion } from '../version.js';
 
 export type IdentityResolver = (
   authInfo: AuthInfo | undefined
@@ -54,7 +55,7 @@ export function createGatewayProxyServer(
   const server = new Server(
     {
       name: options.name ?? 'jupyter-collab-mcp-http',
-      version: options.version ?? '0.1.0'
+      version: options.version ?? packageVersion()
     },
     {
       capabilities: { tools: {}, resources: {} },

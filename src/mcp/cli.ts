@@ -19,13 +19,13 @@
  * @module
  */
 
-import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
 
 import type { CollabService, ServerProfile, ServiceConfig, ServiceConfigInput, ShutdownReason } from '../core/index.js';
 import { coreError, redactCredentials, toCoreError, withDefaults } from '../core/index.js';
+import { packageVersion } from '../version.js';
 
 /** Log levels of the stderr diagnostics, from quietest to loudest. */
 const LEVELS = ['silent', 'error', 'warn', 'info', 'debug'] as const;
@@ -69,16 +69,6 @@ export interface LoadedCliConfig {
 function requireValue(flag: string, value: string | undefined): string {
   if (value === undefined) throw coreError('INVALID_ARGUMENT', `${flag} needs a value`);
   return value;
-}
-
-function packageVersion(): string {
-  try {
-    const require = createRequire(import.meta.url);
-    const pkg = require('../../package.json') as { version?: string };
-    return pkg.version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
 }
 
 /**

@@ -195,6 +195,7 @@ describe('the cli child process', () => {
         expect(parsed.jsonrpc).toBe('2.0');
       }
       const answers = lines.map((line) => JSON.parse(line) as { id?: number; result?: Record<string, unknown> });
+      expect(answers.find((answer) => answer.id === 1)?.result?.['serverInfo']).toMatchObject({ version: PACKAGE_VERSION });
       const tools = answers.find((answer) => answer.id === 2)?.result?.['tools'] as { name: string }[];
       expect(tools).toHaveLength(18);
       const call = answers.find((answer) => answer.id === 3)?.result as { structuredContent?: Record<string, unknown> };

@@ -1060,6 +1060,9 @@ a token query, that URL is also redacted before logging.
 The installed package executable must start through the package manager's bin
 symlink and preserve the same `--help`, `--version`, stdio, and `--http`
 behavior as direct invocation of its target file.
+CLI version output and default MCP server/client implementation metadata use
+the installed package version, independent of the process working directory or
+private worker home. Explicit programmatic version overrides remain supported.
 [MCP stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)
 
 Support token authentication and validated HTTPS; cookie/XSRF and
