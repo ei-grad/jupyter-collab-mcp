@@ -230,15 +230,18 @@ describe('error mapping', () => {
       side_effects: 'none',
       next_request_id: '4',
       request_accepted: false,
-      execution_id: 'exec_1',
-      execution_ids: ['exec_1', 'exec_2'],
-      revision: 'rev_1'
+      execution_id: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e1$/u),
+      execution_ids: [
+        expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e1$/u),
+        expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e2$/u)
+      ],
+      revision: expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.r1$/u)
     });
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
     expect(text).toContain('KERNEL_NOT_BOUND');
     expect(text).toContain('next_request_id=4');
-    expect(text).toContain('execution_ids=exec_1,exec_2');
-    expect(text).toContain('"cell_id":"cell_1"');
+    expect(text).toMatch(/execution_ids=@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e1,@[A-Za-z0-9_-]+\.[1-9][0-9]*\.e2/u);
+    expect(text).toMatch(/"cell_id":"@[A-Za-z0-9_-]+\.[1-9][0-9]*\.c1"/u);
   });
 
   it('maps an unknown throw to INTERNAL_ERROR with side_effects unknown', async () => {

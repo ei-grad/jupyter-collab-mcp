@@ -159,7 +159,7 @@ describe('buildExecutionView', () => {
     expect(view.cells[0]?.outputs.every((entry) => entry.truncated === false)).toBe(true);
     expect(view.cells[0]?.executionCount).toBe(3);
     expect(view.lifetime.releasedBy).toContain('session_close');
-    expect(store.size).toBe(0);
+    expect(store.size).toBe(3);
   });
 
   it('a payload above the budget becomes a snapshot, never inline base64', () => {

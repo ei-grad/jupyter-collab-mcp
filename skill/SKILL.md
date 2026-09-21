@@ -42,8 +42,10 @@ Work from IDs and revisions, never from remembered line numbers.
 The server may return short connection-scoped references for notebook, cell,
 execution, output, and revision values. Pass them back exactly as returned;
 they preserve the full underlying identity and expire with the connection.
-Full values remain valid for compatible callers. If a cells read reports a
-source cursor, continue it before acting on the incomplete source.
+Full values remain valid for compatible callers. Values beginning with `@` are
+reserved references; pass a custom literal with that prefix as
+`raw:<base64url(UTF-8)>`. If a cells read reports a source cursor, continue it
+before acting on the incomplete source.
 
 Use the revision named by each guarded operation from the answer you just read:
 `source_revision` (text), `cell_revision` (whole cell), `outputs_revision`, or

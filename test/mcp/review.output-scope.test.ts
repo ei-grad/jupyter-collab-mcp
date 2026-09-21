@@ -152,4 +152,28 @@ describe('output snapshots stay inside their working context', () => {
     } while (cursor !== undefined);
     expect(chunks.join('')).toBe(output);
   });
+
+  it('gives text-only hosts an output_id for an otherwise inline output', async () => {
+    const { connection, handles } = await rig();
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const cellId = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_id']);
+    const output = 'text-only recovery\n'.repeat(512);
+    const cell = handles[0]!.notebook.getCell(0) as unknown as { setOutputs(outputs: unknown[]): void };
+    cell.setOutputs([{ output_type: 'stream', name: 'stdout', text: output }]);
+
+    const answer = await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'outputs',
+      cell_ids: [cellId]
+    });
+    const entry = ((((answer.structuredContent?.['cells'] as Record<string, unknown>[])[0]!['outputs'] as Record<string, unknown>[])[0]!));
+    expect(entry['truncated']).toBe(false);
+    const outputId = String((entry['snapshot'] as Record<string, unknown>)['output_id']);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(text).toContain(`output_id=${outputId}`);
+
+    const recovered = await connection.call('output_read', { output_id: outputId });
+    expect(recovered.structuredContent?.['data']).toBe(output);
+  });
 });

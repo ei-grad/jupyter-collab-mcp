@@ -147,8 +147,11 @@ explicitly reopens the document; unfinished code is not automatically retried.
 The MCP adapter may present notebook, durable cell, execution, output, and
 revision values as short typed references. Each reference expands only inside
 the connection that issued it, never in notebook payload data, and is never
-reused after close or restart. Full opaque values remain accepted for compatible
-callers and remain the values used for identity and revision comparisons.
+reused after close or restart. Its token carries a process epoch and connection
+generation, so an old token cannot select a new object. Full opaque values
+remain accepted for compatible callers and remain the values used for identity
+and revision comparisons. `@` begins the reserved reference namespace; a valid
+custom identifier beginning with `@` is passed as `raw:<base64url(UTF-8)>`.
 Creation-tool descriptions and responses state lifetimes: notebook handles
 last until explicitly closed or the connection context ends. Jobs are released
 with their notebook; bounded output snapshots expire on eviction or context

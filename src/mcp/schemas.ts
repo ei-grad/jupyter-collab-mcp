@@ -244,9 +244,9 @@ const KERNEL_STATUS: Record<string, JsonSchema> = {
 // ---------------------------------------------------------------------------
 
 const serverId = z.string().min(1).optional().describe('Jupyter server profile. Omit only when exactly one server is available; otherwise SERVER_SELECTION_REQUIRED.');
-const notebookId = z.string().min(1).describe('notebook_id from notebook_open or notebook_create. Full process-local IDs remain accepted; a short connection-scoped reference from a prior response is preferred.');
-const executionId = z.string().min(1).describe('execution_id from notebook_execute. Full process-local IDs remain accepted; a short connection-scoped reference from a prior response is preferred.');
-const outputId = z.string().min(1).describe('output_id from an outputs read or an execution result. Full process-local IDs remain accepted; a short connection-scoped reference from a prior response is preferred.');
+const notebookId = z.string().min(1).describe('notebook_id from notebook_open or notebook_create. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. A custom literal beginning with @ must be raw:<base64url(UTF-8)> to avoid ambiguity.');
+const executionId = z.string().min(1).describe('execution_id from notebook_execute. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. A custom literal beginning with @ must be raw:<base64url(UTF-8)>.');
+const outputId = z.string().min(1).describe('output_id from an outputs read or an execution result. Full process-local IDs remain accepted; use a connection-scoped @ reference from a prior response when available. A custom literal beginning with @ must be raw:<base64url(UTF-8)>.');
 
 const requestId = z
   .string()
@@ -255,7 +255,7 @@ const requestId = z
     'Canonical decimal request number of this connection, starting at "1" and growing by one. Always take it from next_request_id of the previous answer; never invent or reconstruct one. A repeat with the same payload replays the stored result; a different payload is REQUEST_ID_CONFLICT.'
   );
 
-const revision = (what: string) => z.string().min(1).describe(`Expected ${what} revision, taken from a previous read. A mismatch is REVISION_CONFLICT and nothing is applied. Full digests remain accepted; use the short connection-scoped reference returned by the server when available.`);
+const revision = (what: string) => z.string().min(1).describe(`Expected ${what} revision, taken from a previous read. A mismatch is REVISION_CONFLICT and nothing is applied. Full digests remain accepted; use the short connection-scoped @ reference returned by the server when available.`);
 
 const limits = z
   .object({

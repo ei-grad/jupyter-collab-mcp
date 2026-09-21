@@ -261,12 +261,27 @@ export function toOutputEntry(
 ): OutputEntry {
   const byteSize = outputByteSize(output);
   const mimeTypes = mimeTypesOf(output);
+  const snapshot = store.intern({ ...address, index }, output);
   const fits = byteSize <= Math.min(budget.remaining, budget.maxOutputBytes);
   if (fits) {
     budget.remaining -= byteSize;
-    return { index, outputType: output.output_type, mimeTypes, byteSize, truncated: false, output };
+    return {
+      index,
+      outputType: output.output_type,
+      mimeTypes,
+      byteSize,
+      truncated: false,
+      output,
+      snapshot: {
+        outputId: snapshot.outputId,
+        uri: snapshot.uri,
+        mimeTypes: snapshot.mimeTypes,
+        byteSize: snapshot.byteSize,
+        inlineImageAdvised: snapshot.inlineImageAdvised,
+        lifetime: SNAPSHOT_LIFETIME
+      }
+    };
   }
-  const snapshot = store.intern({ ...address, index }, output);
   const preview = previewOf(output, Math.min(budget.remaining, 512));
   if (preview !== undefined) budget.remaining = Math.max(0, budget.remaining - preview.length);
   return {

@@ -119,9 +119,9 @@ describe('implicit MCP working context', () => {
     const cellId = String(cell['cell_id']);
     const revision = String(cell['source_revision']);
 
-    expect(notebookId).toBe('nb_1');
-    expect(cellId).toBe('cell_1');
-    expect(revision).toBe('rev_1');
+    expect(notebookId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.n1$/u);
+    expect(cellId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.c1$/u);
+    expect(revision).toMatch(/^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.r1$/u);
     expect((await connection.call('notebook_read', {
       notebook_id: notebookId,
       view: 'cells',
@@ -143,11 +143,15 @@ describe('implicit MCP working context', () => {
       }]
     });
     expect(applied.isError).not.toBe(true);
-    expect(String(((applied.structuredContent?.['results'] as Record<string, unknown>[])[0]!)['source_revision'])).toMatch(/^rev_[1-9][0-9]*$/u);
+    expect(String(((applied.structuredContent?.['results'] as Record<string, unknown>[])[0]!)['source_revision'])).toMatch(
+      /^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.r[1-9][0-9]*$/u
+    );
 
     await connection.call('notebook_close', { notebook_id: notebookId });
     const reopened = await connection.call('notebook_open', { path: 'a.ipynb' });
-    expect((reopened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']).toBe('nb_2');
+    expect((reopened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']).toMatch(
+      /^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.n2$/u
+    );
     expect(metaError(await connection.call('notebook_read', {
       notebook_id: notebookId,
       view: 'summary'
@@ -185,8 +189,8 @@ describe('implicit MCP working context', () => {
     expect(fullCells).toHaveLength(100);
     expect(fullCells.every((cell) => String(cell['cell_id']).length === 36)).toBe(true);
     expect(fullCells.every((cell) => String(cell['source_revision']).length === 46 && String(cell['cell_revision']).length === 46 && String(cell['outputs_revision']).length === 46)).toBe(true);
-    expect(compactCells.every((cell) => /^cell_[1-9][0-9]*$/u.test(String(cell['cell_id'])))).toBe(true);
-    expect(compactCells.every((cell) => /^rev_[1-9][0-9]*$/u.test(String(cell['source_revision'])))).toBe(true);
+    expect(compactCells.every((cell) => /^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.c[1-9][0-9]*$/u.test(String(cell['cell_id'])))).toBe(true);
+    expect(compactCells.every((cell) => /^@[A-Za-z0-9_-]+\.[1-9][0-9]*\.r[1-9][0-9]*$/u.test(String(cell['source_revision'])))).toBe(true);
     expect(jsonByteSize(compact.structuredContent)).toBeLessThan(jsonByteSize(toWire(full)));
   });
 

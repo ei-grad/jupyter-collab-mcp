@@ -171,8 +171,6 @@ const KERNEL_WATCH_MS = 2000;
 
 /** How long a long-poll sleeps between journal checks. */
 const POLL_INTERVAL_MS = 50;
-/** Reserve wire framing and common JSON escaping around a cells source chunk. */
-const CELL_READ_RESPONSE_OVERHEAD_BYTES = 8 * 1024;
 
 /**
  * Receipt reservation of one `notebook_apply` batch (SPEC.md §9).
@@ -661,35 +659,44 @@ class CollabServiceImpl implements CollabService {
           throw coreError('INVALID_ARGUMENT', 'cell_ids and cursor are mutually exclusive');
         }
         const changesCursor = handle.model.changesCursor;
-        const read = handle.model.readCells(
-          request.cellIds === undefined
-            ? request.cursor === undefined
-              ? {}
-              : { cursor: request.cursor }
-            : { cellIds: request.cellIds },
-          {
-            maxCells: limits.maxCells,
-            maxBytes: Math.max(1, limits.maxBytes - CELL_READ_RESPONSE_OVERHEAD_BYTES)
-          }
-        );
-        const duplicates = new Set(handle.model.duplicateCellIds);
-        const cells: CellContent[] = read.cells.map((cell) => ({
-          ...cell,
-          ...(duplicates.has(cell.cellId) ? { duplicateId: true } : {})
-        }));
+        const selector = request.cellIds === undefined
+          ? request.cursor === undefined
+            ? {}
+            : { cursor: request.cursor }
+          : { cellIds: request.cellIds };
         const metadata = notebookMetadata(handle);
-        const result: NotebookCellsReadResult = {
-          ...common,
-          view: 'cells',
-          structureRevision: read.structureRevision,
-          changesCursor,
-          cells,
-          truncated: read.truncated,
-          ...(read.nextCursor === undefined ? {} : { nextCursor: read.nextCursor }),
-          ...(metadata === null ? {} : { notebookMetadata: metadata }),
-          notebookMetadataRevision: metadataRevisionOf(handle.notebook)
-        };
-        return { ...(result as NotebookReadResultFor<R>), ...session.envelope() };
+        const duplicates = new Set(handle.model.duplicateCellIds);
+        let contentBudget = limits.maxBytes;
+        while (contentBudget > 0) {
+          const read = handle.model.readCells(selector, {
+            maxCells: limits.maxCells,
+            maxBytes: contentBudget
+          });
+          const cells: CellContent[] = read.cells.map((cell) => ({
+            ...cell,
+            ...(duplicates.has(cell.cellId) ? { duplicateId: true } : {})
+          }));
+          const result: NotebookCellsReadResult = {
+            ...common,
+            view: 'cells',
+            structureRevision: read.structureRevision,
+            changesCursor,
+            cells,
+            truncated: read.truncated,
+            ...(read.nextCursor === undefined ? {} : { nextCursor: read.nextCursor }),
+            ...(metadata === null ? {} : { notebookMetadata: metadata }),
+            notebookMetadataRevision: metadataRevisionOf(handle.notebook)
+          };
+          const envelope = session.envelope();
+          const response = { ...(result as NotebookReadResultFor<R>), ...envelope };
+          if (wireJsonByteSize(response) <= this.#config.limits.responseMaxBytes) return response;
+          const nextBudget = Math.floor(contentBudget / 2);
+          if (nextBudget === contentBudget) break;
+          contentBudget = nextBudget;
+        }
+        throw coreError('RESOURCE_LIMIT', 'notebook cells cannot fit the response budget; narrow metadata or attachments', {
+          details: { max_bytes: this.#config.limits.responseMaxBytes }
+        });
       }
       if (request.cellIds !== undefined && request.cursor !== undefined) {
         throw coreError('INVALID_ARGUMENT', 'cell_ids and cursor are mutually exclusive');
@@ -1722,14 +1729,13 @@ class CollabServiceImpl implements CollabService {
       : [];
     return cell.outputs.map((read) => {
       if (!read.truncated && read.output !== undefined) {
-        return {
-          index: read.index,
-          outputType: read.outputType,
-          mimeTypes: read.mimeTypes,
-          byteSize: read.byteSize,
-          truncated: false,
-          output: read.output
-        };
+        return toOutputEntry(
+          read.output,
+          read.index,
+          { remaining: Number.MAX_SAFE_INTEGER, maxOutputBytes: Number.MAX_SAFE_INTEGER },
+          { notebookId: handle.notebookId, executionId: 'read', cellId: cell.cellId },
+          session.outputs
+        );
       }
       const payload = full.find((entry) => entry.index === read.index)?.output;
       if (payload === undefined) {
@@ -2205,6 +2211,28 @@ function wireOutputReadByteSize(result: WithEnvelope<OutputReadResult>): number 
     }),
     'utf8'
   );
+}
+
+const WIRE_OPAQUE_KEYS = new Set(['metadata', 'notebookMetadata', 'notebook_metadata', 'attachments', 'value', 'output', 'details']);
+
+function snakeWireKey(key: string): string {
+  return key.replace(/[A-Z]/gu, (letter) => `_${letter.toLowerCase()}`);
+}
+
+/** Match the adapter's JSON key conversion without coupling the service to MCP. */
+function wireJsonByteSize(value: unknown): number {
+  const convert = (current: unknown, opaque = false): unknown => {
+    if (opaque || current === null || typeof current !== 'object') return current;
+    if (Array.isArray(current)) return current.map((entry) => convert(entry));
+    const result: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(current as Record<string, unknown>)) {
+      if (child === undefined) continue;
+      const wireKey = snakeWireKey(key);
+      result[wireKey] = convert(child, WIRE_OPAQUE_KEYS.has(key) || WIRE_OPAQUE_KEYS.has(wireKey));
+    }
+    return result;
+  };
+  return Buffer.byteLength(JSON.stringify(convert(value)) ?? '', 'utf8');
 }
 
 // ---------------------------------------------------------------------------

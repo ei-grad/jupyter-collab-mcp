@@ -146,15 +146,18 @@ export interface WireError {
   readonly details?: Record<string, unknown>;
 }
 
-function redactDeep(value: unknown, depth = 0): unknown {
+function redactDeep(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
   if (typeof value === 'string') return redactCredentials(value);
-  if (depth >= 6) return value;
-  if (Array.isArray(value)) return value.map((item) => redactDeep(item, depth + 1));
+  if (depth >= 6) return '[details depth omitted]';
+  if (Array.isArray(value)) return value.map((item) => redactDeep(item, depth + 1, seen));
   if (value !== null && typeof value === 'object') {
+    if (seen.has(value)) return '[details cycle omitted]';
+    seen.add(value);
     const out: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = redactDeep(child, depth + 1);
+      out[key] = redactDeep(child, depth + 1, seen);
     }
+    seen.delete(value);
     return out;
   }
   return value;
@@ -216,8 +219,41 @@ function presentWireError(wire: WireError, references: ReferenceAliases): WireEr
       };
 }
 
+const RECOVERY_DETAIL_KEYS = [
+  'notebook_id', 'cell_id', 'execution_id', 'execution_ids', 'output_id',
+  'revision', 'expected', 'current', 'cursor', 'next_cursor', 'next_request_id',
+  'request_accepted'
+] as const;
+
+function boundedString(value: string, maxBytes: number): string {
+  return boundText(value, maxBytes).text;
+}
+
+function boundedDetails(details: Record<string, unknown>, maxBytes: number): Record<string, unknown> {
+  if (jsonByteSize(details) <= maxBytes) return details;
+  const kept: Record<string, unknown> = { details_truncated: true };
+  for (const key of RECOVERY_DETAIL_KEYS) {
+    const value = details[key];
+    if (typeof value === 'string') kept[key] = boundedString(value, 512);
+    else if (typeof value === 'boolean' || value === null || typeof value === 'number') kept[key] = value;
+    else if (Array.isArray(value) && value.every((entry) => typeof entry === 'string')) {
+      kept[key] = value.slice(0, 32).map((entry) => boundedString(entry, 128));
+    }
+  }
+  return kept;
+}
+
+function boundWireError(wire: WireError, maxBytes: number): WireError {
+  const message = boundedString(wire.message, Math.min(4096, Math.max(256, Math.floor(maxBytes / 4))));
+  const { details, ...withoutDetails } = wire;
+  const base: WireError = { ...withoutDetails, message };
+  if (details === undefined) return base;
+  const available = Math.max(128, maxBytes - jsonByteSize(base) - 128);
+  return { ...base, details: boundedDetails(details, available) };
+}
+
 function errorResult(thrown: unknown, maxBytes: number, references: ReferenceAliases): CallToolResult {
-  const wire = presentWireError(toWireError(thrown), references);
+  const wire = boundWireError(presentWireError(toWireError(thrown), references), maxBytes);
   const head = `${wire.code}: ${wire.message}`;
   const facts = [
     `retryable=${String(wire.retryable)}`,
@@ -458,6 +494,7 @@ export function renderText(tool: string, payload: WireObject): string {
       } else {
         if (payload['next_cursor'] !== undefined) lines.push(`next_cursor=${s(payload['next_cursor'])}`);
         lines.push(...cellLines(payload['cells']));
+        lines.push(...outputLines(payload['cells']));
       }
       break;
     }
@@ -490,8 +527,7 @@ export function renderText(tool: string, payload: WireObject): string {
           if (Array.isArray(outputs)) {
             for (const output of outputs.slice(0, 10)) {
               if (!isObject(output)) continue;
-              const preview = output['text_preview'] ?? summarizeOutput(output);
-              lines.push(`    ${s(output['output_type'])} ${s(preview)}`);
+              lines.push(`    ${s(output['output_type'])} ${renderOutputReference(output)}`);
             }
           }
         }
@@ -580,6 +616,28 @@ function summarizeOutput(output: WireObject): string {
   const mimeTypes = output['mime_types'];
   const suffix = output['delivered_as'] === 'image' ? ' (returned as image content)' : '';
   return `${Array.isArray(mimeTypes) && mimeTypes.length > 0 ? mimeTypes.join(',') : 'no payload'} ${String(output['byte_size'] ?? '')} bytes${suffix}`.trim();
+}
+
+function renderOutputReference(output: WireObject): string {
+  const snapshot = nested(output, 'snapshot');
+  if (typeof snapshot['output_id'] === 'string') {
+    return `output_id=${snapshot['output_id']} — call output_read with this id`;
+  }
+  const raw = output['output'];
+  return raw === undefined ? summarizeOutput(output) : JSON.stringify(raw);
+}
+
+function outputLines(cells: WireValue | undefined): string[] {
+  if (!Array.isArray(cells)) return [];
+  const lines: string[] = [];
+  for (const cell of cells.slice(0, 20)) {
+    if (!isObject(cell) || !Array.isArray(cell['outputs'])) continue;
+    for (const output of cell['outputs'].slice(0, 10)) {
+      if (!isObject(output)) continue;
+      lines.push(`  cell_id=${s(cell['cell_id'])} output_index=${s(output['index'])} ${renderOutputReference(output)}`);
+    }
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
