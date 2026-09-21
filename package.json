@@ -16,13 +16,13 @@
     "llm",
     "claude"
   ],
-  "homepage": "https://github.com/ei-grad/jupyter-collab-mcp#readme",
+  "homepage": "https://github.com/lipa88/jupyter-collab-mcp#readme",
   "bugs": {
-    "url": "https://github.com/ei-grad/jupyter-collab-mcp/issues"
+    "url": "https://github.com/lipa88/jupyter-collab-mcp/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ei-grad/jupyter-collab-mcp.git"
+    "url": "git+https://github.com/lipa88/jupyter-collab-mcp.git"
   },
   "author": "Lilia Grigoreva",
   "license": "MIT",
