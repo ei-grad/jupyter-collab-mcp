@@ -1,6 +1,6 @@
 {
   "name": "jupyter-collab-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server for live JupyterLab notebooks over RTC: read, edit and run cells in the document the user is looking at.",
   "keywords": [
     "mcp",
