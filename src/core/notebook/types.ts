@@ -141,6 +141,8 @@ export interface ReadLimits {
   readonly maxCells?: number;
   /** UTF-8 budget for the whole answer. Default 64 KiB (SPEC.md §9). */
   readonly maxBytes?: number;
+  /** Per-output UTF-8 inline payload budget; the aggregate maxBytes still applies. */
+  readonly maxOutputBytes?: number;
 }
 
 /** Which cells to read; exactly one form, like the MCP arguments. */

@@ -55,8 +55,11 @@ over rewriting a whole cell. The answer gives new revisions,
 
 `notebook_execute {notebook_id, request_id, cells[{cell_id,
 expected_source_revision}], wait_ms?}` runs the cells in the notebook, so the
-user sees `[*]`, outputs and the final `execution_count`. Then
-`execution_get {execution_id, cursor?, wait_ms?}` until `state` is terminal.
+user sees `[*]`, outputs and the final `execution_count`. A positive `wait_ms`
+waits for completion or the deadline, without holding the mutation lock.
+Intermediate updates do not return early. If `wait_timed_out` is true, continue
+with `execution_get {execution_id, cursor?, wait_ms?}` until `state` is terminal;
+that read-only tool still waits for the next update rather than completion.
 Never run notebook code with a shell tool instead: it would be invisible.
 
 **request_id discipline.** `notebook_create`, `notebook_apply`,

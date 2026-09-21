@@ -1400,8 +1400,9 @@ export interface CollabService {
    * and `idle` are written only at completion, and only while this generation
    * still owns the output area.
    *
-   * `waitMs` bounds the MCP answer only. The job keeps running afterwards and
-   * is read with {@link executionGet}.
+   * `waitMs` waits for terminal completion or the bounded deadline. Intermediate
+   * updates do not end this wait. A timed-out job continues and is read with
+   * {@link executionGet}. Waiting holds no mutation lock and never resends code.
    *
    * Deduplicated. The receipt is created before the first output-area
    * generation is started, so a replay never runs the cells twice.

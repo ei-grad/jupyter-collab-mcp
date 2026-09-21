@@ -1010,18 +1010,18 @@ describe('Interruption and cancellation (SPEC §12)', () => {
       request_id: session.counter.value,
       cells,
       stop_on_error: false,
-      wait_ms: 20_000
+      wait_ms: 100
     };
     const submittedAt = Date.now();
     const job = await mcp.call('notebook_execute', executionPayload);
-    expect(Date.now() - submittedAt).toBeLessThan(20_000);
-    expect(job['wait_timed_out']).toBe(false);
-    const replay = await mcp.call('notebook_execute', executionPayload);
+    expect(Date.now() - submittedAt).toBeGreaterThanOrEqual(90);
+    expect(job['wait_timed_out']).toBe(true);
+    const replay = await mcp.call('notebook_execute', { ...executionPayload, wait_ms: 0 });
     expect(replay['replayed']).toBe(true);
     expect(replay['execution_id']).toBe(job['execution_id']);
     session.counter.take(job);
     const executionId = str(job['execution_id']);
-    // Startup or output updates answer the wait before execution finishes.
+    // The deadline returns a still-running job without interrupting it.
     expect(job['state']).toBe('running');
 
     // The wait ending killed nothing: the kernel is still busy with our cell.

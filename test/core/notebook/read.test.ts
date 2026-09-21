@@ -178,6 +178,34 @@ describe('readCells (SPEC.md §9)', () => {
 });
 
 describe('readOutputs (SPEC.md §9: no full base64 in every answer)', () => {
+  it('enforces per-output bytes without replacing the aggregate budget', () => {
+    const output = { output_type: 'stream', name: 'stdout', text: 'x'.repeat(75) };
+    const peer = makePeer(notebookWith([codeCell('a', 'print()', { outputs: [output, output] })]));
+    cleanups.push(() => peer.dispose());
+    const bytes = Buffer.byteLength(JSON.stringify(output));
+    const perOutput = peer.model.readOutputs(['a'], { maxBytes: 1000, maxOutputBytes: 40 });
+    expect(perOutput.truncated).toBe(true);
+    for (const entry of perOutput.cells[0]!.outputs) {
+      expect(entry).toMatchObject({ byteSize: bytes, truncated: true });
+      expect(entry.output).toBeUndefined();
+      expect(Buffer.byteLength(entry.textPreview ?? '')).toBeLessThanOrEqual(40);
+    }
+    const aggregate = peer.model.readOutputs(['a'], { maxBytes: bytes, maxOutputBytes: bytes });
+    expect(aggregate.cells[0]!.outputs.map((entry) => entry.truncated)).toEqual([false, true]);
+    const exact = peer.model.readOutputs(['a'], { maxBytes: bytes * 2, maxOutputBytes: bytes });
+    expect(exact.truncated).toBe(false);
+  });
+
+  it('bounds Unicode previews by UTF-8 bytes rather than character count', () => {
+    const peer = makePeer(notebookWith([codeCell('a', 'print()', {
+      outputs: [{ output_type: 'stream', name: 'stdout', text: '🙂'.repeat(30) }]
+    })]));
+    cleanups.push(() => peer.dispose());
+    const entry = peer.model.readOutputs(['a'], { maxBytes: 1000, maxOutputBytes: 7 }).cells[0]!.outputs[0]!;
+    expect(entry.truncated).toBe(true);
+    expect(Buffer.byteLength(entry.textPreview ?? '')).toBeLessThanOrEqual(7);
+    expect(entry.textPreview).toBe('🙂');
+  });
   it('inlines small outputs with their MIME list and size', () => {
     const peer = makePeer(
       notebookWith([

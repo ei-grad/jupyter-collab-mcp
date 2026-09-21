@@ -581,17 +581,22 @@ Execution states are `queued`, `running`, `succeeded`, `failed`, `cancelled`,
 `interrupted`, and `unknown`. Python errors and kernel `aborted` have distinct
 causes; by default an error stops the remaining cells. `wait_ms` limits only
 how long the MCP response waits; computation may continue. `notebook_execute`
-may return on the first kernel update, including startup or state updates,
-with a running job and `wait_timed_out: false`. It does not wait specifically
-for completion. Follow its cursor with `execution_get` to observe progress.
+with a positive `wait_ms` waits for a terminal job or the bounded deadline.
+Startup, state, and output updates do not end that wait. It reports
+`wait_timed_out: true` only when the deadline elapsed with a nonterminal job;
+a zero/omitted wait returns the current state without claiming a timeout.
+The submission receipt completes before waiting, outside the mutation lock.
+Retries can wait on the same execution without re-sending code, and interruption
+or cancellation remains available while another call waits. Follow its cursor
+with `execution_get` to observe progress after a timeout.
 `execution_get` can
 wait for a state change and retrieve new output. A waiting read is answered at
 once when the state it waits for is already there - undelivered changes after
 the cursor, or a job in a terminal state. Terminal reads do not long-poll;
 late output may still arrive and can be retrieved in a subsequent read.
 `wait_timed_out` is true only when the call consumed the whole `wait_ms`
-without observing a change; every earlier answer, including such an immediate
-one, reports false. A long computation does not block reads, RTC updates, or
+without its wait condition being met; every earlier answer, including such an
+immediate one, reports false. A long computation does not block reads, RTC updates, or
 kernel control.
 
 Cell completion requires the matching `execute_reply` and IOPub `idle`, in
@@ -941,6 +946,13 @@ continued reading; an expired output snapshot returns `HANDLE_EXPIRED`. Lack of
 host resource support does not make the execution result inaccessible.
 [MCP resource links](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#resource-links),
 [MCP resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources)
+
+`notebook_read(view: "outputs")` enforces `max_output_bytes` independently for
+each inlined output, in addition to the aggregate `max_bytes` budget, whether
+cells are selected explicitly, implicitly, or through a paging cursor. An
+oversized output reports its full byte size, `truncated: true`, and a readable
+snapshot reference instead of inlining the payload. Its text preview observes
+both remaining aggregate and per-output byte limits.
 
 Initial configurable limits are 100 cells per summary, 64 KiB of text per
 response, up to 30 seconds of waiting per tool call, 10,000 notebook-log events,

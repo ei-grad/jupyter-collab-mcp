@@ -708,7 +708,8 @@ class CollabServiceImpl implements CollabService {
       }
       const read = handle.model.readOutputs(cellIds, {
         maxCells: limits.maxCells,
-        maxBytes: limits.maxBytes
+        maxBytes: limits.maxBytes,
+        maxOutputBytes: limits.maxOutputBytes
       });
       const cells: CellOutputsView[] = read.cells.map((cell) => ({
         ...cell,
@@ -798,7 +799,7 @@ class CollabServiceImpl implements CollabService {
   async notebookExecute(request: NotebookExecuteRequest): Promise<WithEnvelope<ExecutionView>> {
     this.#assertRunning();
     const { session, handle } = this.#locate(request.notebookId);
-    return session.lock.run(async () => {
+    const submitted = await session.lock.run(async () => {
       const payload = {
         cells: request.cells,
         stopOnError: request.stopOnError ?? true
@@ -903,12 +904,28 @@ class CollabServiceImpl implements CollabService {
         this.#startKernelWatch();
 
         const view = await this.#executionView(session, record, {
-          waitMs: request.waitMs ?? 0,
+          waitMs: 0,
           ...(request.limits === undefined ? {} : { limits: request.limits })
         });
         return { result: view, replay: { kind: 'execution', executionId } };
       });
     });
+    if (this.#clampWait(request.waitMs) === 0 || TERMINAL_JOB_STATES.has(submitted.state)) {
+      return { ...submitted, ...session.envelope() };
+    }
+    try {
+      const { record } = this.#locateExecution(submitted.executionId);
+      const view = await this.#executionView(session, record, {
+        waitMs: request.waitMs ?? 0,
+        untilTerminal: true,
+        ...(request.limits === undefined ? {} : { limits: request.limits })
+      });
+      return { ...submitted, ...view, ...session.envelope() };
+    } catch (error) {
+      // Submission is already receipted. Observation failure cannot make a
+      // retry eligible to send code again or change the accepted outcome.
+      throw withEnvelopeDetails(error, { ...submitted, ...session.envelope() });
+    }
   }
 
   async executionGet(request: ExecutionGetRequest): Promise<WithEnvelope<ExecutionView>> {
@@ -1756,7 +1773,7 @@ class CollabServiceImpl implements CollabService {
   async #executionView(
     session: WorkingSession,
     record: ExecutionRecord,
-    options: { waitMs: number; cursor?: string; limits?: ResponseLimits }
+    options: { waitMs: number; cursor?: string; limits?: ResponseLimits; untilTerminal?: boolean }
   ): Promise<ExecutionView> {
     const first = record.registry.get(record.executionId);
     if (first === undefined) {
@@ -1781,7 +1798,7 @@ class CollabServiceImpl implements CollabService {
     // Nothing to wait for when undelivered changes are already there, and
     // nothing can arrive for a terminal job: both answer at once, so neither
     // reports a timeout (SPEC.md §8).
-    const settled = first.cursor > since || TERMINAL_JOB_STATES.has(first.job.state);
+    const settled = (!options.untilTerminal && first.cursor > since) || TERMINAL_JOB_STATES.has(first.job.state);
     let waitTimedOut = false;
     if (waitMs > 0 && !settled) {
       const deadline = Date.now() + waitMs;
@@ -1791,9 +1808,15 @@ class CollabServiceImpl implements CollabService {
           waitTimedOut = true;
           break;
         }
-        snapshot = await record.registry.waitForChange(record.executionId, since, remaining);
-        if (snapshot.cursor > since || TERMINAL_JOB_STATES.has(snapshot.job.state)) break;
+        snapshot = await record.registry.waitForChange(record.executionId,
+          options.untilTerminal ? snapshot.cursor : since, remaining);
+        if (TERMINAL_JOB_STATES.has(snapshot.job.state) || (!options.untilTerminal && snapshot.cursor > since)) break;
       }
+    }
+    if (session.closed || record.handle.closed) {
+      throw coreError('HANDLE_EXPIRED', 'the execution context was closed while waiting', {
+        details: { execution_id: record.executionId }
+      });
     }
     // The watcher normally does this, but a caller that waited should never
     // see a finished cell whose `[*]` is still on screen (SPEC.md §8).

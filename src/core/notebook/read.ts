@@ -278,6 +278,7 @@ export function readOutputs(
   limits: ReadLimits = {}
 ): OutputsRead {
   const maxBytes = limits.maxBytes ?? DEFAULT_MAX_BYTES;
+  const maxOutputBytes = limits.maxOutputBytes ?? maxBytes;
   const maxCells = limits.maxCells ?? DEFAULT_MAX_CELLS;
   let used = 0;
   let anyTruncated = false;
@@ -295,7 +296,7 @@ export function readOutputs(
       const serialised = JSON.stringify(output) ?? '';
       const byteSize = utf8Length(serialised);
       const remaining = Math.max(0, maxBytes - used);
-      if (byteSize <= remaining) {
+      if (byteSize <= Math.min(remaining, maxOutputBytes)) {
         used += byteSize;
         reads.push({
           index: position,
@@ -310,7 +311,7 @@ export function readOutputs(
       cellTruncated = true;
       anyTruncated = true;
       const text = textOf(output);
-      const previewBudget = Math.min(remaining, MAX_TEXT_PREVIEW_BYTES);
+      const previewBudget = Math.min(remaining, maxOutputBytes, MAX_TEXT_PREVIEW_BYTES);
       const preview =
         text === null || previewBudget <= 0 ? undefined : truncateUtf8(text, previewBudget).text;
       if (preview !== undefined) used += utf8Length(preview);
