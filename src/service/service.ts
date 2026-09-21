@@ -171,6 +171,8 @@ const KERNEL_WATCH_MS = 2000;
 
 /** How long a long-poll sleeps between journal checks. */
 const POLL_INTERVAL_MS = 50;
+/** Reserve wire framing and common JSON escaping around a cells source chunk. */
+const CELL_READ_RESPONSE_OVERHEAD_BYTES = 8 * 1024;
 
 /**
  * Receipt reservation of one `notebook_apply` batch (SPEC.md §9).
@@ -665,7 +667,10 @@ class CollabServiceImpl implements CollabService {
               ? {}
               : { cursor: request.cursor }
             : { cellIds: request.cellIds },
-          { maxCells: limits.maxCells, maxBytes: limits.maxBytes }
+          {
+            maxCells: limits.maxCells,
+            maxBytes: Math.max(1, limits.maxBytes - CELL_READ_RESPONSE_OVERHEAD_BYTES)
+          }
         );
         const duplicates = new Set(handle.model.duplicateCellIds);
         const cells: CellContent[] = read.cells.map((cell) => ({
@@ -992,23 +997,34 @@ class CollabServiceImpl implements CollabService {
           details: { output_id: snapshot.outputId, byte_size: snapshot.byteSize }
         });
       }
-      const chunk = sliceSnapshot(snapshot, offset, limits.maxBytes);
-      const end = offset + chunk.byteLength;
-      return {
-        outputId: snapshot.outputId,
-        uri: snapshot.uri,
-        outputType: snapshot.outputType,
-        mimeTypes: snapshot.mimeTypes,
-        mimeType: snapshot.mimeType,
-        encoding: snapshot.encoding,
-        data: chunk.toString(snapshot.encoding === 'base64' ? 'base64' : 'utf8'),
-        byteOffset: offset,
-        byteSize: snapshot.byteSize,
-        truncated: end < snapshot.byteSize,
-        ...(end < snapshot.byteSize ? { nextCursor: makeOutputCursor(end) } : {}),
-        lifetime: SNAPSHOT_LIFETIME,
-        ...context.envelope()
-      };
+      const envelope = context.envelope();
+      let budget = limits.maxBytes;
+      while (budget > 0) {
+        const chunk = sliceSnapshot(snapshot, offset, budget);
+        const end = offset + chunk.byteLength;
+        const result: WithEnvelope<OutputReadResult> = {
+          outputId: snapshot.outputId,
+          uri: snapshot.uri,
+          outputType: snapshot.outputType,
+          mimeTypes: snapshot.mimeTypes,
+          mimeType: snapshot.mimeType,
+          encoding: snapshot.encoding,
+          data: chunk.toString(snapshot.encoding === 'base64' ? 'base64' : 'utf8'),
+          byteOffset: offset,
+          byteSize: snapshot.byteSize,
+          truncated: end < snapshot.byteSize,
+          ...(end < snapshot.byteSize ? { nextCursor: makeOutputCursor(end) } : {}),
+          lifetime: SNAPSHOT_LIFETIME,
+          ...envelope
+        };
+        if (wireOutputReadByteSize(result) <= this.#config.limits.responseMaxBytes) return result;
+        const nextBudget = Math.floor(budget / 2);
+        if (nextBudget === budget) break;
+        budget = nextBudget;
+      }
+      throw coreError('RESOURCE_LIMIT', 'output_read cannot fit one recoverable chunk in the response budget', {
+        details: { output_id: snapshot.outputId, max_bytes: limits.maxBytes }
+      });
     } catch (error) {
       throw withEnvelopeDetails(error, context.envelope());
     }
@@ -2163,6 +2179,32 @@ class CollabServiceImpl implements CollabService {
       status
     };
   }
+}
+
+/** Exact JSON shape used by the adapter for one output_read result. */
+function wireOutputReadByteSize(result: WithEnvelope<OutputReadResult>): number {
+  return Buffer.byteLength(
+    JSON.stringify({
+      output_id: result.outputId,
+      uri: result.uri,
+      output_type: result.outputType,
+      mime_types: result.mimeTypes,
+      mime_type: result.mimeType,
+      encoding: result.encoding,
+      data: result.data,
+      byte_offset: result.byteOffset,
+      byte_size: result.byteSize,
+      truncated: result.truncated,
+      ...(result.nextCursor === undefined ? {} : { next_cursor: result.nextCursor }),
+      lifetime: {
+        scope: result.lifetime.scope,
+        released_by: result.lifetime.releasedBy,
+        process_scoped: result.lifetime.processScoped
+      },
+      ...(result.nextRequestId === undefined ? {} : { next_request_id: result.nextRequestId })
+    }),
+    'utf8'
+  );
 }
 
 // ---------------------------------------------------------------------------

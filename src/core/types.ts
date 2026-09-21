@@ -555,6 +555,9 @@ export type ChangesCursor = string & { readonly __cursor: 'changes' };
  */
 export type PageCursor = string & { readonly __cursor: 'page' };
 
+/** Opaque continuation for source text that did not fit one cells read. */
+export type SourceCursor = string & { readonly __cursor: 'source' };
+
 const CHANGES_CURSOR_PREFIX = 'chg_';
 const PAGE_CURSOR_PREFIX = 'pg_';
 

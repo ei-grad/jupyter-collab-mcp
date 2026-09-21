@@ -39,6 +39,12 @@ Work from IDs and revisions, never from remembered line numbers.
 - `outputs` - output entries with `mime_types`, `byte_size`, `truncated`,
   `output_id`.
 
+The server may return short connection-scoped references for notebook, cell,
+execution, output, and revision values. Pass them back exactly as returned;
+they preserve the full underlying identity and expire with the connection.
+Full values remain valid for compatible callers. If a cells read reports a
+source cursor, continue it before acting on the incomplete source.
+
 Use the revision named by each guarded operation from the answer you just read:
 `source_revision` (text), `cell_revision` (whole cell), `outputs_revision`, or
 `notebook_metadata_revision`. `structure_revision` identifies the structure
@@ -94,7 +100,8 @@ one speculatively. Never guess `expected_kernel_id`.
 - Images arrive as MCP image content when small enough; larger outputs come as
   `output_id` / `resource_link`. Read them with `output_read {output_id,
   cursor?}` (or the resource, if the host reads resources). Do not ask for full
-  base64 in text.
+  base64 in text. `output_read` pages its encoded payload within the response
+  budget; keep following `next_cursor` until `truncated:false`.
 - A Python error is a *result*, not a tool error: the job is `failed` with a
   reason and the traceback is in the cell outputs.
 - `notebook_changes {notebook_id, cursor, wait_ms?, limit?}` reports adds,

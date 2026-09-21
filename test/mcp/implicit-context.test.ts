@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { randomUUID } from 'node:crypto';
+
 import { createCollabService } from '../../src/service/index.js';
 import type { CollabService } from '../../src/core/index.js';
+import { jsonByteSize, toWire } from '../../src/mcp/index.js';
+import type { NotebookHandle } from '../../src/service/index.js';
 import { makeFakeHandle, makeFakeServer } from '../service/helpers.js';
 import { connect, metaError, type Harness } from './harness.js';
 
@@ -14,6 +18,7 @@ afterEach(async () => {
 
 async function rig(ids = ['one']) {
   const servers = ids.map(() => makeFakeServer({ files: [{ path: 'a.ipynb', type: 'notebook' }] }));
+  const handles: NotebookHandle[] = [];
   const service = createCollabService({ servers: ids.map((id, index) => ({
     id, kind: 'standalone', apiBaseUrl: `http://127.0.0.1:${9000 + index}`, credentialRef: 'literal:synthetic'
   })) }, {
@@ -22,12 +27,16 @@ async function rig(ids = ['one']) {
       const url = new URL(String(input));
       return servers[Number(url.port) - 9000]!.fetchImpl(input, init);
     },
-    openHandle: async (init) => makeFakeHandle(init).handle
+    openHandle: async (init) => {
+      const handle = makeFakeHandle(init).handle;
+      handles.push(handle);
+      return handle;
+    }
   });
   services.push(service);
   const connection = await connect({ service });
   connections.push(connection);
-  return { service, connection, servers };
+  return { service, connection, servers, handles };
 }
 
 describe('implicit MCP working context', () => {
@@ -98,6 +107,87 @@ describe('implicit MCP working context', () => {
     expect((await connection.call('notebook_read', { notebook_id: firstId, view: 'summary' })).isError).not.toBe(true);
     const other = await rig();
     expect(metaError(await other.connection.call('notebook_read', { notebook_id: firstId, view: 'summary' }))['code']).toBe('HANDLE_EXPIRED');
+  });
+
+  it('round-trips typed aliases without reusing a closed notebook reference', async () => {
+    const { connection, handles } = await rig();
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebook = opened.structuredContent?.['notebook'] as Record<string, unknown>;
+    const summary = opened.structuredContent?.['summary'] as Record<string, unknown>;
+    const notebookId = String(notebook['notebook_id']);
+    const cell = (summary['cells'] as Record<string, unknown>[])[0]!;
+    const cellId = String(cell['cell_id']);
+    const revision = String(cell['source_revision']);
+
+    expect(notebookId).toBe('nb_1');
+    expect(cellId).toBe('cell_1');
+    expect(revision).toBe('rev_1');
+    expect((await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_ids: [cellId]
+    })).isError).not.toBe(true);
+    expect((await connection.call('notebook_read', {
+      notebook_id: handles[0]!.notebookId,
+      view: 'summary'
+    })).isError).not.toBe(true);
+
+    const applied = await connection.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '1',
+      operations: [{
+        op: 'replace_source',
+        cell_id: cellId,
+        expected_source_revision: revision,
+        source: 'changed through aliases'
+      }]
+    });
+    expect(applied.isError).not.toBe(true);
+    expect(String(((applied.structuredContent?.['results'] as Record<string, unknown>[])[0]!)['source_revision'])).toMatch(/^rev_[1-9][0-9]*$/u);
+
+    await connection.call('notebook_close', { notebook_id: notebookId });
+    const reopened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    expect((reopened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']).toBe('nb_2');
+    expect(metaError(await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'summary'
+    }))['code']).toBe('HANDLE_EXPIRED');
+    expect(metaError(await connection.call('notebook_read', {
+      notebook_id: handles[0]!.notebookId,
+      view: 'summary'
+    }))['code']).toBe('HANDLE_EXPIRED');
+  });
+
+  it('reduces a 100-cell UUID-and-revision summary without changing identities', async () => {
+    const { service, connection, handles } = await rig();
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    handles[0]!.notebook.setSource({
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: Array.from({ length: 100 }, (_unused, index) => ({
+        id: randomUUID(),
+        cell_type: 'code',
+        source: `x_${String(index)} = ${String(index)}`,
+        metadata: {},
+        outputs: [],
+        execution_count: null
+      }))
+    } as never);
+
+    const compact = await connection.call('notebook_read', { notebook_id: notebookId, view: 'summary' });
+    const full = await service.notebookRead({ notebookId: handles[0]!.notebookId, view: 'summary' });
+    const compactSummary = compact.structuredContent?.['summary'] as Record<string, unknown>;
+    const compactCells = compactSummary['cells'] as Record<string, unknown>[];
+    const fullCells = ((toWire(full) as Record<string, unknown>)['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[];
+
+    expect(fullCells).toHaveLength(100);
+    expect(fullCells.every((cell) => String(cell['cell_id']).length === 36)).toBe(true);
+    expect(fullCells.every((cell) => String(cell['source_revision']).length === 46 && String(cell['cell_revision']).length === 46 && String(cell['outputs_revision']).length === 46)).toBe(true);
+    expect(compactCells.every((cell) => /^cell_[1-9][0-9]*$/u.test(String(cell['cell_id'])))).toBe(true);
+    expect(compactCells.every((cell) => /^rev_[1-9][0-9]*$/u.test(String(cell['source_revision'])))).toBe(true);
+    expect(jsonByteSize(compact.structuredContent)).toBeLessThan(jsonByteSize(toWire(full)));
   });
 
   it('retries failed initialization without replacing a live context', async () => {

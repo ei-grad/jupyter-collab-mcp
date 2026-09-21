@@ -430,6 +430,33 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
     expect(expired.code).toBe('CURSOR_EXPIRED');
   }, 120_000);
 
+  it('continues a large source through the live RTC document before later cells', async () => {
+    const source = `chunk-${RUN}\n`.repeat(10_000);
+    const added = await mcp.call('notebook_apply', {
+      notebook_id: docId,
+      request_id: main.counter.value,
+      operations: [{ op: 'add_cell', cell_type: 'code', source, position: 'end' }]
+    });
+    main.counter.take(added);
+    const cellId = str(list(added['results'])[0]?.['cell_id']);
+
+    const chunks: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await mcp.call('notebook_read', {
+        notebook_id: docId,
+        view: 'cells',
+        ...(cursor === undefined ? { cell_ids: [cellId] } : { cursor }),
+        limits: { max_bytes: 16_384 }
+      });
+      chunks.push(...list(page['cells'])
+        .filter((cell) => cell['cell_id'] === cellId)
+        .map((cell) => str(cell['source'])));
+      cursor = page['next_cursor'] as string | undefined;
+    } while (cursor !== undefined);
+    expect(chunks.join('')).toBe(source);
+  }, 120_000);
+
   it('exposes the code cell the execution scenarios use', () => {
     expect(codeCellId).toBeTypeOf('string');
     executionTarget = { cellId: codeCellId, revision: codeRevision };

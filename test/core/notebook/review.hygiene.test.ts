@@ -246,19 +246,38 @@ describe('review: read limits (SPEC.md §9)', () => {
     peer.dispose();
   });
 
-  it('a page cursor advances past a cell whose source did not fit the budget', () => {
+  it('a source cursor pages every byte before it advances to the next cell', () => {
+    const source = 'x'.repeat(100_000);
     const peer = reviewPeer(
       11,
-      reviewBook([reviewCode('big', 'x'.repeat(100_000)), reviewCode('small', 'y')])
+      reviewBook([reviewCode('big', source), reviewCode('small', 'y')])
     );
-    const page = peer.model.readCells(undefined, { maxBytes: 16 });
-    expect(page.cells).toHaveLength(1);
-    expect(page.cells[0]!.sourceTruncated).toBe(true);
-    expect(page.cells[0]!.sourceBytes).toBe(100_000);
-    // The cursor points at the *next* cell: the remaining 99 984 bytes of
-    // `big` are not reachable by paging, only by raising maxBytes.
-    const next = peer.model.readCells({ cursor: page.nextCursor! }, { maxBytes: 64 * 1024 });
-    expect(next.cells.map((cell) => cell.cellId)).toEqual(['small']);
+    const chunks: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = peer.model.readCells(
+        cursor === undefined ? undefined : { cursor: cursor as never },
+        { maxBytes: 16_384 }
+      );
+      chunks.push(...page.cells.filter((cell) => cell.cellId === 'big').map((cell) => cell.source));
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    expect(chunks.join('')).toBe(source);
+    peer.dispose();
+  });
+
+  it('expires a source cursor after the observed cell changes', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('big', 'x'.repeat(100_000))]));
+    const first = peer.model.readCells(undefined, { maxBytes: 16 });
+    peer.model.apply([{
+      op: 'replace_source',
+      cellId: 'big',
+      expectedSourceRevision: first.cells[0]!.sourceRevision,
+      source: 'changed'
+    }]);
+    expect(() => peer.model.readCells({ cursor: first.nextCursor! }, { maxBytes: 16 })).toThrowError(
+      expect.objectContaining({ code: 'CURSOR_EXPIRED' })
+    );
     peer.dispose();
   });
 

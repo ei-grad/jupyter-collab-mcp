@@ -244,9 +244,9 @@ const KERNEL_STATUS: Record<string, JsonSchema> = {
 // ---------------------------------------------------------------------------
 
 const serverId = z.string().min(1).optional().describe('Jupyter server profile. Omit only when exactly one server is available; otherwise SERVER_SELECTION_REQUIRED.');
-const notebookId = z.string().min(1).describe('notebook_id from notebook_open or notebook_create.');
-const executionId = z.string().min(1).describe('execution_id from notebook_execute.');
-const outputId = z.string().min(1).describe('output_id from an outputs read or an execution result.');
+const notebookId = z.string().min(1).describe('notebook_id from notebook_open or notebook_create. Full process-local IDs remain accepted; a short connection-scoped reference from a prior response is preferred.');
+const executionId = z.string().min(1).describe('execution_id from notebook_execute. Full process-local IDs remain accepted; a short connection-scoped reference from a prior response is preferred.');
+const outputId = z.string().min(1).describe('output_id from an outputs read or an execution result. Full process-local IDs remain accepted; a short connection-scoped reference from a prior response is preferred.');
 
 const requestId = z
   .string()
@@ -255,7 +255,7 @@ const requestId = z
     'Canonical decimal request number of this connection, starting at "1" and growing by one. Always take it from next_request_id of the previous answer; never invent or reconstruct one. A repeat with the same payload replays the stored result; a different payload is REQUEST_ID_CONFLICT.'
   );
 
-const revision = (what: string) => z.string().min(1).describe(`Expected ${what} revision, taken from a previous read. A mismatch is REVISION_CONFLICT and nothing is applied.`);
+const revision = (what: string) => z.string().min(1).describe(`Expected ${what} revision, taken from a previous read. A mismatch is REVISION_CONFLICT and nothing is applied. Full digests remain accepted; use the short connection-scoped reference returned by the server when available.`);
 
 const limits = z
   .object({
@@ -539,7 +539,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       notebook_id: notebookId,
       view: z.enum(['summary', 'cells', 'outputs']),
       cell_ids: z.array(z.string()).optional().describe('Explicit selection for cells or outputs. Mutually exclusive with cursor; ignored for summary.'),
-      cursor: z.string().optional().describe('page_cursor from a previous page. Bound to the structural revision: a structural change gives CURSOR_EXPIRED.'),
+      cursor: z.string().optional().describe('page_cursor or source cursor from a previous cells read. A source cursor continues the same source before later cells; a changed source, replacement, or structural change gives CURSOR_EXPIRED.'),
       limits
     }),
     output: result(

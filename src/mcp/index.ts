@@ -34,5 +34,7 @@ export {
 } from './wire.js';
 export type { BoundedPayload, WireObject, WireValue } from './wire.js';
 
+export { ReferenceAliases } from './references.js';
+
 export { CLI_USAGE, loadCliConfig, runCli, runMainCli } from './cli.js';
 export type { CliOptions, CliResult, LoadedCliConfig, MainCliOptions } from './cli.js';

@@ -27,7 +27,8 @@ import type {
   CellType,
   NbOutput,
   PageCursor,
-  SharedExecutionState
+  SharedExecutionState,
+  SourceCursor
 } from '../types.js';
 import { makePageCursor, parsePageCursor } from '../types.js';
 import type { CellEntry, CellIndex } from './cell-index.js';
@@ -175,17 +176,87 @@ export function offsetFromCursor(cursor: PageCursor | string, binding: Structure
   return parsed.offset;
 }
 
+interface ParsedSourceCursor {
+  readonly binding: StructureRevision;
+  readonly identityToken: string;
+  readonly sourceRevision: string;
+  readonly byteOffset: number;
+}
+
+function makeSourceCursor(
+  binding: StructureRevision,
+  entry: CellEntry,
+  revision: string,
+  byteOffset: number
+): SourceCursor {
+  return `src_${binding}.${entry.identityToken}.${revision}.${String(byteOffset)}` as SourceCursor;
+}
+
+function parseSourceCursor(cursor: string): ParsedSourceCursor | null {
+  const match = /^src_(x1_[A-Za-z0-9_-]{43})\.(cid_[A-Za-z0-9-]+)\.(s1_[A-Za-z0-9_-]{43})\.(0|[1-9][0-9]*)$/u.exec(cursor);
+  if (match === null) return null;
+  return {
+    binding: match[1]! as StructureRevision,
+    identityToken: match[2]!,
+    sourceRevision: match[3]!,
+    byteOffset: Number(match[4]!)
+  };
+}
+
+function sourceFromOffset(source: string, byteOffset: number, cellId: string): string {
+  const bytes = Buffer.from(source, 'utf8');
+  if (byteOffset >= bytes.length || (bytes[byteOffset]! & 0xc0) === 0x80) {
+    throw coreError('CURSOR_EXPIRED', 'the source cursor is not on an unread UTF-8 boundary', {
+      details: { cell_id: cellId, byte_offset: byteOffset }
+    });
+  }
+  return bytes.subarray(byteOffset).toString('utf8');
+}
+
 /** Resolve a selector to the entries to read, in document order. */
 export function selectEntries(
+  notebook: YNotebook,
   index: CellIndex,
   selector: CellSelector | undefined,
   binding: StructureRevision
-): { entries: CellEntry[]; offset: number; paged: boolean } {
+): { entries: CellEntry[]; offset: number; paged: boolean; sourceOffset: number } {
   if (selector?.cellIds !== undefined) {
-    return { entries: selector.cellIds.map((id) => index.require(id)), offset: 0, paged: false };
+    return { entries: selector.cellIds.map((id) => index.require(id)), offset: 0, paged: false, sourceOffset: 0 };
+  }
+  if (selector?.cursor?.startsWith('src_') === true) {
+    const parsed = parseSourceCursor(selector.cursor);
+    if (parsed === null) {
+      throw coreError('INVALID_ARGUMENT', 'not a source cursor issued by this process', {
+        details: { cursor: selector.cursor }
+      });
+    }
+    if (parsed.binding !== binding) {
+      throw coreError('CURSOR_EXPIRED', 'the notebook structure changed since this source cursor', {
+        details: { cursor: selector.cursor }
+      });
+    }
+    const entry = [...index.entries].find((candidate) => candidate.identityToken === parsed.identityToken);
+    if (entry === undefined) {
+      throw coreError('CURSOR_EXPIRED', 'the cell changed since this source cursor', {
+        details: { cursor: selector.cursor }
+      });
+    }
+    const cell = resolveCell(notebook, entry);
+    const revision = sourceRevision(cellTypeOf(cell), cell.getSource());
+    if (revision !== parsed.sourceRevision) {
+      throw coreError('CURSOR_EXPIRED', 'the cell source changed since this source cursor', {
+        details: { cursor: selector.cursor }
+      });
+    }
+    return {
+      entries: [...index.entries].slice(entry.index),
+      offset: entry.index,
+      paged: true,
+      sourceOffset: parsed.byteOffset
+    };
   }
   const offset = selector?.cursor === undefined ? 0 : offsetFromCursor(selector.cursor, binding);
-  return { entries: [...index.entries].slice(offset), offset, paged: true };
+  return { entries: [...index.entries].slice(offset), offset, paged: true, sourceOffset: 0 };
 }
 
 /** `notebook_read(view: 'cells')` (SPEC.md §9). */
@@ -199,13 +270,13 @@ export function readCells(
   const binding = pageBindingOf(index);
   const maxCells = limits.maxCells ?? DEFAULT_MAX_CELLS;
   const maxBytes = limits.maxBytes ?? DEFAULT_MAX_BYTES;
-  const { entries, offset, paged } = selectEntries(index, selector, binding);
+  const { entries, offset, paged, sourceOffset } = selectEntries(notebook, index, selector, binding);
 
   const cells: CellRead[] = [];
   let used = 0;
   let truncated = false;
   let taken = 0;
-  for (const entry of entries) {
+  for (const [position, entry] of entries.entries()) {
     if (cells.length >= maxCells) {
       truncated = true;
       break;
@@ -217,7 +288,18 @@ export function readCells(
     const cell = resolveCell(notebook, entry);
     const type = cellTypeOf(cell);
     const full = cell.getSource();
-    const cut = truncateUtf8(full, Math.max(0, maxBytes - used));
+    const remainder = position === 0 && sourceOffset > 0
+      ? sourceFromOffset(full, sourceOffset, entry.cellId)
+      : full;
+    const cut = truncateUtf8(remainder, Math.max(0, maxBytes - used));
+    if (cut.text.length === 0 && remainder.length > 0) {
+      const first = Buffer.from(remainder, 'utf8');
+      let requiredBytes = 1;
+      while (requiredBytes < first.length && (first[requiredBytes]! & 0xc0) === 0x80) requiredBytes++;
+      throw coreError('RESOURCE_LIMIT', 'the next UTF-8 code point exceeds the cell-read byte budget', {
+        details: { cell_id: entry.cellId, required_bytes: requiredBytes, max_bytes: maxBytes - used }
+      });
+    }
     used += utf8Length(cut.text);
     const attachments =
       type === 'code' ? undefined : (cell as { getAttachments?: () => unknown }).getAttachments?.();
@@ -227,8 +309,8 @@ export function readCells(
       index: entry.index,
       cellType: type,
       source: cut.text,
-      sourceTruncated: cut.text.length !== full.length,
-      sourceBytes: cut.totalBytes,
+      sourceTruncated: cut.text.length !== remainder.length,
+      sourceBytes: utf8Length(full),
       metadata: (cell.getMetadata() ?? {}) as Record<string, unknown>,
       ...(attachments === undefined || attachments === null
         ? {}
@@ -240,7 +322,16 @@ export function readCells(
       ...(state === undefined ? {} : { executionState: state })
     });
     taken++;
-    if (cut.text.length !== full.length) truncated = true;
+    if (cut.text.length !== remainder.length) {
+      truncated = true;
+      const consumed = sourceOffset + utf8Length(cut.text);
+      return {
+        cells,
+        truncated: true,
+        structureRevision: structure,
+        nextCursor: makeSourceCursor(binding, entry, sourceRevision(type, full), consumed)
+      };
+    }
   }
 
   const more = paged && offset + taken < index.size;

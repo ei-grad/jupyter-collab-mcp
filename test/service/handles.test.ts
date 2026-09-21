@@ -326,7 +326,7 @@ describe('output snapshots', () => {
       sessionId: session.sessionId,
       path: 'a.ipynb'
     });
-    const text = '😀¢€😀';
+    const text = '😀¢€😀'.repeat(100);
     const cellId = opened.summary.cells[0]!.cellId;
     const cell = rig.handles[0]!.notebook.getCell(0) as unknown as {
       setOutputs(outputs: unknown[]): void;
@@ -362,7 +362,7 @@ describe('output snapshots', () => {
           sessionId: session.sessionId,
           outputId: snapshot.outputId,
           cursor: 'oc_1' as never,
-          limits: { maxBytes: 4 }
+          limits: { maxBytes: 1_000 }
         })
       )
     ).toBe('CURSOR_EXPIRED');
@@ -376,7 +376,7 @@ describe('output snapshots', () => {
         sessionId: session.sessionId,
         outputId: snapshot.outputId,
         ...(cursor === undefined ? {} : { cursor: cursor as never }),
-        limits: { maxBytes: 4 }
+        limits: { maxBytes: 1_000 }
       });
       expect(chunk.byteOffset).toBe(deliveredBytes);
       expect(chunk.data).not.toContain('�');
@@ -388,7 +388,6 @@ describe('output snapshots', () => {
     } while (cursor !== undefined);
 
     expect(chunks.join('')).toBe(text);
-    expect(byteLengths).toEqual([4, 2, 3, 4]);
     expect(deliveredBytes).toBe(Buffer.byteLength(text, 'utf8'));
   });
 });

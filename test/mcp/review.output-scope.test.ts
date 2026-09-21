@@ -13,6 +13,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import type { CollabService } from '../../src/core/index.js';
+import { jsonByteSize } from '../../src/mcp/index.js';
 import { createCollabService } from '../../src/service/index.js';
 import type { NotebookHandle } from '../../src/service/index.js';
 import { makeFakeHandle, makeFakeServer } from '../service/helpers.js';
@@ -119,5 +120,36 @@ describe('output snapshots stay inside their working context', () => {
     await expect(
       connection.client.readResource({ uri: `jupyter-output:${owned.outputId}` })
     ).rejects.toThrow(/HANDLE_EXPIRED/u);
+  });
+
+  it('keeps default output_read chunks within the MCP budget and losslessly pages text', async () => {
+    const { connection, handles } = await rig();
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const cellId = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_id']);
+    const output = 'x'.repeat(100_000);
+    const cell = handles[0]!.notebook.getCell(0) as unknown as { setOutputs(outputs: unknown[]): void };
+    cell.setOutputs([{ output_type: 'stream', name: 'stdout', text: output }]);
+    const outputs = await connection.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'outputs',
+      cell_ids: [cellId],
+      limits: { max_bytes: 1 }
+    });
+    const outputId = String(((((outputs.structuredContent?.['cells'] as Record<string, unknown>[])[0]!['outputs'] as Record<string, unknown>[])[0]!['snapshot'] as Record<string, unknown>)['output_id']));
+
+    const chunks: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const answer = await connection.call('output_read', {
+        output_id: outputId,
+        ...(cursor === undefined ? {} : { cursor })
+      });
+      expect(answer.isError).not.toBe(true);
+      expect(jsonByteSize(answer.structuredContent)).toBeLessThanOrEqual(64 * 1024);
+      chunks.push(String(answer.structuredContent?.['data']));
+      cursor = answer.structuredContent?.['next_cursor'] as string | undefined;
+    } while (cursor !== undefined);
+    expect(chunks.join('')).toBe(output);
   });
 });

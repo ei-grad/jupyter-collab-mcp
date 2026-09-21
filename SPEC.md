@@ -144,6 +144,11 @@ All handles are opaque and belong to a specific service process. A supplied
 global "current notebook." Likewise, an `execution_id` addresses a specific
 execution. After a restart, old handles return `HANDLE_EXPIRED`. The agent
 explicitly reopens the document; unfinished code is not automatically retried.
+The MCP adapter may present notebook, durable cell, execution, output, and
+revision values as short typed references. Each reference expands only inside
+the connection that issued it, never in notebook payload data, and is never
+reused after close or restart. Full opaque values remain accepted for compatible
+callers and remain the values used for identity and revision comparisons.
 Creation-tool descriptions and responses state lifetimes: notebook handles
 last until explicitly closed or the connection context ends. Jobs are released
 with their notebook; bounded output snapshots expire on eviction or context
@@ -455,6 +460,13 @@ within an API version; a short display hash is not used for stale-edit
 protection. Shared `execution_state` and `notebook_metadata_revision` are also
 returned. The latter covers notebook metadata, excluding internal state and
 awareness.
+
+A cells read that cuts source text returns a source cursor. Continuing it must
+serve the remaining UTF-8 bytes of that same cell before any later cell. The
+cursor binds the current cell object identity, source revision, structural
+binding, and byte offset; a source edit, replacement, reorder, add, or delete
+expires it with `CURSOR_EXPIRED`. A response never issues a source cursor that
+cannot advance because the next UTF-8 code point exceeds its byte budget.
 
 Source replacement requires `expected_source_revision`. Full replacement is
 applied as minimal changes to the existing Y.Text, preserving the cell object.
@@ -878,9 +890,11 @@ live handle within its automatic context.
 
 Tool errors return `isError: true` and structured `code`, `message`,
 `retryable`, and `side_effects: none|applied|unknown`; when applicable, also
-`execution_id` and the current revision. The SDK handles malformed JSON-RPC. A
-Python error is a specific execution result with state `failed`; MCP transport
-may remain healthy. [MCP tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
+`execution_id`, `execution_ids`, and the current revision. Sanitized recovery
+details are present in the text content as well as the structured error metadata.
+The SDK handles malformed JSON-RPC. A Python error is a specific execution
+result with state `failed`; MCP transport may remain healthy.
+[MCP tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
 
 The defaults below apply before a new call's effects. `side_effects` refers to
 the document/file/kernel; number acceptance is reflected in `request_accepted`.
@@ -969,10 +983,12 @@ interrupted automatically.
 
 Page-read cursors are bound to a revision: structural changes between pages
 return `CURSOR_EXPIRED` to avoid missing or duplicating cells. Continuing an
-unchanged large output must not retransmit chunks already returned. Text output
-chunks and their cursors must begin and end on UTF-8 code-point boundaries. If
-the next code point exceeds the requested byte budget, `output_read` returns
-`RESOURCE_LIMIT` without advancing the cursor.
+unchanged large output must not retransmit chunks already returned. `output_read`
+budgets the complete encoded response, including JSON escaping, envelope, and
+base64 expansion; a successful answer never exceeds the configured response
+limit. Text output chunks and their cursors must begin and end on UTF-8
+code-point boundaries. If the next code point exceeds the requested byte budget,
+`output_read` returns `RESOURCE_LIMIT` without advancing the cursor.
 An `execution_get` cursor identifies both the mutable output-state version and
 the delivered position within that version for every cell. If an already
 delivered stream or display is updated, or the output area is cleared, the

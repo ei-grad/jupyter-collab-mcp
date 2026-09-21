@@ -52,6 +52,7 @@ import type {
   Operation,
   OperationResult,
   PageCursor,
+  SourceCursor,
   PersistenceState,
   ReadView,
   SaveStatus,
@@ -520,7 +521,7 @@ export interface NotebookCellsReadRequest {
   readonly view: 'cells';
   /** Explicit selection; mutually exclusive with {@link cursor}. */
   readonly cellIds?: readonly string[];
-  readonly cursor?: PageCursor;
+  readonly cursor?: PageCursor | SourceCursor;
   readonly limits?: ResponseLimits;
 }
 
@@ -551,7 +552,7 @@ export interface NotebookCellsReadResult extends NotebookReadCommon {
   readonly view: 'cells';
   readonly cells: readonly CellContent[];
   readonly truncated: boolean;
-  readonly nextCursor?: PageCursor;
+  readonly nextCursor?: PageCursor | SourceCursor;
   readonly notebookMetadata?: Readonly<Record<string, unknown>>;
   readonly notebookMetadataRevision: NotebookMetadataRevision;
 }

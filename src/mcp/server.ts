@@ -49,6 +49,7 @@ import type {
 } from '../core/index.js';
 import { TOOL_SPECS, TOOL_SPECS_BY_NAME } from './schemas.js';
 import type { ToolSpec } from './schemas.js';
+import { ReferenceAliases } from './references.js';
 import {
   DEFAULT_RESPONSE_MAX_BYTES,
   boundPayload,
@@ -140,6 +141,7 @@ export interface WireError {
   readonly next_request_id?: string | null;
   readonly request_accepted?: boolean | null;
   readonly execution_id?: string;
+  readonly execution_ids?: readonly string[];
   readonly revision?: string;
   readonly details?: Record<string, unknown>;
 }
@@ -184,6 +186,7 @@ export function toWireError(thrown: unknown): WireError {
   const nextRequestId = pick(details, 'next_request_id', 'nextRequestId');
   const requestAccepted = pick(details, 'request_accepted', 'requestAccepted');
   const executionId = pick(details, 'execution_id', 'executionId');
+  const executionIds = pick(details, 'execution_ids', 'executionIds');
   const revision = pick(details, 'revision');
 
   return {
@@ -194,13 +197,27 @@ export function toWireError(thrown: unknown): WireError {
     ...(typeof nextRequestId === 'string' || nextRequestId === null ? { next_request_id: nextRequestId } : {}),
     ...(typeof requestAccepted === 'boolean' || requestAccepted === null ? { request_accepted: requestAccepted } : {}),
     ...(typeof executionId === 'string' ? { execution_id: executionId } : {}),
+    ...(Array.isArray(executionIds) && executionIds.every((value) => typeof value === 'string')
+      ? { execution_ids: executionIds as string[] }
+      : {}),
     ...(typeof revision === 'string' ? { revision } : {}),
     ...(details === undefined ? {} : { details })
   };
 }
 
-function errorResult(thrown: unknown, maxBytes: number): CallToolResult {
-  const wire = toWireError(thrown);
+function presentWireError(wire: WireError, references: ReferenceAliases): WireError {
+  const { details, ...base } = wire;
+  const presented = references.presentValue(base as unknown as WireValue) as unknown as WireError;
+  return details === undefined
+    ? presented
+    : {
+        ...presented,
+        details: references.presentValue(details as unknown as WireValue) as unknown as Record<string, unknown>
+      };
+}
+
+function errorResult(thrown: unknown, maxBytes: number, references: ReferenceAliases): CallToolResult {
+  const wire = presentWireError(toWireError(thrown), references);
   const head = `${wire.code}: ${wire.message}`;
   const facts = [
     `retryable=${String(wire.retryable)}`,
@@ -208,9 +225,11 @@ function errorResult(thrown: unknown, maxBytes: number): CallToolResult {
     ...(wire.next_request_id === undefined ? [] : [`next_request_id=${String(wire.next_request_id)}`]),
     ...(wire.request_accepted === undefined ? [] : [`request_accepted=${String(wire.request_accepted)}`]),
     ...(wire.execution_id === undefined ? [] : [`execution_id=${wire.execution_id}`]),
+    ...(wire.execution_ids === undefined ? [] : [`execution_ids=${wire.execution_ids.join(',')}`]),
     ...(wire.revision === undefined ? [] : [`revision=${wire.revision}`])
   ].join(' ');
-  const text = boundText(`${head}\n${facts}`, maxBytes).text;
+  const diagnostics = wire.details === undefined ? '' : `\ndetails=${JSON.stringify(wire.details)}`;
+  const text = boundText(`${head}\n${facts}${diagnostics}`, maxBytes).text;
   return {
     content: [{ type: 'text', text }],
     isError: true,
@@ -219,7 +238,12 @@ function errorResult(thrown: unknown, maxBytes: number): CallToolResult {
 }
 
 /** Build the `INVALID_ARGUMENT` answer for arguments that failed the schema. */
-function invalidArgument(tool: string, issues: readonly z.core.$ZodIssue[], maxBytes: number): CallToolResult {
+function invalidArgument(
+  tool: string,
+  issues: readonly z.core.$ZodIssue[],
+  maxBytes: number,
+  references: ReferenceAliases
+): CallToolResult {
   const detail = issues
     .slice(0, 8)
     .map((issue) => `${issue.path.length === 0 ? '(root)' : issue.path.join('.')}: ${issue.message}`)
@@ -231,7 +255,8 @@ function invalidArgument(tool: string, issues: readonly z.core.$ZodIssue[], maxB
         issues: issues.slice(0, 8).map((issue) => ({ path: issue.path.join('.'), message: issue.message }))
       }
     }),
-    maxBytes
+    maxBytes,
+    references
   );
 }
 
@@ -361,10 +386,18 @@ function envelopeLine(payload: WireObject): string[] {
 
 function cellLines(cells: WireValue | undefined, limit = 20): string[] {
   if (!Array.isArray(cells)) return [];
-  return cells.slice(0, limit).map((cell) => {
+  return cells.slice(0, limit).flatMap((cell) => {
     if (!isObject(cell)) return '  -';
     const state = cell['state'] ?? cell['execution_state'];
-    return `  ${s(cell['index'])} ${s(cell['cell_id'])} ${s(cell['cell_type'] ?? state)} ${s(cell['preview'] ?? cell['state'] ?? '')}`.trimEnd();
+    const refs = [
+      `source_revision=${s(cell['source_revision'])}`,
+      `cell_revision=${s(cell['cell_revision'])}`,
+      ...(cell['outputs_revision'] === undefined ? [] : [`outputs_revision=${s(cell['outputs_revision'])}`])
+    ];
+    const row = `  index=${s(cell['index'])} cell_id=${s(cell['cell_id'])} type=${s(cell['cell_type'] ?? state)} ${refs.join(' ')} ${s(cell['preview'] ?? cell['state'] ?? '')}`.trimEnd();
+    return typeof cell['source'] === 'string'
+      ? [row, `    source=${JSON.stringify(cell['source'])}`]
+      : [row];
   });
 }
 
@@ -420,11 +453,12 @@ export function renderText(tool: string, payload: WireObject): string {
       const summary = payload['summary'];
       if (isObject(summary)) {
         lines.push(`cells=${s(summary['cell_count'])} truncated=${s(summary['truncated'])}`);
+        if (payload['next_cursor'] !== undefined) lines.push(`next_cursor=${s(payload['next_cursor'])}`);
         lines.push(...cellLines(summary['cells']));
       } else {
+        if (payload['next_cursor'] !== undefined) lines.push(`next_cursor=${s(payload['next_cursor'])}`);
         lines.push(...cellLines(payload['cells']));
       }
-      if (payload['next_cursor'] !== undefined) lines.push(`next_cursor=${s(payload['next_cursor'])}`);
       break;
     }
     case 'notebook_apply': {
@@ -469,6 +503,7 @@ export function renderText(tool: string, payload: WireObject): string {
         `output ${s(payload['output_id'])} ${s(payload['mime_type'])} ${s(payload['encoding'])} bytes ${s(payload['byte_offset'])}..+${String((payload['data'] as string | undefined)?.length ?? 0)} of ${s(payload['byte_size'])} truncated=${s(payload['truncated'])}`
       );
       if (payload['next_cursor'] !== undefined) lines.push(`next_cursor=${s(payload['next_cursor'])}`);
+      lines.push(`data=${JSON.stringify(payload['data'] ?? '')}`);
       break;
     case 'execution_cancel':
       lines.push(
@@ -635,9 +670,10 @@ export function createMcpServer(service: CollabService, options: McpServerOption
     { name: resolved.name, version: resolved.version },
     { capabilities: { tools: {}, resources: {} } }
   );
+  const references = new ReferenceAliases();
 
-  for (const spec of TOOL_SPECS) registerTool(server, service, spec, resolved);
-  registerOutputResources(server, service, resolved);
+  for (const spec of TOOL_SPECS) registerTool(server, service, spec, resolved, references);
+  registerOutputResources(server, service, resolved, references);
 
   return server;
 }
@@ -646,7 +682,8 @@ function registerTool(
   server: McpServer,
   service: CollabService,
   spec: ToolSpec,
-  options: ResolvedOptions
+  options: ResolvedOptions,
+  references: ReferenceAliases
 ): void {
   server.registerTool(
     spec.name,
@@ -667,22 +704,28 @@ function registerTool(
       const parsed = spec.input.safeParse(rawArgs ?? {});
       if (!parsed.success) {
         options.log('debug', `${spec.name}: invalid arguments`);
-        return invalidArgument(spec.name, parsed.error.issues, options.responseMaxBytes);
+        return invalidArgument(spec.name, parsed.error.issues, options.responseMaxBytes, references);
       }
       try {
-        const result = await dispatch(service, spec.name, fromWire(parsed.data));
-        return buildResult(spec.name, result, options);
+        const request = references.resolveValue(parsed.data as unknown as WireValue);
+        const result = await dispatch(service, spec.name, fromWire(request));
+        return buildResult(spec.name, result, options, references);
       } catch (thrown) {
         options.log('debug', `${spec.name}: ${toWireError(thrown).code}`);
-        return errorResult(thrown, options.responseMaxBytes);
+        return errorResult(thrown, options.responseMaxBytes, references);
       }
     }
   );
 }
 
 /** Assemble content blocks and `structuredContent` from a service result. */
-function buildResult(tool: string, result: unknown, options: ResolvedOptions): CallToolResult {
-  const wire = publicResult(toWire(result));
+function buildResult(
+  tool: string,
+  result: unknown,
+  options: ResolvedOptions,
+  references: ReferenceAliases
+): CallToolResult {
+  const wire = references.presentValue(publicResult(toWire(result)));
   const base: WireObject = typeof wire === 'object' && wire !== null && !Array.isArray(wire) ? wire : { result: wire };
   const extracted = extractOutputContent(tool, base, options);
   let bounded;
@@ -752,7 +795,12 @@ function publicResult(value: WireValue): WireValue {
   return result;
 }
 
-function registerOutputResources(server: McpServer, service: CollabService, options: ResolvedOptions): void {
+function registerOutputResources(
+  server: McpServer,
+  service: CollabService,
+  options: ResolvedOptions,
+  references: ReferenceAliases
+): void {
   const listSnapshots = async (cursor?: string): Promise<{
     resources: { uri: string; name: string; mimeType: string; description: string }[];
     nextCursor?: string;
@@ -761,7 +809,7 @@ function registerOutputResources(server: McpServer, service: CollabService, opti
     return {
       resources: listed.resources.map((entry) => ({
         uri: entry.uri,
-        name: entry.name,
+        name: references.present('output', entry.outputId),
         mimeType: entry.mimeType,
         description: `Output snapshot of execution ${entry.executionId}, ${String(entry.byteSize)} bytes.`
       })),
@@ -790,11 +838,11 @@ function registerOutputResources(server: McpServer, service: CollabService, opti
             uri: contents.uri,
             mimeType: 'application/json',
             text: JSON.stringify({
-              output_id: contents.outputId,
+              output_id: references.present('output', contents.outputId),
               mime_type: contents.mimeType,
               byte_size: contents.byteSize,
               truncated: true,
-              read_more: `too large for resources/read — call output_read with output_id ${contents.outputId}`
+              read_more: `too large for resources/read — call output_read with output_id ${references.present('output', contents.outputId)}`
             })
           }
         ]

@@ -210,7 +210,14 @@ describe('error mapping', () => {
         failWith: {
           method: 'notebookExecute',
           error: coreError('KERNEL_NOT_BOUND', 'no kernel is bound to work/analysis.ipynb', {
-            details: { next_request_id: '4', request_accepted: false, execution_id: 'exe_9', revision: 's1_x' }
+            details: {
+              next_request_id: '4',
+              request_accepted: false,
+              execution_id: 'exe_9',
+              execution_ids: ['exe_9', 'exe_10'],
+              revision: 's1_x',
+              cell_id: 'cell_a'
+            }
           })
         }
       }
@@ -223,12 +230,15 @@ describe('error mapping', () => {
       side_effects: 'none',
       next_request_id: '4',
       request_accepted: false,
-      execution_id: 'exe_9',
-      revision: 's1_x'
+      execution_id: 'exec_1',
+      execution_ids: ['exec_1', 'exec_2'],
+      revision: 'rev_1'
     });
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
     expect(text).toContain('KERNEL_NOT_BOUND');
     expect(text).toContain('next_request_id=4');
+    expect(text).toContain('execution_ids=exec_1,exec_2');
+    expect(text).toContain('"cell_id":"cell_1"');
   });
 
   it('maps an unknown throw to INTERNAL_ERROR with side_effects unknown', async () => {

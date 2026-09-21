@@ -99,6 +99,7 @@ export type {
   OutputSink,
   OutputSinkFactory,
   PageCursor,
+  SourceCursor,
   PersistenceState,
   ReadView,
   ReplaceSourceOperation,

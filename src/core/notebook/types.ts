@@ -21,6 +21,7 @@ import type {
   NotebookSummary,
   OperationResult,
   PageCursor,
+  SourceCursor,
   SetCellMetadataOperation,
   DeleteCellMetadataOperation,
   SetNotebookMetadataOperation,
@@ -148,7 +149,7 @@ export interface ReadLimits {
 /** Which cells to read; exactly one form, like the MCP arguments. */
 export type CellSelector =
   | { readonly cellIds: readonly string[]; readonly cursor?: never }
-  | { readonly cellIds?: never; readonly cursor?: PageCursor };
+  | { readonly cellIds?: never; readonly cursor?: PageCursor | SourceCursor };
 
 /** One cell of `notebook_read(view: 'cells')` (SPEC.md §9). */
 export interface CellRead {
@@ -176,8 +177,8 @@ export interface CellsRead {
   /** `true` when a limit stopped the read before the selection was exhausted. */
   readonly truncated: boolean;
   readonly structureRevision: StructureRevision;
-  /** Present when more cells remain; bound to the structural revision. */
-  readonly nextCursor?: PageCursor;
+  /** Present when source or later cells remain; bound to their current identity and revision. */
+  readonly nextCursor?: PageCursor | SourceCursor;
 }
 
 /**

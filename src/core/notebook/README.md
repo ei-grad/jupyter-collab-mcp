@@ -78,9 +78,9 @@ cursor. The binding value is opaque and appears externally only inside the
 `pg_` cursor.
 
 With a small `maxBytes`, `readCells` may truncate cell source
-(`sourceTruncated`, with the full size in `sourceBytes`) and advance the cursor
-to the next cell. `CellRead` has no continuation for source text; reread the
-same cell with a larger budget to obtain the omitted content.
+(`sourceTruncated`, with the full size in `sourceBytes`) and returns a source
+cursor. Continue it until that source is complete; it remains on the same cell
+and expires when the source, cell identity, or structure changes.
 
 ### Editing
 
