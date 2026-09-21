@@ -36,6 +36,7 @@ to the default `AUTH_MODE=oauth`.
 | `API_BASE_URL` | Operator-controlled JupyterHub proxy base |
 | `BROWSER_BASE_URL` | Display base; defaults to `API_BASE_URL` |
 | `ASSERTION_HEADER` | Upstream assertion header; default `X-Jupyter-Access-Token` |
+| `HUB_ADAPTER_URL` | Optional full own-user lifecycle endpoint under `API_BASE_URL`, e.g. `http://proxy-public.jupyter.svc.cluster.local/hub/api/faceapp/server`; absent disables Hub start support |
 | `RUNTIME_DIR` | Private worker directory; default `/run/mcp` |
 | `MAX_WORKERS` | Global process cap; default 16 |
 | `MAX_WORKERS_PER_PRINCIPAL` | Grant cap per OIDC principal; default 4 |

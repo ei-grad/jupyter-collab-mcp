@@ -84,6 +84,9 @@ import {
   type PageCursor,
   type ResponseLimits,
   type ServerListResult,
+  type ServerStatusRequest,
+  type ServerStatusResult,
+  type ServerStartRequest,
   type ServiceConfigInput,
   type SessionCloseRequest,
   type SessionCloseResult,
@@ -263,6 +266,93 @@ class CollabServiceImpl implements CollabService {
     return { ...await this.#servers.list(), nextRequestId: this.#implicitLedger.nextRequestId };
   }
 
+  async serverStatus(request: ServerStatusRequest): Promise<ServerStatusResult> {
+    this.#assertRunning();
+    const server = await this.#servers.select(request.serverId);
+    const hub = this.#servers.hubFor(server);
+    if (hub !== undefined) return { ...await hub.status(), nextRequestId: this.#implicitLedger.nextRequestId };
+    await this.#servers.clientFor(server).status();
+    return { serverId: server.id, state: 'ready', supportsStart: false, nextRequestId: this.#implicitLedger.nextRequestId };
+  }
+
+  async serverStart(request: ServerStartRequest): Promise<WithEnvelope<ServerStatusResult>> {
+    this.#assertRunning();
+    let accepted: Receipt | undefined;
+    let replayed = false;
+    const envelope = () => ({
+      nextRequestId: this.#implicitLedger.nextRequestId,
+      requestAccepted: accepted !== undefined,
+      ...(accepted === undefined ? {} : { replayed, firstAcceptedAt: accepted.firstAcceptedAt })
+    });
+    let result: WithEnvelope<ServerStatusResult>;
+    try {
+      result = await this.#implicitLock.run(async () => {
+        this.#assertRunning();
+        const server = await this.#servers.select(request.serverId);
+        const { requestId, waitMs: _waitMs, ...payload } = request;
+        const input = { tool: 'server_start' as const, requestId, target: server.id, payload };
+        const previous = this.#implicitLedger.preflight(input);
+        if (previous !== null) {
+          accepted = previous.receipt;
+          replayed = true;
+          if (accepted.failure !== null) throw accepted.failure;
+          if (accepted.replay?.kind !== 'value') throw coreError('REQUEST_ID_EXPIRED', 'start receipt is no longer available');
+          return { ...accepted.replay.value as ServerStatusResult, ...envelope() };
+        }
+        const hub = this.#servers.hubFor(server);
+        if (hub === undefined) throw coreError('UNSUPPORTED_OPERATION', 'server_start requires explicitly configured Hub lifecycle support');
+        if (request.profileId !== undefined && request.userOptions !== undefined) throw coreError('INVALID_ARGUMENT', 'choose profile_id or user_options');
+        if (request.userOptions !== undefined && (request.userOptions === null || typeof request.userOptions !== 'object' || Array.isArray(request.userOptions))) {
+          throw coreError('INVALID_ARGUMENT', 'user_options must be a JSON object');
+        }
+        if (request.waitMs !== undefined && (!Number.isFinite(request.waitMs) || request.waitMs < 0)) throw coreError('INVALID_ARGUMENT', 'wait_ms must be nonnegative');
+        const current = await hub.status();
+        let options = request.userOptions;
+        if (request.profileId !== undefined) {
+          const selected = current.startOptions?.profiles.find((entry) => entry.id === request.profileId);
+          if (selected === undefined) throw coreError('INVALID_ARGUMENT', 'unknown start profile; read server_status for available profiles');
+          options = selected.userOptions;
+        }
+        const { startOptions: _catalog, userOptions: _options, ...compactCurrent } = current;
+        const reserveBytes = Buffer.byteLength(JSON.stringify(compactCurrent), 'utf8') + 512;
+        const decision = this.#implicitLedger.begin({ ...input, reserveBytes });
+        accepted = decision.receipt;
+        try {
+          const status = await hub.start(options);
+          // Catalogs are discoverable through status and need not occupy every receipt.
+          const { startOptions: _catalog, userOptions: _options, ...compact } = status;
+          this.#implicitLedger.complete(accepted, { kind: 'value', value: compact }, 'applied');
+          return { ...compact, ...envelope() };
+        } catch (error) {
+          const core = toCoreError(error);
+          this.#implicitLedger.fail(accepted, core, core.sideEffects);
+          throw core;
+        }
+      });
+    } catch (error) {
+      throw withEnvelopeDetails(error, {
+        ...envelope(),
+        ...(isCoreError(error) && error.code === 'REQUEST_ID_EXPIRED' ? { requestAccepted: null } : {})
+      });
+    }
+    // The receipt is complete before polling, so a cancelled wait neither
+    // blocks other mutations nor leaves an accepted start eligible for resend.
+    const deadline = Date.now() + Math.min(request.waitMs ?? 0, this.#config.limits.maxWaitMs);
+    while (!replayed && result.state === 'starting' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, deadline - Date.now())));
+      if (Date.now() >= deadline) break;
+      this.#assertRunning();
+      const hub = this.#servers.hubFor(await this.#servers.select(result.serverId))!;
+      const signal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+      try { result = { ...await hub.status(signal), ...envelope() }; }
+      catch (error) {
+        if (signal.aborted) break;
+        throw withEnvelopeDetails(error, envelope());
+      }
+    }
+    return { ...result, ...envelope() };
+  }
+
   /** Resolve a library session or lazily bind a server to this MCP connection. */
   async #sessionFor(request: { readonly sessionId?: string; readonly serverId?: string }): Promise<WorkingSession> {
     if (request.sessionId !== undefined) {
@@ -274,7 +364,7 @@ class CollabServiceImpl implements CollabService {
       let pending = this.#implicitSessions.get(server.id);
       if (pending === undefined) {
         pending = (async () => {
-          await this.#servers.clientFor(server).status();
+          await this.#servers.prepare(server);
           this.#assertRunning();
           return this.#sessions.open(server, undefined, { ledger: this.#implicitLedger, lock: this.#implicitLock });
         })();
@@ -297,7 +387,7 @@ class CollabServiceImpl implements CollabService {
     // Reaching the server here turns a bad credential or an unreachable host
     // into `AUTH_REQUIRED` / `NETWORK_ERROR` now, rather than into a confusing
     // failure of the first document call.
-    await this.#servers.clientFor(server).status();
+    await this.#servers.prepare(server);
     this.#assertRunning();
     const session = this.#sessions.open(server, request.label);
     return {

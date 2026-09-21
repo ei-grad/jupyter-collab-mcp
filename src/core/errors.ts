@@ -28,9 +28,8 @@
  *     rename on the standard manager (SPEC.md §6 "External file changes"),
  *     so a named create fails with `ALREADY_EXISTS` / `PERMISSION_DENIED` /
  *     `OPERATION_UNCERTAIN` instead.
- *   - `SERVER_NOT_RUNNING` — belongs to the optional JupyterHub lifecycle
- *     adapter (docs/CONNECTIONS.md §7), which is explicitly outside the first
- *     version. Add it here together with that adapter.
+ *   - `SERVER_NOT_RUNNING` requires confirmed Hub lifecycle evidence; an
+ *     arbitrary proxy failure never establishes that a user server is stopped.
  */
 export type ErrorCode =
   // --- arguments and unsupported operations (SPEC §9) -----------------------
@@ -38,6 +37,8 @@ export type ErrorCode =
   | 'UNSUPPORTED_OPERATION'
   // --- server selection (SPEC §6 item 1, §9) -------------------------------
   | 'SERVER_NOT_FOUND'
+  | 'SERVER_NOT_RUNNING'
+  | 'SERVER_OPTIONS_CONFLICT'
   | 'SERVER_SELECTION_REQUIRED'
   // --- authentication (SPEC §9, §11) ---------------------------------------
   | 'AUTH_REQUIRED'
@@ -123,6 +124,8 @@ export const DEFAULTS: Readonly<Record<ErrorCode, ErrorDefaults>> = Object.freez
   INVALID_ARGUMENT: { retryable: false, sideEffects: 'none' },
   UNSUPPORTED_OPERATION: { retryable: false, sideEffects: 'none' },
   SERVER_NOT_FOUND: { retryable: false, sideEffects: 'none' },
+  SERVER_NOT_RUNNING: { retryable: false, sideEffects: 'none' },
+  SERVER_OPTIONS_CONFLICT: { retryable: false, sideEffects: 'none' },
   SERVER_SELECTION_REQUIRED: { retryable: false, sideEffects: 'none' },
   AUTH_REQUIRED: { retryable: false, sideEffects: 'none' },
   PERMISSION_DENIED: { retryable: false, sideEffects: 'none' },

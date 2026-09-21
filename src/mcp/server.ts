@@ -28,6 +28,8 @@ import type { z } from 'zod';
 import { coreError, redactCredentials, toCoreError } from '../core/index.js';
 import type {
   CollabService,
+  ServerStatusRequest,
+  ServerStartRequest,
   ExecutionCancelRequest,
   ExecutionGetRequest,
   KernelControlRequest,
@@ -369,6 +371,10 @@ function cellLines(cells: WireValue | undefined, limit = 20): string[] {
 export function renderText(tool: string, payload: WireObject): string {
   const lines: string[] = [];
   switch (tool) {
+    case 'server_status':
+    case 'server_start':
+      lines.push(`${s(payload['server_id'])}: ${s(payload['state'])}; supports_start=${s(payload['supports_start'])}`);
+      break;
     case 'server_list': {
       const servers = payload['servers'];
       lines.push(`${Array.isArray(servers) ? servers.length : 0} server(s); discovery=${s(payload['discovery_enabled'])} selection_required=${s(payload['selection_required'])}`);
@@ -553,6 +559,10 @@ function summarizeOutput(output: WireObject): string {
  */
 async function dispatch(service: CollabService, tool: string, request: unknown): Promise<unknown> {
   switch (tool) {
+    case 'server_status':
+      return service.serverStatus(request as ServerStatusRequest);
+    case 'server_start':
+      return service.serverStart(request as ServerStartRequest);
     case 'server_list':
       return service.serverList();
     case 'notebook_list':

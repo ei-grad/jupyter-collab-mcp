@@ -122,6 +122,42 @@ Output snapshots are also exposed as `jupyter-output:` MCP resources
   summary, 64 KiB of text per response, 30 s of wait per call, 10 000 journal
   events, 32 replicas per process and 64 server bindings per connection context.
 
+## Optional JupyterHub lifecycle
+
+Standalone JupyterLab still needs only its URL and token:
+
+```sh
+JUPYTER_URL=http://127.0.0.1:8888 JUPYTER_TOKEN=example-token jupyter-collab-mcp
+```
+
+For standard JupyterHub, a minimal `--config hub.json` file is:
+
+```json
+{
+  "servers": [{
+    "id": "hub",
+    "kind": "jupyterhub",
+    "hub": {
+      "apiBaseUrl": "https://jupyter.example/hub/api",
+      "credentialRef": "env:JUPYTERHUB_API_TOKEN"
+    }
+  }]
+}
+```
+
+The client discovers its own Hub user, API version and same-origin singleuser
+URL. An optional `hubServerName` selects a named server. Keep an explicit
+`apiBaseUrl` and data-plane `credentialRef` when routing or credentials differ.
+Hub 5 needs own-user `read:servers` and `servers` permissions; Hub 6 uses
+`start:servers` for starting. Notebook access separately needs `access:servers`.
+
+`server_status` reports readiness and available start profiles. `server_start`
+explicitly starts or joins that server using the connection's `request_id`;
+it does not start a notebook kernel. A wait timeout leaves startup running.
+Normal notebook access never starts a stopped server, and conflicting options
+never restart a running server. Standard Hub profile choices can be supplied
+as `hub.startProfiles` entries with `id`, `title`, and `userOptions`.
+
 ## Development
 
 ```sh

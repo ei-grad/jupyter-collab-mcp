@@ -267,6 +267,27 @@ export interface ServerListResult {
 // session_open / session_close
 // ---------------------------------------------------------------------------
 
+export interface ServerStatusRequest {
+  readonly serverId?: string;
+}
+
+export interface ServerStartRequest extends ServerStatusRequest, WaitOptions {
+  readonly requestId: RequestId;
+  readonly profileId?: string;
+  readonly userOptions?: Readonly<Record<string, unknown>>;
+}
+
+export interface ServerStatusResult {
+  readonly serverId: string;
+  readonly state: 'ready' | 'stopped' | 'starting' | 'stopping' | 'failed' | 'unknown';
+  readonly supportsStart: boolean;
+  readonly hubUser?: string;
+  readonly hubServerName?: string;
+  readonly userOptions?: Readonly<Record<string, unknown>>;
+  readonly startOptions?: { readonly profiles: readonly import('./types.js').ServerStartProfile[] };
+  readonly nextRequestId?: RequestId | null;
+}
+
 /** Arguments of `session_open` (SPEC.md §9). */
 export interface SessionOpenRequest {
   /** Omitted only when exactly one server is available (SPEC.md §6 item 1). */
@@ -1164,6 +1185,8 @@ export interface CollabService {
    * descriptor whose reachability is unknown.
    */
   serverList(): Promise<ServerListResult>;
+  serverStatus(request: ServerStatusRequest): Promise<ServerStatusResult>;
+  serverStart(request: ServerStartRequest): Promise<WithEnvelope<ServerStatusResult>>;
 
   /**
    * Open a working session on one server. Starts no kernel and opens no

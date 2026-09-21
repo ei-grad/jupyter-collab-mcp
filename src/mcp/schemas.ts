@@ -12,7 +12,7 @@
  *
  * The descriptions are the agent's only documentation. Each one states what
  * the call *does* (including what it deliberately does not do), the lifetime
- * of any handle it returns, and — for the four deduplicated mutations — the
+ * of any handle it returns, and — for deduplicated mutations — the
  * sequential `request_id` rule. Nothing here describes an internal.
  *
  * @module
@@ -102,10 +102,19 @@ const SERVER_DESCRIPTOR = obj(
     api_base_url: str(),
     browser_base_url: str(),
     hub_user: str(),
-    hub_server_name: str()
+    hub_server_name: str(),
+    supports_start: bool()
   },
-  ['id', 'kind', 'api_base_url']
+  ['id', 'kind']
 );
+
+const SERVER_STATUS = result({
+  server_id: str(), state: str('ready | stopped | starting | stopping | failed | unknown'),
+  supports_start: bool(), hub_user: str(), hub_server_name: str(), user_options: anyObject(),
+  start_options: obj({ profiles: arr(obj({
+    id: str(), title: str(), description: str(), default: bool(), user_options: anyObject()
+  }, ['id', 'title', 'user_options'])) }, ['profiles'])
+}, ['server_id', 'state', 'supports_start']);
 
 const CELL_SUMMARY = obj(
   {
@@ -347,7 +356,7 @@ export interface ToolSpec {
   readonly output: JsonSchema;
   /** `true` when the tool changes no document, file or kernel state. */
   readonly readOnly: boolean;
-  /** `true` for the four tools that take a `request_id` (SPEC.md §9). */
+  /** `true` for tools that take a `request_id` (SPEC.md §9). */
   readonly deduplicated: boolean;
 }
 
@@ -357,8 +366,25 @@ const SEQUENTIAL =
 const NOT_A_TOOL_ERROR =
   'A Python error, an aborted or interrupted run and a lost kernel are job results (state failed / aborted / interrupted / unknown), never tool errors.';
 
-/** The 16 tools of SPEC.md §9, in the order of the table there. */
+/** The 18 tools of SPEC.md §9. */
 export const TOOL_SPECS: readonly ToolSpec[] = [
+  {
+    name: 'server_status', title: 'Inspect Jupyter server lifecycle',
+    description: 'Read server readiness, lifecycle support and available start profiles. Does not start a server or kernel. Use server_start explicitly for a stopped Hub server; use kernel_control separately to start a notebook kernel.',
+    input: z.object({ server_id: z.string().optional() }), output: SERVER_STATUS, readOnly: true, deduplicated: false
+  },
+  {
+    name: 'server_start', title: 'Start a JupyterHub user server',
+    description: `Explicitly start the configured own-user Hub server. Join an existing matching start; conflicting options never restart a server. Choose profile_id from server_status or supply user_options, not both. Omitting options preserves saved options; an empty object selects defaults. wait_ms only bounds observation; a timeout never cancels or retries a start. No kernel is started. ${SEQUENTIAL}`,
+    input: z.object({
+      server_id: z.string().optional(), request_id: requestId,
+      profile_id: z.string().min(1).optional(), user_options: z.record(z.string(), z.json()).optional(),
+      wait_ms: z.number().int().nonnegative().optional()
+    }).superRefine((value, context) => {
+      if (value.profile_id !== undefined && value.user_options !== undefined) context.addIssue({ code: 'custom', message: 'choose profile_id or user_options', path: ['user_options'] });
+    }),
+    output: SERVER_STATUS, readOnly: false, deduplicated: true
+  },
   {
     name: 'server_list',
     title: 'List Jupyter servers',
@@ -842,5 +868,5 @@ export const TOOL_SPECS_BY_NAME: ReadonlyMap<string, ToolSpec> = new Map(
   TOOL_SPECS.map((spec) => [spec.name, spec])
 );
 
-/** The names of the four deduplicated mutations (SPEC.md §9). */
+/** The names of deduplicated mutations (SPEC.md §9). */
 export const DEDUPLICATED_TOOLS: readonly string[] = TOOL_SPECS.filter((s) => s.deduplicated).map((s) => s.name);

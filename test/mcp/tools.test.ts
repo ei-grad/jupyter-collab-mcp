@@ -17,6 +17,8 @@ afterEach(async () => {
 
 const VALID_ARGS: Record<string, Record<string, unknown>> = {
   server_list: {},
+  server_status: {},
+  server_start: { request_id: '1' },
   notebook_list: { server_id: 'default', directory: 'work' },
   notebook_create: { server_id: 'default', request_id: '1', directory: 'work', name: 'new.ipynb' },
   notebook_open: { server_id: 'default', path: 'work/analysis.ipynb' },
@@ -52,12 +54,12 @@ const VALID_ARGS: Record<string, Record<string, unknown>> = {
 };
 
 describe('tools/list', () => {
-  it('publishes all 16 SPEC §9 tools with an input and an output schema', async () => {
+  it('publishes all 18 SPEC §9 tools with an input and an output schema', async () => {
     harness = await connect();
     const listed = await harness.client.listTools();
     const names = listed.tools.map((tool) => tool.name).sort();
     expect(names).toEqual(TOOL_SPECS.map((spec) => spec.name).sort());
-    expect(names).toHaveLength(16);
+    expect(names).toHaveLength(18);
     for (const tool of listed.tools) {
       expect(tool.inputSchema, tool.name).toBeDefined();
       expect(tool.inputSchema.type, tool.name).toBe('object');

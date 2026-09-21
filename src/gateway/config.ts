@@ -22,6 +22,7 @@ export interface GatewayConfig {
   readonly apiBaseUrl: URL;
   readonly browserBaseUrl: URL;
   readonly assertionHeader: string;
+  readonly hubAdapterUrl?: URL;
   readonly nodeCommand: string;
   readonly upstreamCli: string;
   readonly runtimeDir: string;
@@ -251,6 +252,12 @@ function loadCommonConfig(env: NodeJS.ProcessEnv): GatewayCommonConfig {
     throw new Error('explicit provisioned Hub user names are required');
   }
   const apiBaseUrl = validateJupyterUrl(required(env, 'API_BASE_URL'), 'API_BASE_URL');
+  const hubAdapterInput = env[`${PREFIX}HUB_ADAPTER_URL`];
+  const hubAdapterUrl = hubAdapterInput === undefined ? undefined : validateJupyterUrl(hubAdapterInput, 'HUB_ADAPTER_URL');
+  if (hubAdapterUrl !== undefined && (hubAdapterUrl.origin !== apiBaseUrl.origin ||
+      hubAdapterUrl.pathname !== `${apiBaseUrl.pathname.replace(/\/+$/u, '')}/hub/api/faceapp/server`)) {
+    throw new Error('HUB_ADAPTER_URL must be the own Hub lifecycle endpoint under API_BASE_URL');
+  }
   const sourceRuntime = fileURLToPath(import.meta.url).endsWith('.ts');
 
   return Object.freeze({
@@ -260,6 +267,7 @@ function loadCommonConfig(env: NodeJS.ProcessEnv): GatewayCommonConfig {
     allowMissingEmailVerified: parseBoolean(env, 'ALLOW_MISSING_EMAIL_VERIFIED'),
     allowedUsers,
     apiBaseUrl,
+    ...(hubAdapterUrl === undefined ? {} : { hubAdapterUrl }),
     browserBaseUrl: validateJupyterUrl(
       env[`${PREFIX}BROWSER_BASE_URL`] ?? apiBaseUrl.href,
       'BROWSER_BASE_URL'

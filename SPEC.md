@@ -678,6 +678,8 @@ read results and changes.
 | Tool | Primary arguments | Result/effect |
 | --- | --- | --- |
 | `server_list` | — | Safe descriptors for discovered/configured servers |
+| `server_status` | `server_id?` | Read-only readiness, `supports_start`, and available start profiles |
+| `server_start` | `server_id?`, `request_id`, `profile_id?` or `user_options?`, `wait_ms?` | Explicit own-user Hub singleuser start or join of an existing compatible start |
 | `notebook_list` | `server_id?`, `directory`, `cursor?` | Notebook files and available session information |
 | `notebook_create` | `server_id?`, `directory`, `name?`, `request_id` | Untitled → optional rename → open; actual path, fileId, notebook_id, changes_cursor |
 | `notebook_open` | `server_id?`, `path` | Reusable handle, lifetime, status, summary, and `changes_cursor` |
@@ -705,12 +707,76 @@ summary snapshot and `changes_cursor` are captured consistently, without an
 `await` between reading the model and recording the log boundary. `page_cursor`
 and `changes_cursor` have distinct, noninterchangeable types. Tool responses in
 a connection context also return the current `next_request_id`. Descriptions for
-`notebook_create`, `notebook_apply`, `notebook_execute`, and `kernel_control`
+`server_start`, `notebook_create`, `notebook_apply`, `notebook_execute`, and `kernel_control`
 require sequential calls within each connection context: send the next such call
 after the preceding response, using its number. This constrains tool-call
 acceptance; a returned `execution_id` may still be running. Reads, observation,
 wait cancellation, and operations in different connection contexts may proceed in
 parallel. Interrupt remains available after obtaining an execution handle.
+
+### Optional JupyterHub server lifecycle
+
+`server_list` contacts no upstream. `server_status` probes a standalone server
+without starting a local process and reports `supports_start: false`. A profile
+with explicit Hub lifecycle configuration reports lifecycle state
+`ready|stopped|starting|stopping|failed|unknown` and `supports_start: true`.
+Lifecycle concerns the whole singleuser server; it is independent of notebook
+handles and kernel start, interrupt, restart, and shutdown.
+
+Only `server_start` may send a Hub start request. Notebook/session opening,
+listing, reconnect, observation, process startup and receipt replay never start
+or resurrect a server. Confirmed stopped/failed state on opening yields
+`SERVER_NOT_RUNNING`; a proxy 503 is not evidence of stopped state. There is no
+server-stop tool, local process launcher, or automatic retry of a spawn.
+
+Start belongs to the same connection-wide request ledger used by notebook
+mutations, including before the first notebook is opened and across configured
+servers. Its receipt target includes the configured server ID. An accepted start
+is recorded before its first effect; replay is resolved before inspecting live
+Hub state. Replaying after idle culling cannot start another server. Lost POST
+confirmation is `OPERATION_UNCERTAIN` and is retained without retransmission.
+Start waiting occurs after its receipt completes and outside the mutation lock;
+it only observes state, is bounded by `maxWaitMs`, and never cancels a spawn.
+
+An already ready or starting server is joined when all explicitly requested
+option values agree. Conflicts yield `SERVER_OPTIONS_CONFLICT` without stopping,
+changing, or restarting the existing server. Cross-client start races are
+resolved against authoritative Hub state. A pending stop is not a new start.
+`profile_id` selects a catalog entry's `user_options`; arbitrary spawner keys
+inside `user_options` are preserved verbatim. Missing options reuse saved Hub
+options; explicit `{}` selects defaults on a stopped server and expresses no
+specific option constraint when joining an existing server.
+
+Standalone URL/token configuration is unchanged. Optional `hub` configuration
+supplies a control URL and credential reference, with token authentication by
+default. Standard Hub API major is discovered read-only from its API root;
+versions 5 and 6 receive their respective start-body schemas. Only the
+authenticated own user and a configured default/named server are targeted.
+The verified user is fixed for the client lifetime; a configured user must
+match it. Missing read permission is not interpreted as a stopped server.
+An absent selected entry in a scope-filtered server map requires an expanded
+`read:servers` grant covering that exact own user/server (or an established
+group membership); grants for another server do not establish absence.
+
+Hub-only profiles derive a same-origin own-user data-plane URL under the
+configured deployment prefix after authenticating the user. Explicit
+data-plane URLs remain authoritative. Returned model URLs cannot widen the
+credential origin or select another user's path; control requests do not
+follow redirects. Reusing a Hub credential for a data-plane origin requires
+the same configured origin; another origin needs an explicit data credential.
+Header authentication, credential refresh and expiry are separately configured
+on the control plane. `adapter-v1` is an optional deployment transport; the
+generic core assigns no meaning to a particular profile slug or cloud provider.
+Hub user/server URL components use Hub-compatible escaping, including literal
+`@` and escaped punctuation. Equivalent encodings are compared per path segment;
+decoding must never turn an encoded separator or traversal segment into an
+authorized route. A validated model URL supplies the spelling of a derived
+data-plane route; it never overrides an explicitly configured data-plane URL.
+
+Standard Hub exposes spawn failure through completed progress events rather
+than a server-model flag. A bounded read may establish `failed`; when Hub no
+longer retains that failure, a stopped model remains `stopped`. Catalog discovery
+is adapter-defined; standard Hub uses an optional operator-supplied catalog.
 
 Example edit arguments and the subsequent execution call:
 
@@ -745,7 +811,7 @@ back.
 ### Retries, errors, and response size
 
 Deduplication is required for `notebook_create`, `notebook_apply`,
-`notebook_execute`, and `kernel_control`. `request_id` is the canonical decimal
+`notebook_execute`, `kernel_control`, and `server_start`. `request_id` is the canonical decimal
 string of a positive 64-bit number increasing by one within the connection context;
 initial `next_request_id` is `"1"`. The client takes the number from that
 session's latest response, without incrementing or reconstructing it from
@@ -822,6 +888,8 @@ under a new ID.
 | --- | --- | --- | --- |
 | `INVALID_ARGUMENT`, `UNSUPPORTED_OPERATION` | false | none | Fix arguments/select a supported operation |
 | `SERVER_NOT_FOUND`, `SERVER_SELECTION_REQUIRED` | false | none | Configure/explicitly select a server |
+| `SERVER_NOT_RUNNING` | false | none | Inspect Hub state; starting requires an explicit `server_start` |
+| `SERVER_OPTIONS_CONFLICT` | false | none | Inspect existing start options; never stop or restart implicitly |
 | `AUTH_REQUIRED`, `PERMISSION_DENIED` | false | none | Fix credentials/permissions outside tool arguments |
 | `HANDLE_EXPIRED` | false | none | Explicitly reopen the notebook; do not retry code |
 | `NOT_READY` | true | none | Await readiness; for a terminal state, see the RTC code |

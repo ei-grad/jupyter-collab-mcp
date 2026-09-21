@@ -196,7 +196,7 @@ describe('the cli child process', () => {
       }
       const answers = lines.map((line) => JSON.parse(line) as { id?: number; result?: Record<string, unknown> });
       const tools = answers.find((answer) => answer.id === 2)?.result?.['tools'] as { name: string }[];
-      expect(tools).toHaveLength(16);
+      expect(tools).toHaveLength(18);
       const call = answers.find((answer) => answer.id === 3)?.result as { structuredContent?: Record<string, unknown> };
       expect(call.structuredContent?.['servers']).toBeDefined();
 

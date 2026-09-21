@@ -110,14 +110,14 @@ async function openContext(client?: McpChild): Promise<Context> {
 // ---------------------------------------------------------------------------
 
 describe('protocol surface', () => {
-  it('initialize pins 2026-07-28 and tools/list publishes all 16 tools with schemas', async () => {
+  it('initialize pins 2026-07-28 and tools/list publishes all 18 tools with schemas', async () => {
     // `client.connect` already completed the pinned handshake in beforeAll.
     expect(mcp.client.getServerVersion()?.name).toBe('jupyter-collab-mcp');
     expect(mcp.client.getServerCapabilities()?.tools).toBeDefined();
     expect(mcp.client.getServerCapabilities()?.resources).toBeDefined();
 
     const tools = (await mcp.client.listTools()).tools;
-    expect(tools).toHaveLength(16);
+    expect(tools).toHaveLength(18);
     expect(tools.map((tool) => tool.name).sort()).toEqual(
       [
         'execution_cancel',
@@ -135,7 +135,7 @@ describe('protocol surface', () => {
         'notebook_read',
         'notebook_save',
         'output_read',
-        'server_list'
+        'server_list', 'server_status', 'server_start'
       ].sort()
     );
     for (const tool of tools) {
@@ -148,7 +148,7 @@ describe('protocol surface', () => {
       expect(tool.outputSchema, `${tool.name} outputSchema`).toBeDefined();
       expect(String(tool.description ?? '').length).toBeGreaterThan(40);
     }
-    // The four deduplicated mutations, and only those, take a request_id.
+    // Every deduplicated mutation takes a request_id.
     const takesRequestId = (schema: unknown): boolean => {
       const node = obj(schema);
       return 'request_id' in obj(node['properties']);
@@ -157,7 +157,7 @@ describe('protocol surface', () => {
       .filter((tool) => takesRequestId(tool.inputSchema))
       .map((tool) => tool.name)
       .sort();
-    expect(withRequestId).toEqual(['kernel_control', 'notebook_apply', 'notebook_create', 'notebook_execute']);
+    expect(withRequestId).toEqual(['kernel_control', 'notebook_apply', 'notebook_create', 'notebook_execute', 'server_start']);
   });
 
   it('server_list shows the configured stand and no credential', async () => {

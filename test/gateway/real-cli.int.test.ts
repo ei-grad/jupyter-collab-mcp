@@ -186,7 +186,7 @@ describe('HTTP mode with the canonical stdio CLI', () => {
     }
 
     const tools = await rpc(baseUrl, 'first', 'tools/list');
-    expect(tools['tools']).toHaveLength(16);
+    expect(tools['tools']).toHaveLength(18);
     for (const tool of tools['tools'] as Array<{ name: string; inputSchema: Record<string, unknown> }>) {
       expect(tool.inputSchema['type'], tool.name).toBe('object');
       expect(tool.inputSchema['properties'], tool.name).toBeDefined();

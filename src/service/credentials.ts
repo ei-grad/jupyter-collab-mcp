@@ -15,6 +15,7 @@ import { readFileSync } from 'node:fs';
 import {
   coreError,
   type CredentialRef,
+  type HubLifecycleConfig,
   type ResolvedServer,
   type ServerProfile
 } from '../core/index.js';
@@ -82,10 +83,18 @@ export function resolveCredential(ref: CredentialRef, sources: CredentialSources
 /** Validate and normalize every externally supplied URL on a server profile. */
 export function validateServerProfile(
   profile: ServerProfile
-): ServerProfile & { readonly wsBaseUrl: string } {
-  const apiBaseUrl = validateBaseUrl(profile.apiBaseUrl, 'http', 'API base URL');
-  const wsBaseUrl = validateBaseUrl(
-    profile.wsBaseUrl ?? deriveWsBaseUrl(apiBaseUrl),
+): ServerProfile {
+  const hub = hubConfig(profile);
+  if (profile.kind !== 'standalone' && profile.kind !== 'jupyterhub') {
+    throw coreError('INVALID_ARGUMENT', 'unknown server kind');
+  }
+  if (profile.apiBaseUrl === undefined && hub === undefined) {
+    throw coreError('INVALID_ARGUMENT', 'an API base URL or Hub lifecycle configuration is required');
+  }
+  const apiBaseUrl = profile.apiBaseUrl === undefined ? undefined : validateBaseUrl(profile.apiBaseUrl, 'http', 'API base URL');
+  const wsInput = profile.wsBaseUrl ?? (apiBaseUrl === undefined ? undefined : deriveWsBaseUrl(apiBaseUrl));
+  const wsBaseUrl = wsInput === undefined ? undefined : validateBaseUrl(
+    wsInput,
     'websocket',
     'WebSocket base URL'
   );
@@ -95,10 +104,43 @@ export function validateServerProfile(
       : validateBaseUrl(profile.browserBaseUrl, 'http', 'browser base URL');
   return {
     ...profile,
-    apiBaseUrl,
-    wsBaseUrl,
+    ...(apiBaseUrl === undefined ? {} : { apiBaseUrl }),
+    ...(wsBaseUrl === undefined ? {} : { wsBaseUrl }),
+    ...(profile.hub === undefined ? {} : { hub: hub! }),
     ...(browserBaseUrl === undefined ? {} : { browserBaseUrl })
   };
+}
+
+/** Legacy flat control fields remain accepted; the nested form separates auth. */
+export function hubConfig(profile: ServerProfile): HubLifecycleConfig | undefined {
+  if (profile.hub !== undefined && (profile.hubApiBaseUrl !== undefined || profile.hubCredentialRef !== undefined)) {
+    throw coreError('INVALID_ARGUMENT', 'choose nested or flat Hub configuration');
+  }
+  const input = profile.hub ?? (profile.hubApiBaseUrl === undefined ? undefined : {
+    apiBaseUrl: profile.hubApiBaseUrl,
+    credentialRef: profile.hubCredentialRef ?? profile.credentialRef!
+  });
+  if (input === undefined) return undefined;
+  if (profile.kind !== 'jupyterhub' || typeof input.credentialRef !== 'string') {
+    throw coreError('INVALID_ARGUMENT', 'Hub lifecycle requires a jupyterhub profile and credential reference');
+  }
+  if (input.protocol !== undefined && input.protocol !== 'jupyterhub' && input.protocol !== 'adapter-v1') {
+    throw coreError('INVALID_ARGUMENT', 'unsupported Hub lifecycle protocol');
+  }
+  const apiBaseUrl = validateBaseUrl(input.apiBaseUrl, 'http', 'Hub API base URL');
+  if (input.protocol !== 'adapter-v1' && !new URL(apiBaseUrl).pathname.endsWith('/hub/api')) {
+    throw coreError('INVALID_ARGUMENT', 'Hub API base URL must end in /hub/api');
+  }
+  if (profile.hubUser !== undefined && (typeof profile.hubUser !== 'string' || !profile.hubUser || /[/\\\0]/u.test(profile.hubUser))) {
+    throw coreError('INVALID_ARGUMENT', 'invalid configured Hub user');
+  }
+  if (profile.hubServerName !== undefined && (typeof profile.hubServerName !== 'string' || /[/\\\0]/u.test(profile.hubServerName) || ['.', '..'].includes(profile.hubServerName))) {
+    throw coreError('INVALID_ARGUMENT', 'invalid configured Hub server name');
+  }
+  if (input.protocol === 'adapter-v1' && profile.hubServerName) {
+    throw coreError('UNSUPPORTED_OPERATION', 'this adapter manages the default server only');
+  }
+  return { ...input, apiBaseUrl };
 }
 
 /** Profile plus its resolved credential, ready for `src/jupyter`. */
@@ -108,8 +150,16 @@ export function resolveServer(
 ): ResolvedServer {
   const validated = validateServerProfile(profile);
   const apiBaseUrl = validated.apiBaseUrl;
-  const wsBaseUrl = validated.wsBaseUrl;
-  const auth = validated.auth;
+  if (apiBaseUrl === undefined) throw coreError('NOT_READY', 'Hub data-plane URL has not been resolved');
+  const wsBaseUrl = validated.wsBaseUrl ?? deriveWsBaseUrl(apiBaseUrl);
+  const inherited = validated.credentialRef === undefined ? hubConfig(validated) : undefined;
+  if (inherited !== undefined && new URL(inherited.apiBaseUrl).origin !== new URL(apiBaseUrl).origin) {
+    throw coreError('INVALID_ARGUMENT', 'a different data-plane origin requires its own explicit credential');
+  }
+  const authentication = inherited ?? validated;
+  const credentialRef = authentication.credentialRef;
+  if (credentialRef === undefined) throw coreError('AUTH_REQUIRED', 'a data-plane credential reference is required');
+  const auth = authentication.auth;
   if (auth !== undefined && (auth === null || !['token', 'header'].includes(auth.type))) {
     throw coreError('INVALID_ARGUMENT', 'unsupported authentication type');
   }
@@ -118,35 +168,35 @@ export function resolveServer(
        /^(authorization|proxy-authorization|cookie|host|connection|upgrade|content-.*|transfer-encoding|sec-websocket-.*)$/i.test(auth.name))) {
     throw coreError('INVALID_ARGUMENT', 'invalid authentication header name');
   }
-  if (validated.credentialRefresh !== undefined &&
-      (validated.credentialRefresh !== 'request' || auth?.type !== 'header' ||
-       !validated.credentialRef.startsWith('file:'))) {
+  if (authentication.credentialRefresh !== undefined &&
+      (authentication.credentialRefresh !== 'request' || auth?.type !== 'header' ||
+       !credentialRef.startsWith('file:'))) {
     throw coreError('INVALID_ARGUMENT', 'request credential refresh requires file header authentication');
   }
-  if (validated.credentialExpiry !== undefined &&
-      (validated.credentialExpiry !== 'jwt' || validated.credentialRefresh !== 'request')) {
+  if (authentication.credentialExpiry !== undefined &&
+      (authentication.credentialExpiry !== 'jwt' || authentication.credentialRefresh !== 'request')) {
     throw coreError('INVALID_ARGUMENT', 'JWT credential expiry requires request credential refresh');
   }
-  if (validated.credentialExpiresAt !== undefined &&
-      (!Number.isFinite(validated.credentialExpiresAt) || validated.credentialExpiry !== 'jwt')) {
+  if (authentication.credentialExpiresAt !== undefined &&
+      (!Number.isFinite(authentication.credentialExpiresAt) || authentication.credentialExpiry !== 'jwt')) {
     throw coreError('INVALID_ARGUMENT', 'credential deadline requires JWT credential expiry');
   }
   const readCredential = (): string => {
-    const credential = resolveCredential(validated.credentialRef, sources);
+    const credential = resolveCredential(credentialRef, sources);
     if ((auth?.type === 'header' && !credential) || /[^\x20-\x7e]/.test(credential)) {
       throw coreError('AUTH_REQUIRED', 'credential is not a valid authentication header value');
     }
-    if (validated.credentialExpiry === 'jwt') assertionDeadline(credential, validated.credentialExpiresAt);
+    if (authentication.credentialExpiry === 'jwt') assertionDeadline(credential, authentication.credentialExpiresAt);
     return credential;
   };
   const credential = readCredential();
   return {
-    profile: validated,
+    profile: { ...validated, ...authentication, apiBaseUrl },
     apiBaseUrl,
     wsBaseUrl,
     token: auth?.type === 'header' ? '' : credential,
     ...(auth?.type === 'header' ? { authHeaders: { [auth.name]: credential } } : {}),
-    ...(validated.credentialRefresh === 'request' && auth?.type === 'header'
+    ...(authentication.credentialRefresh === 'request' && auth?.type === 'header'
       ? { resolveAuthHeaders: () => ({ [auth.name]: readCredential() }) } : {})
   };
 }

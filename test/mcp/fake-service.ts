@@ -58,6 +58,9 @@ import type {
   OutputsRevision,
   PageCursor,
   ServerListResult,
+  ServerStatusRequest,
+  ServerStatusResult,
+  ServerStartRequest,
   SessionCloseRequest,
   SessionCloseResult,
   SessionOpenRequest,
@@ -210,6 +213,14 @@ export class FakeCollabService implements CollabService {
       discoveryEnabled: false,
       selectionRequired: false
     });
+  }
+
+  async serverStatus(request: ServerStatusRequest): Promise<ServerStatusResult> {
+    return this.record('serverStatus', request, { serverId: 'default', state: 'ready', supportsStart: true, nextRequestId: '5' });
+  }
+
+  async serverStart(request: ServerStartRequest): Promise<WithEnvelope<ServerStatusResult>> {
+    return this.record('serverStart', request, { serverId: 'default', state: 'ready', supportsStart: true, nextRequestId: '5', requestAccepted: true });
   }
 
   async sessionOpen(request: SessionOpenRequest): Promise<WithEnvelope<SessionOpenResult>> {

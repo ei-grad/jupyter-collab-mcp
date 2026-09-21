@@ -38,7 +38,8 @@ it.each([0, 3600])('binds SDK sessions to verified principals, isolates agents a
     .setAudience('aud').setSubject(`${user}-sub`).setJti(crypto.randomUUID())
     .setExpirationTime(Math.floor(Date.now() / 1000) + (expired ? -10 : 300)).sign(keys.privateKey);
   const assertions: string[] = [];
-  const registry = new WorkerRegistry({ ...config, apiBaseUrl: config.apiBaseUrl.href,
+  const { hubAdapterUrl, ...workerConfig } = config;
+  const registry = new WorkerRegistry({ ...workerConfig, ...(hubAdapterUrl === undefined ? {} : { hubAdapterUrl: hubAdapterUrl.href }), apiBaseUrl: config.apiBaseUrl.href,
     browserBaseUrl: config.browserBaseUrl.href, maxWorkers: 3, maxWorkersPerPrincipal: 2
   }, async (identity, digest) => {
     assertions.push(identity.assertion());

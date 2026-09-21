@@ -29,6 +29,14 @@ function environment(changes: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 }
 
 describe('gateway configuration', () => {
+  it('opts into the own Hub adapter without adding another credential origin', () => {
+    expect(loadGatewayConfig(environment()).hubAdapterUrl).toBeUndefined();
+    expect(loadGatewayConfig(environment({ JUPYTER_MCP_HUB_ADAPTER_URL: 'http://jupyter:8000/base/hub/api/faceapp/server' })).hubAdapterUrl?.href)
+      .toBe('http://jupyter:8000/base/hub/api/faceapp/server');
+    for (const url of ['https://evil.invalid/hub/api/faceapp/server', 'http://jupyter:8000/hub/api/faceapp/server', 'http://jupyter:8000/base/user/bob']) {
+      expect(() => loadGatewayConfig(environment({ JUPYTER_MCP_HUB_ADAPTER_URL: url }))).toThrow('HUB_ADAPTER_URL');
+    }
+  });
   it('loads the explicit operator boundary and source-runtime defaults', () => {
     const config = loadGatewayConfig(environment());
     expect(config.publicUrl.href).toBe('https://mcp.example.invalid/');

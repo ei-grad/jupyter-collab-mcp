@@ -115,6 +115,23 @@ function delayedFakeFactory(options: { firstCleanupFails?: boolean } = {}) {
 }
 
 describe('Node worker credential custody', () => {
+  it('pins optional control auth to the same private assertion and verified principal', async () => {
+    const config = await settings({ hubAdapterUrl: 'http://jupyter.internal/hub/api/faceapp/server' });
+    const actor = { ...identity(), grantId: 'grant', grantExpiresAt: Math.floor(Date.now() / 1000) + 120 };
+    const worker = await startNodeWorker(config, actor);
+    try {
+      const profile = JSON.parse(await readFile(join(worker.directory, 'profile.json'), 'utf8')) as {
+        servers: Array<{ hubUser: string; credentialRef: string; hub: Record<string, unknown> }>
+      };
+      expect(profile.servers[0]).toMatchObject({ hubUser: 'alice', hub: {
+        apiBaseUrl: config.hubAdapterUrl, protocol: 'adapter-v1',
+        credentialRef: profile.servers[0]?.credentialRef,
+        auth: { type: 'header', name: 'X-Jupyter-Access-Token' },
+        credentialRefresh: 'request', credentialExpiry: 'jwt', credentialExpiresAt: actor.grantExpiresAt
+      } });
+      expect(JSON.stringify(profile)).not.toContain(actor.assertion());
+    } finally { await worker.close(); }
+  });
   it('uses private files and passes no assertion through argv or env', async () => {
     const config = await settings();
     const worker = await startNodeWorker(config, identity('alice', 'grant-secret'));

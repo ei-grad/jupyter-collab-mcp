@@ -13,6 +13,14 @@ Work from IDs and revisions, never from remembered line numbers.
 
 1. `server_list` returns safe server descriptors and `next_request_id`.
    If selection is ambiguous, choose the intended configured `server_id`.
+   `server_status {server_id?}` reads readiness and start profiles. If a Hub
+   server is stopped and starting it is authorized, use
+   `server_start {server_id?, request_id, profile_id?, wait_ms?}`. Alternatively
+   pass `user_options` instead of `profile_id`. Take profile IDs from status;
+   never guess a deployment profile. A timeout means keep observing with
+   `server_status`, not resend under a new request number. A conflicting profile
+   never permits restarting the existing server. This starts the singleuser
+   server; notebook kernel start remains a separate `kernel_control` operation.
 2. `notebook_list {server_id?, directory}` finds a file, then
    `notebook_open {server_id?, path}` returns `notebook_id`, `summary`,
    `changes_cursor`, and the current `next_request_id`. Reopening the same file

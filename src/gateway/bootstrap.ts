@@ -38,6 +38,7 @@ function workerSettings(config: GatewayCommonConfig): WorkerRegistrySettings {
     apiBaseUrl: config.apiBaseUrl.href,
     browserBaseUrl: config.browserBaseUrl.href,
     assertionHeader: config.assertionHeader,
+    ...(config.hubAdapterUrl === undefined ? {} : { hubAdapterUrl: config.hubAdapterUrl.href }),
     nodeCommand: config.nodeCommand,
     upstreamCli: config.upstreamCli,
     runtimeDir: config.runtimeDir,

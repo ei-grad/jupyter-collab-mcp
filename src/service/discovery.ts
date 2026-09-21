@@ -148,7 +148,7 @@ export async function discoverLocalServers(
       }
       const server = toProfile(descriptor, name, file);
       if (server === null) continue;
-      if (byUrl.has(server.profile.apiBaseUrl)) continue;
+      if (server.profile.apiBaseUrl === undefined || byUrl.has(server.profile.apiBaseUrl)) continue;
       byUrl.set(server.profile.apiBaseUrl, server);
     }
   }

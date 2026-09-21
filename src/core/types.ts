@@ -74,6 +74,30 @@ export type CredentialRef = `env:${string}` | `file:${string}` | `literal:${stri
 /** `standalone` Jupyter Server, or a JupyterHub-managed user server. */
 export type ServerKind = 'standalone' | 'jupyterhub';
 
+/** Operator-controlled authentication, never accepted as tool input. */
+export interface UpstreamAuth {
+  readonly credentialRef: CredentialRef;
+  readonly auth?: { readonly type: 'token' } | { readonly type: 'header'; readonly name: string };
+  readonly credentialRefresh?: 'request';
+  readonly credentialExpiry?: 'jwt';
+  readonly credentialExpiresAt?: number;
+}
+
+export interface ServerStartProfile {
+  readonly id: string;
+  readonly title: string;
+  readonly description?: string;
+  readonly default?: boolean;
+  readonly userOptions: Readonly<Record<string, unknown>>;
+}
+
+/** Optional control plane. Adapter URLs name the complete lifecycle endpoint. */
+export interface HubLifecycleConfig extends UpstreamAuth {
+  readonly apiBaseUrl: string;
+  readonly protocol?: 'jupyterhub' | 'adapter-v1';
+  readonly startProfiles?: readonly ServerStartProfile[];
+}
+
 /**
  * Operator-supplied upstream profile (docs/CONNECTIONS.md §9).
  *
@@ -89,7 +113,7 @@ export interface ServerProfile {
    * Final server API base including any prefix such as `/user/name/`, with no
    * trailing `/api`. This is the origin credentials may be sent to.
    */
-  readonly apiBaseUrl: string;
+  readonly apiBaseUrl?: string;
   /** Explicit allowed WS base; normally derived from {@link apiBaseUrl}. */
   readonly wsBaseUrl?: string;
   /**
@@ -97,7 +121,7 @@ export interface ServerProfile {
    * requests, and never substituted for {@link apiBaseUrl}.
    */
   readonly browserBaseUrl?: string;
-  readonly credentialRef: CredentialRef;
+  readonly credentialRef?: CredentialRef;
   /** Re-read a file assertion for each new request or handshake. */
   readonly credentialRefresh?: 'request';
   /** Reject expired assertions and close sockets at their JWT expiry. */
@@ -111,6 +135,7 @@ export interface ServerProfile {
   readonly hubUser?: string;
   readonly hubServerName?: string;
   readonly hubCredentialRef?: CredentialRef;
+  readonly hub?: HubLifecycleConfig;
   /** Explicit trust configuration. Never a switch that disables TLS checks. */
   readonly tlsCaRef?: string;
   readonly proxyAuthRef?: string;
@@ -120,10 +145,11 @@ export interface ServerProfile {
 export interface ServerDescriptor {
   readonly id: string;
   readonly kind: ServerKind;
-  readonly apiBaseUrl: string;
+  readonly apiBaseUrl?: string;
   readonly browserBaseUrl?: string;
   readonly hubUser?: string;
   readonly hubServerName?: string;
+  readonly supportsStart?: boolean;
 }
 
 /**

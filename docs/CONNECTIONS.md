@@ -450,8 +450,15 @@ separate permissions.
 [Hub token API](https://jupyterhub.readthedocs.io/en/stable/howto/rest.html#make-an-api-request),
 [Hub scopes](https://jupyterhub.readthedocs.io/en/stable/rbac/scopes.html)
 
-A lifecycle adapter is optional for the first Hub integration. It must
-distinguish ready/stopped/pending/failed. Accessing `/api/...` on a stopped user
+A lifecycle adapter is optional. `server_status` and explicit `server_start`
+support standard Hub API-token access and the configured `adapter-v1` control
+transport. Standalone setup remains URL/token only. A standard Hub-only profile
+needs `kind: "jupyterhub"`, `id`, and `hub: {apiBaseUrl, credentialRef}`; the
+client discovers its authenticated user and API version before lifecycle use.
+`hubServerName` optionally names its own named server. Profile catalogs are
+operator configuration (`hub.startProfiles`) or adapter discovery, rather than
+an assumed universal Hub endpoint. It distinguishes ready/stopped/pending/failed
+where the upstream supplies evidence. Accessing `/api/...` on a stopped user
 server must not start it implicitly; a confirmed stopped state is returned as
 `SERVER_NOT_RUNNING`. A 503 must not automatically be treated as a stopped
 server because it may be a proxy/upstream error. If spawn is required, it is a
@@ -461,7 +468,8 @@ notebook kernel.
 
 Hub 6.0.0 adds `start:servers` and changes both the server create/edit API and
 the `user_options` format. The lifecycle schema must therefore be versioned,
-and Hub 5 commands must not be carried forward without validation. REST token
+and the client selects the start body from the read-only discovered API version.
+No operator version switch is required. REST token
 access to an existing server and management of its lifecycle are validated
 separately.
 [Hub 6 migration](https://jupyterhub.readthedocs.io/en/stable/howto/upgrading-v6.html)

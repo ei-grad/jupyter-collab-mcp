@@ -24,6 +24,7 @@ export interface WorkerProcessSettings {
   readonly apiBaseUrl: string;
   readonly browserBaseUrl: string;
   readonly assertionHeader: string;
+  readonly hubAdapterUrl?: string;
   readonly nodeCommand: string;
   readonly upstreamCli: string;
   readonly runtimeDir: string;
@@ -132,6 +133,18 @@ export async function startNodeWorker(
         browserBaseUrl: userBaseUrl(settings.browserBaseUrl, identity.username),
         credentialRef: `file:${assertionFile}`,
         auth: { type: 'header', name: settings.assertionHeader },
+        ...(settings.hubAdapterUrl === undefined ? {} : {
+          hubUser: identity.username,
+          hub: {
+            apiBaseUrl: settings.hubAdapterUrl,
+            protocol: 'adapter-v1', credentialRef: `file:${assertionFile}`,
+            auth: { type: 'header', name: settings.assertionHeader },
+            ...(identity.grantId === undefined && identity.session === undefined ? {} : {
+              credentialRefresh: 'request', credentialExpiry: 'jwt',
+              credentialExpiresAt: identity.session?.expiresAt ?? identity.grantExpiresAt
+            })
+          }
+        }),
         ...(identity.grantId === undefined && identity.session === undefined ? {} : {
           credentialRefresh: 'request', credentialExpiry: 'jwt',
           credentialExpiresAt: identity.session?.expiresAt ?? identity.grantExpiresAt

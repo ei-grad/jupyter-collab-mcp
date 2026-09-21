@@ -36,8 +36,8 @@ import { canonicalJson, coreError, type JsonValue, type SideEffects } from '../c
 /** Largest `request_id` a session accepts: the positive 64-bit range. */
 export const MAX_REQUEST_ID = (1n << 63n) - 1n;
 
-/** The four deduplicated tools of SPEC.md §9. */
-export type DedupTool = 'notebook_create' | 'notebook_apply' | 'notebook_execute' | 'kernel_control';
+/** The deduplicated tools of SPEC.md §9. */
+export type DedupTool = 'notebook_create' | 'notebook_apply' | 'notebook_execute' | 'kernel_control' | 'server_start';
 
 /**
  * What a replay hands back.

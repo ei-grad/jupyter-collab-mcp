@@ -28,8 +28,10 @@ import {
   type ServerProfile
 } from '../core/index.js';
 import { ServerClient } from '../jupyter/server-client.js';
+import { HubClient } from '../jupyter/hub-client.js';
 import {
   resolveServer,
+  hubConfig,
   validateServerProfile,
   type CredentialSources
 } from './credentials.js';
@@ -58,7 +60,8 @@ export function describeServer(profile: ServerProfile): ServerDescriptor {
   return {
     id: validated.id,
     kind: validated.kind,
-    apiBaseUrl: validated.apiBaseUrl,
+    ...(validated.apiBaseUrl === undefined ? {} : { apiBaseUrl: validated.apiBaseUrl }),
+    supportsStart: hubConfig(validated) !== undefined,
     ...(validated.browserBaseUrl === undefined
       ? {}
       : { browserBaseUrl: validated.browserBaseUrl }),
@@ -74,6 +77,7 @@ export class ServerRegistry {
   readonly #config: ServiceConfig;
   readonly #options: ServerRegistryOptions;
   readonly #clients = new Map<string, ServerClient>();
+  readonly #hubs = new Map<string, HubClient>();
   readonly #collabSessionIds = new Map<string, string>();
   #entries: ServerEntry[] | null = null;
   #loading: Promise<ServerEntry[]> | null = null;
@@ -159,12 +163,38 @@ export class ServerRegistry {
   clientFor(entry: ServerEntry): ServerClient {
     const existing = this.#clients.get(entry.id);
     if (existing !== undefined) return existing;
-    const resolved = resolveServer(entry.profile, this.#options.credentials);
+    const apiBaseUrl = entry.profile.apiBaseUrl ?? this.#hubs.get(entry.id)?.dataUrl;
+    const resolved = resolveServer({ ...entry.profile, ...(apiBaseUrl === undefined ? {} : { apiBaseUrl }) }, this.#options.credentials);
     const client = new ServerClient(resolved, {
       ...(this.#options.fetchImpl === undefined ? {} : { fetchImpl: this.#options.fetchImpl })
     });
     this.#clients.set(entry.id, client);
     return client;
+  }
+
+  hubFor(entry: ServerEntry): HubClient | undefined {
+    const config = hubConfig(entry.profile);
+    if (config === undefined) return undefined;
+    let client = this.#hubs.get(entry.id);
+    if (client === undefined) {
+      client = new HubClient(entry.profile, config,
+        () => resolveServer({ id: entry.id, kind: 'standalone', ...config }, this.#options.credentials), this.#options.fetchImpl);
+      this.#hubs.set(entry.id, client);
+    }
+    return client;
+  }
+
+  /** Read-only readiness gate; opening a notebook never starts a server. */
+  async prepare(entry: ServerEntry): Promise<void> {
+    const hub = this.hubFor(entry);
+    if (hub !== undefined) {
+      const status = await hub.status();
+      if (status.state !== 'ready') {
+        throw coreError(status.state === 'stopped' || status.state === 'failed' ? 'SERVER_NOT_RUNNING' : 'NOT_READY',
+          'Jupyter user server is not ready; use server_status and explicit server_start', { details: { state: status.state } });
+      }
+    }
+    await this.clientFor(entry).status();
   }
 
   /** The resolved credential of a server; internal use only (SPEC.md §11). */

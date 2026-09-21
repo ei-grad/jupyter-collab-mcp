@@ -52,6 +52,8 @@ export type WireObject = { [key: string]: WireValue };
  *   wire form by the thrower.
  */
 export const OPAQUE_KEYS: ReadonlySet<string> = new Set([
+  'userOptions',
+  'user_options',
   'metadata',
   'notebookMetadata',
   'notebook_metadata',
