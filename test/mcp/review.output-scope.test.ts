@@ -138,14 +138,14 @@ describe('output snapshots stay inside their working context', () => {
     const { connection, handles } = await rig();
     const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
     const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
-    const cellId = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_id']);
+    const cellRef = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_ref']);
     const output = 'x'.repeat(100_000);
     const cell = handles[0]!.notebook.getCell(0) as unknown as { setOutputs(outputs: unknown[]): void };
     cell.setOutputs([{ output_type: 'stream', name: 'stdout', text: output }]);
     const outputs = await connection.call('notebook_read', {
       notebook_id: notebookId,
       view: 'outputs',
-      cell_ids: [cellId],
+      cell_refs: [cellRef],
       limits: { max_bytes: 1 }
     });
     const outputId = String(((((outputs.structuredContent?.['cells'] as Record<string, unknown>[])[0]!['outputs'] as Record<string, unknown>[])[0]!['snapshot'] as Record<string, unknown>)['output_id']));
@@ -169,7 +169,7 @@ describe('output snapshots stay inside their working context', () => {
     const { connection, handles } = await rig();
     const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
     const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
-    const cellId = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_id']);
+    const cellRef = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_ref']);
     const output = 'text-only recovery\n'.repeat(512);
     const cell = handles[0]!.notebook.getCell(0) as unknown as { setOutputs(outputs: unknown[]): void };
     cell.setOutputs([{ output_type: 'stream', name: 'stdout', text: output }]);
@@ -177,7 +177,7 @@ describe('output snapshots stay inside their working context', () => {
     const answer = await connection.call('notebook_read', {
       notebook_id: notebookId,
       view: 'outputs',
-      cell_ids: [cellId]
+      cell_refs: [cellRef]
     });
     const entry = ((((answer.structuredContent?.['cells'] as Record<string, unknown>[])[0]!['outputs'] as Record<string, unknown>[])[0]!));
     expect(entry['truncated']).toBe(false);
@@ -193,7 +193,7 @@ describe('output snapshots stay inside their working context', () => {
     const { connection, handles } = await rig({ outputStoreMaxBytes: 1000 });
     const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
     const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
-    const cellId = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_id']);
+    const cellRef = String(((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!['cell_ref']);
     const cell = handles[0]!.notebook.getCell(0) as unknown as { setOutputs(outputs: unknown[]): void };
     cell.setOutputs([
       { output_type: 'stream', name: 'stdout', text: 'x'.repeat(700) },
@@ -203,7 +203,7 @@ describe('output snapshots stay inside their working context', () => {
     const answer = await connection.call('notebook_read', {
       notebook_id: notebookId,
       view: 'outputs',
-      cell_ids: [cellId],
+      cell_refs: [cellRef],
       limits: { max_bytes: 1 }
     });
     expect(answer.isError).toBe(true);
@@ -248,8 +248,8 @@ describe('output snapshots stay inside their working context', () => {
       view: 'summary'
     }));
     expect(summaryText).toContain('index=24 ');
-    const firstCellId = /^\s*index=0 cell_id=(\S+)/mu.exec(summaryText)?.[1];
-    expect(firstCellId).toBeDefined();
+    const firstCellRef = /^\s*index=0 cell_ref=(\S+)/mu.exec(summaryText)?.[1];
+    expect(firstCellRef).toBeDefined();
 
     const recoveredSources: string[] = [];
     let sourceCursor: string | undefined;
@@ -271,7 +271,7 @@ describe('output snapshots stay inside their working context', () => {
     const outputText = textOf(await connection.call('notebook_read', {
       notebook_id: notebookId,
       view: 'outputs',
-      cell_ids: [firstCellId]
+      cell_refs: [firstCellRef]
     }));
     const outputIds = [...outputText.matchAll(/output_id=(\S+) — call output_read/gmu)].map((match) => match[1]!);
     expect(outputIds).toHaveLength(12);

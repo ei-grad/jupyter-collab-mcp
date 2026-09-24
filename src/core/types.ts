@@ -199,6 +199,8 @@ export interface CellRef {
 /** One row of `notebook_read(view: 'summary')` (SPEC.md §7). */
 export interface CellSummary {
   readonly cellId: string;
+  /** Internal identity of the live Y.Map; MCP turns this into a cell_ref. */
+  readonly identityToken?: string;
   /** Position at the moment the summary was taken. */
   readonly index: number;
   readonly cellType: CellType;
@@ -218,6 +220,15 @@ export interface CellSummary {
    * `CELL_ID_AMBIGUOUS`; other cells keep working (SPEC.md §7).
    */
   readonly duplicateId?: boolean;
+}
+
+/** Complete immutable observation used to mint one public `cell_ref`. */
+export interface CellObservation {
+  readonly cellId: string;
+  readonly identityToken: string;
+  readonly sourceRevision: SourceRevision;
+  readonly cellRevision: CellRevision;
+  readonly outputsRevision: OutputsRevision | null;
 }
 
 /**
@@ -324,8 +335,8 @@ export type NbOutput =
  * rejected before any mutation.
  */
 export type AddCellAnchor =
-  | { readonly beforeCellId: string; readonly afterCellId?: never; readonly position?: never }
-  | { readonly beforeCellId?: never; readonly afterCellId: string; readonly position?: never }
+  | { readonly beforeCellId: string; readonly beforeCellIdentityToken?: string; readonly afterCellId?: never; readonly position?: never }
+  | { readonly beforeCellId?: never; readonly afterCellId: string; readonly afterCellIdentityToken?: string; readonly position?: never }
   | { readonly beforeCellId?: never; readonly afterCellId?: never; readonly position: 'end' };
 
 /** Create a cell of a chosen type (SPEC.md §7). */
@@ -345,6 +356,8 @@ export type AddCellOperation = {
 export interface ReplaceSourceOperation {
   readonly op: 'replace_source';
   readonly cellId: string;
+  /** Internal object-identity guard expanded from a public `cell_ref`. */
+  readonly expectedCellIdentityToken?: string;
   readonly expectedSourceRevision: SourceRevision;
   readonly source: string;
 }
@@ -356,6 +369,7 @@ export interface ReplaceSourceOperation {
 export interface ReplaceTextOperation {
   readonly op: 'replace_text';
   readonly cellId: string;
+  readonly expectedCellIdentityToken?: string;
   readonly expectedSourceRevision: SourceRevision;
   readonly oldText: string;
   readonly newText: string;
@@ -365,6 +379,7 @@ export interface ReplaceTextOperation {
 export interface DeleteCellOperation {
   readonly op: 'delete_cell';
   readonly cellId: string;
+  readonly expectedCellIdentityToken?: string;
   readonly expectedCellRevision: CellRevision;
 }
 
@@ -375,6 +390,7 @@ export interface DeleteCellOperation {
 export interface ClearOutputsOperation {
   readonly op: 'clear_outputs';
   readonly cellId: string;
+  readonly expectedCellIdentityToken?: string;
   readonly expectedOutputsRevision: OutputsRevision;
 }
 
@@ -382,6 +398,7 @@ export interface ClearOutputsOperation {
 export interface SetCellMetadataOperation {
   readonly op: 'set_cell_metadata';
   readonly cellId: string;
+  readonly expectedCellIdentityToken?: string;
   readonly expectedCellRevision: CellRevision;
   readonly key: string;
   readonly value: unknown;
@@ -391,6 +408,7 @@ export interface SetCellMetadataOperation {
 export interface DeleteCellMetadataOperation {
   readonly op: 'delete_cell_metadata';
   readonly cellId: string;
+  readonly expectedCellIdentityToken?: string;
   readonly expectedCellRevision: CellRevision;
   readonly key: string;
 }
@@ -398,6 +416,8 @@ export interface DeleteCellMetadataOperation {
 /** Set one notebook metadata key (SPEC.md §7). */
 export interface SetNotebookMetadataOperation {
   readonly op: 'set_notebook_metadata';
+  /** Internal marker that the guard came from an immutable `notebook_ref`. */
+  readonly expectedNotebookObserved?: boolean;
   readonly expectedNotebookMetadataRevision: NotebookMetadataRevision;
   readonly key: string;
   readonly value: unknown;
@@ -406,6 +426,7 @@ export interface SetNotebookMetadataOperation {
 /** Delete one notebook metadata key (SPEC.md §7). */
 export interface DeleteNotebookMetadataOperation {
   readonly op: 'delete_notebook_metadata';
+  readonly expectedNotebookObserved?: boolean;
   readonly expectedNotebookMetadataRevision: NotebookMetadataRevision;
   readonly key: string;
 }
@@ -440,11 +461,13 @@ export interface OperationResult {
   readonly op: OperationKind;
   /** Target cell, or the id assigned to a newly added one. */
   readonly cellId?: string;
+  /** Internal identity used with the revisions to mint a public `cell_ref`. */
+  readonly identityToken?: string;
   /** Index right after the transaction. Display only (SPEC.md §7). */
   readonly index?: number;
   readonly sourceRevision?: SourceRevision;
   readonly cellRevision?: CellRevision;
-  readonly outputsRevision?: OutputsRevision;
+  readonly outputsRevision?: OutputsRevision | null;
   readonly notebookMetadataRevision?: NotebookMetadataRevision;
 }
 

@@ -102,6 +102,8 @@ export interface McpServerOptions {
   readonly maxImages?: number;
   /** `resource_link` blocks per answer. Default 16. */
   readonly maxResourceLinks?: number;
+  /** Immutable observed refs retained by one connection. Default 4096. */
+  readonly observedRefMaxEntries?: number;
   /** Diagnostics sink. Default: nothing. Must never write to stdout. */
   readonly log?: (level: LogLevel, message: string) => void;
 }
@@ -113,6 +115,7 @@ interface ResolvedOptions {
   readonly imageMaxBytes: number;
   readonly maxImages: number;
   readonly maxResourceLinks: number;
+  readonly observedRefMaxEntries: number;
   readonly log: (level: LogLevel, message: string) => void;
 }
 
@@ -124,6 +127,7 @@ function resolve(options: McpServerOptions): ResolvedOptions {
     imageMaxBytes: options.imageMaxBytes ?? 128 * 1024,
     maxImages: options.maxImages ?? 4,
     maxResourceLinks: options.maxResourceLinks ?? 16,
+    observedRefMaxEntries: options.observedRefMaxEntries ?? 4096,
     log: options.log ?? ((): void => undefined)
   };
 }
@@ -140,9 +144,13 @@ export interface WireError {
   readonly side_effects: 'none' | 'applied' | 'unknown';
   readonly next_request_id?: string | null;
   readonly request_accepted?: boolean | null;
+  readonly replayed?: boolean;
+  readonly first_accepted_at?: string;
   readonly execution_id?: string;
   readonly execution_ids?: readonly string[];
   readonly revision?: string;
+  readonly current_cell_ref?: string;
+  readonly current_notebook_ref?: string;
   readonly details?: Record<string, unknown>;
 }
 
@@ -188,6 +196,8 @@ export function toWireError(thrown: unknown): WireError {
 
   const nextRequestId = pick(details, 'next_request_id', 'nextRequestId');
   const requestAccepted = pick(details, 'request_accepted', 'requestAccepted');
+  const replayed = pick(details, 'replayed');
+  const firstAcceptedAt = pick(details, 'first_accepted_at', 'firstAcceptedAt');
   const executionId = pick(details, 'execution_id', 'executionId');
   const executionIds = pick(details, 'execution_ids', 'executionIds');
   const revision = pick(details, 'revision');
@@ -199,6 +209,8 @@ export function toWireError(thrown: unknown): WireError {
     side_effects: error.sideEffects,
     ...(typeof nextRequestId === 'string' || nextRequestId === null ? { next_request_id: nextRequestId } : {}),
     ...(typeof requestAccepted === 'boolean' || requestAccepted === null ? { request_accepted: requestAccepted } : {}),
+    ...(typeof replayed === 'boolean' ? { replayed } : {}),
+    ...(typeof firstAcceptedAt === 'string' ? { first_accepted_at: firstAcceptedAt } : {}),
     ...(typeof executionId === 'string' ? { execution_id: executionId } : {}),
     ...(Array.isArray(executionIds) && executionIds.every((value) => typeof value === 'string')
       ? { execution_ids: executionIds as string[] }
@@ -208,21 +220,11 @@ export function toWireError(thrown: unknown): WireError {
   };
 }
 
-function presentWireError(wire: WireError, references: ReferenceAliases): WireError {
-  const { details, ...base } = wire;
-  const presented = references.presentValue(base as unknown as WireValue) as unknown as WireError;
-  return details === undefined
-    ? presented
-    : {
-        ...presented,
-        details: references.presentValue(details as unknown as WireValue) as unknown as Record<string, unknown>
-      };
-}
-
 const RECOVERY_DETAIL_KEYS = [
   'notebook_id', 'cell_id', 'execution_id', 'execution_ids', 'output_id',
   'revision', 'expected', 'current', 'cursor', 'next_cursor', 'next_request_id',
-  'request_accepted'
+  'request_accepted', 'replayed', 'first_accepted_at', 'current_cell_ref',
+  'current_notebook_ref'
 ] as const;
 
 function boundedString(value: string, maxBytes: number): string {
@@ -253,24 +255,101 @@ function boundWireError(wire: WireError, maxBytes: number): WireError {
 }
 
 function errorResult(thrown: unknown, maxBytes: number, references: ReferenceAliases): CallToolResult {
-  const wire = boundWireError(presentWireError(toWireError(thrown), references), maxBytes);
+  const raw = toWireError(thrown);
+  const capacityFallback = (cause: unknown) => coreError(
+    'RESOURCE_LIMIT',
+    'the connection observed-reference budget is exhausted',
+    {
+      sideEffects: raw.side_effects,
+      details: {
+        ...resultRecoveryDetails((raw.details ?? {}) as unknown as WireValue),
+        ...(raw.execution_id === undefined ? {} : { execution_id: raw.execution_id }),
+        ...(raw.request_accepted === undefined ? {} : { request_accepted: raw.request_accepted }),
+        ...(raw.next_request_id === undefined ? {} : { next_request_id: raw.next_request_id })
+      },
+      cause
+    }
+  );
+  const stageError = (wire: WireError) => {
+    const { details, ...base } = wire;
+    return references.stageValue({
+      ...(base as unknown as WireObject),
+      ...(details === undefined ? {} : { protocol_details: details as unknown as WireValue })
+    });
+  };
+  let staged;
+  try {
+    staged = stageError(raw);
+  } catch (error) {
+    return errorResult(capacityFallback(error), maxBytes, references);
+  }
+  const stagedObject = staged.value as WireObject;
+  const stagedDetails = stagedObject['protocol_details'];
+  const { protocol_details: _details, ...presentedBase } = stagedObject;
+  const presented = presentedBase as unknown as WireError;
+  const details = isObject(stagedDetails) ? { ...stagedDetails } : undefined;
+  const currentCellRef = details?.['cell_ref'];
+  const currentNotebookRef = details?.['notebook_ref'];
+  if (details !== undefined) {
+    if (typeof currentCellRef === 'string') {
+      details['current_cell_ref'] = currentCellRef;
+      delete details['cell_ref'];
+    }
+    if (typeof currentNotebookRef === 'string') {
+      details['current_notebook_ref'] = currentNotebookRef;
+      delete details['notebook_ref'];
+    }
+    for (const key of [
+      'cell_id',
+      'identity_token',
+      'source_revision',
+      'cell_revision',
+      'outputs_revision',
+      'expected_source_revision',
+      'expected_cell_revision',
+      'expected_outputs_revision',
+      'notebook_metadata_revision',
+      'expected_notebook_metadata_revision'
+    ]) delete details[key];
+    if (presented.code === 'REVISION_CONFLICT') {
+      delete details['expected'];
+      delete details['current'];
+    }
+  }
+  const wire = boundWireError({
+    ...presented,
+    ...(details === undefined ? {} : { details }),
+    ...(typeof currentCellRef === 'string' ? { current_cell_ref: currentCellRef } : {}),
+    ...(typeof currentNotebookRef === 'string' ? { current_notebook_ref: currentNotebookRef } : {})
+  }, maxBytes);
   const head = `${wire.code}: ${wire.message}`;
   const facts = [
     `retryable=${String(wire.retryable)}`,
     `side_effects=${wire.side_effects}`,
     ...(wire.next_request_id === undefined ? [] : [`next_request_id=${String(wire.next_request_id)}`]),
     ...(wire.request_accepted === undefined ? [] : [`request_accepted=${String(wire.request_accepted)}`]),
+    ...(wire.replayed === undefined ? [] : [`replayed=${String(wire.replayed)}`]),
+    ...(wire.first_accepted_at === undefined ? [] : [`first_accepted_at=${wire.first_accepted_at}`]),
     ...(wire.execution_id === undefined ? [] : [`execution_id=${wire.execution_id}`]),
     ...(wire.execution_ids === undefined ? [] : [`execution_ids=${wire.execution_ids.join(',')}`]),
-    ...(wire.revision === undefined ? [] : [`revision=${wire.revision}`])
+    ...(wire.revision === undefined ? [] : [`revision=${wire.revision}`]),
+    ...(wire.current_cell_ref === undefined ? [] : [`current_cell_ref=${wire.current_cell_ref}`]),
+    ...(wire.current_notebook_ref === undefined ? [] : [`current_notebook_ref=${wire.current_notebook_ref}`])
   ].join(' ');
   const diagnostics = wire.details === undefined ? '' : `\ndetails=${JSON.stringify(wire.details)}`;
   const text = boundText(`${head}\n${facts}${diagnostics}`, maxBytes).text;
-  return {
+  const answer: CallToolResult = {
     content: [{ type: 'text', text }],
     isError: true,
     _meta: { [ERROR_META_KEY]: wire as unknown as Record<string, unknown> }
   };
+  try {
+    staged.commit();
+  } catch (error) {
+    if (toCoreError(error).code !== 'RESOURCE_LIMIT') throw error;
+    return errorResult(capacityFallback(error), maxBytes, references);
+  }
+  return answer;
 }
 
 /** Build the `INVALID_ARGUMENT` answer for arguments that failed the schema. */
@@ -406,6 +485,12 @@ function s(value: WireValue | undefined): string {
   return String(value);
 }
 
+function refs(value: WireValue | undefined): string {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+    ? value.join(',')
+    : '-';
+}
+
 function nested(payload: WireObject, key: string): WireObject {
   const value = payload[key];
   return isObject(value) ? value : {};
@@ -425,12 +510,7 @@ function cellLines(cells: WireValue | undefined): string[] {
   return cells.flatMap((cell) => {
     if (!isObject(cell)) return '  -';
     const state = cell['state'] ?? cell['execution_state'];
-    const refs = [
-      `source_revision=${s(cell['source_revision'])}`,
-      `cell_revision=${s(cell['cell_revision'])}`,
-      ...(cell['outputs_revision'] === undefined ? [] : [`outputs_revision=${s(cell['outputs_revision'])}`])
-    ];
-    const row = `  index=${s(cell['index'])} cell_id=${s(cell['cell_id'])} type=${s(cell['cell_type'] ?? state)} ${refs.join(' ')} ${s(cell['preview'] ?? cell['state'] ?? '')}`.trimEnd();
+    const row = `  index=${s(cell['index'])} cell_ref=${s(cell['cell_ref'])} type=${s(cell['cell_type'] ?? state)} ${s(cell['preview'] ?? cell['state'] ?? '')}`.trimEnd();
     return typeof cell['source'] === 'string'
       ? [row, `    source=${JSON.stringify(cell['source'])}`]
       : [row];
@@ -477,6 +557,7 @@ export function renderText(tool: string, payload: WireObject): string {
         `notebook ${s(nb['notebook_id'])} ${s(nb['path'])} ${s(nb['connection_state'])}${nb['stale'] === true ? ' stale' : ''} cells=${s(summary['cell_count'])}` +
           (tool === 'notebook_create' ? ` renamed=${s(payload['renamed'])} untitled=${s(payload['untitled_path'])}` : ` reused=${s(payload['reused'])}`)
       );
+      lines.push(`notebook_ref=${s(summary['notebook_ref'])}`);
       lines.push(`changes_cursor=${s(payload['changes_cursor'])}`);
       lines.push(...cellLines(summary['cells']));
       break;
@@ -486,6 +567,7 @@ export function renderText(tool: string, payload: WireObject): string {
       break;
     case 'notebook_read': {
       lines.push(`${s(payload['view'])} of ${s(payload['notebook_id'])} ${s(payload['connection_state'])}${payload['stale'] === true ? ' stale' : ''} structure=${s(payload['structure_revision'])} changes_cursor=${s(payload['changes_cursor'])}`);
+      lines.push(`notebook_ref=${s(payload['notebook_ref'])}`);
       const summary = payload['summary'];
       if (isObject(summary)) {
         lines.push(`cells=${s(summary['cell_count'])} truncated=${s(summary['truncated'])}`);
@@ -504,7 +586,7 @@ export function renderText(tool: string, payload: WireObject): string {
       if (Array.isArray(results)) {
         for (const entry of results) {
           if (!isObject(entry)) continue;
-          lines.push(`  ${s(entry['op'])} ${s(entry['cell_id'])} source=${s(entry['source_revision'])} cell=${s(entry['cell_revision'])}`);
+          lines.push(`  ${s(entry['op'])} cell_ref=${s(entry['cell_ref'])} notebook_ref=${s(entry['notebook_ref'])}`);
         }
       }
       lines.push(`structure=${s(payload['structure_revision'])} changes_cursor=${s(payload['changes_cursor'])}`);
@@ -522,7 +604,7 @@ export function renderText(tool: string, payload: WireObject): string {
           const outputs = cell['outputs'];
           const reason = cell['not_sent_reason'] ?? cell['aborted_reason'];
           lines.push(
-            `  ${s(cell['cell_id'])} ${s(cell['state'])}${reason === undefined ? '' : `/${s(reason)}`} count=${s(cell['execution_count'])} outputs=${Array.isArray(outputs) ? outputs.length : 0}${cell['output_incomplete'] === true ? ' output_incomplete' : ''}${cell['source_changed'] === true ? ' source_changed' : ''}`
+            `  ${s(cell['cell_ref'])} ${s(cell['state'])}${reason === undefined ? '' : `/${s(reason)}`} count=${s(cell['execution_count'])} outputs=${Array.isArray(outputs) ? outputs.length : 0}${cell['cell_ref_unavailable'] === true ? ' cell_ref_unavailable' : ''}${cell['output_incomplete'] === true ? ' output_incomplete' : ''}${cell['source_changed'] === true ? ' source_changed' : ''}`
           );
           if (Array.isArray(outputs)) {
             for (const output of outputs) {
@@ -543,7 +625,7 @@ export function renderText(tool: string, payload: WireObject): string {
       break;
     case 'execution_cancel':
       lines.push(
-        `execution ${s(payload['execution_id'])} notebook=${s(payload['notebook_id'])} ${s(payload['state'])}; cancelled=${s(payload['cancelled_cell_ids'])} already_sent=${s(payload['already_sent_cell_ids'])}; the kernel was not interrupted`
+        `execution ${s(payload['execution_id'])} notebook=${s(payload['notebook_id'])} ${s(payload['state'])}; cancelled_cell_refs=${refs(payload['cancelled_cell_refs'])} unavailable_cancelled_cells=${s(payload['unavailable_cancelled_cells'])} already_sent_cell_refs=${refs(payload['already_sent_cell_refs'])} unavailable_already_sent_cells=${s(payload['unavailable_already_sent_cells'])}; the kernel was not interrupted`
       );
       break;
     case 'notebook_changes': {
@@ -634,7 +716,7 @@ function outputLines(cells: WireValue | undefined): string[] {
     if (!isObject(cell) || !Array.isArray(cell['outputs'])) continue;
     for (const output of cell['outputs']) {
       if (!isObject(output)) continue;
-      lines.push(`  cell_id=${s(cell['cell_id'])} output_index=${s(output['index'])} ${renderOutputReference(output)}`);
+      lines.push(`  cell_ref=${s(cell['cell_ref'])} output_index=${s(output['index'])} ${renderOutputReference(output)}`);
     }
   }
   return lines;
@@ -728,7 +810,7 @@ export function createMcpServer(service: CollabService, options: McpServerOption
     { name: resolved.name, version: resolved.version },
     { capabilities: { tools: {}, resources: {} } }
   );
-  const references = new ReferenceAliases();
+  const references = new ReferenceAliases(resolved.observedRefMaxEntries);
 
   for (const spec of TOOL_SPECS) registerTool(server, service, spec, resolved, references);
   registerOutputResources(server, service, resolved, references);
@@ -765,7 +847,7 @@ function registerTool(
         return invalidArgument(spec.name, parsed.error.issues, options.responseMaxBytes, references);
       }
       try {
-        const request = references.resolveValue(parsed.data as unknown as WireValue);
+        const request = references.resolveTool(spec.name, parsed.data as unknown as WireValue);
         const result = await dispatch(service, spec.name, fromWire(request));
         return buildResult(spec.name, result, options, references);
       } catch (thrown) {
@@ -783,57 +865,141 @@ function buildResult(
   options: ResolvedOptions,
   references: ReferenceAliases
 ): CallToolResult {
-  const wire = references.presentValue(publicResult(toWire(result)));
-  const base: WireObject = typeof wire === 'object' && wire !== null && !Array.isArray(wire) ? wire : { result: wire };
-  const extracted = extractOutputContent(tool, base, options);
-  let bounded;
+  const raw = toWire(result);
+  let staged;
   try {
-    bounded = boundPayload(extracted.payload, options.responseMaxBytes);
+    staged = references.stageValue(raw);
   } catch (error) {
-    if (!(error instanceof WireBudgetError)) throw error;
-    const executionId =
-      typeof extracted.payload['execution_id'] === 'string'
-        ? extracted.payload['execution_id']
-        : undefined;
-    const requestAccepted =
-      typeof extracted.payload['request_accepted'] === 'boolean'
-        ? extracted.payload['request_accepted']
-        : undefined;
-    const nextRequestId =
-      typeof extracted.payload['next_request_id'] === 'string' ||
-      extracted.payload['next_request_id'] === null
-        ? extracted.payload['next_request_id']
-        : undefined;
-    throw coreError(
-      'RESOURCE_LIMIT',
-      `${tool} cannot fit one recoverable result in the response budget; retry with smaller limits or a narrower cell selection`,
-      {
-        details: {
-          byte_size: error.byteSize,
-          max_bytes: error.maxBytes,
-          ...(executionId === undefined ? {} : { execution_id: executionId }),
-          ...(requestAccepted === undefined ? {} : { request_accepted: requestAccepted }),
-          ...(nextRequestId === undefined ? {} : { next_request_id: nextRequestId })
-        },
+    const core = toCoreError(error);
+    if (core.code !== 'RESOURCE_LIMIT') throw error;
+    const details = resultRecoveryDetails(raw);
+    throw coreError('RESOURCE_LIMIT', core.message, {
+      details,
+      sideEffects:
+        TOOL_SPECS_BY_NAME.get(tool)?.readOnly === true
+          ? 'none'
+          : details['request_accepted'] === true
+            ? 'applied'
+            : 'unknown'
+    });
+  }
+  try {
+    const wire = publicResult(tool, staged.value);
+    const base: WireObject = typeof wire === 'object' && wire !== null && !Array.isArray(wire) ? wire : { result: wire };
+    const extracted = extractOutputContent(tool, base, options);
+    let bounded;
+    try {
+    bounded = boundPayload(extracted.payload, options.responseMaxBytes);
+    } catch (error) {
+      if (!(error instanceof WireBudgetError)) throw error;
+      const details: Record<string, WireValue> = {
+        byte_size: error.byteSize,
+        max_bytes: error.maxBytes,
+        ...resultRecoveryDetails(raw)
+      };
+      throw coreError(
+        'RESOURCE_LIMIT',
+        `${tool} cannot fit one recoverable result in the response budget; retry with smaller limits or a narrower cell selection`,
+        {
+          details,
+          sideEffects:
+            TOOL_SPECS_BY_NAME.get(tool)?.readOnly === true
+              ? 'none'
+              : details['request_accepted'] === true
+                ? 'applied'
+                : 'unknown'
+        }
+      );
+    }
+    const text = boundText(renderText(tool, bounded.payload), options.responseMaxBytes).text;
+    const answer: CallToolResult = {
+      content: [{ type: 'text', text }, ...extracted.blocks],
+      structuredContent: bounded.payload
+    };
+    try {
+      staged.commitPublished(bounded.payload);
+    } catch (error) {
+      const core = toCoreError(error);
+      if (core.code !== 'RESOURCE_LIMIT') throw error;
+      const details = resultRecoveryDetails(raw);
+      throw coreError('RESOURCE_LIMIT', core.message, {
+        details,
         sideEffects:
           TOOL_SPECS_BY_NAME.get(tool)?.readOnly === true
             ? 'none'
-            : requestAccepted === true
+            : details['request_accepted'] === true
               ? 'applied'
               : 'unknown'
-      }
-    );
+      });
+    }
+    return answer;
+  } catch (error) {
+    staged.rollback();
+    throw error;
   }
-  const text = boundText(renderText(tool, bounded.payload), options.responseMaxBytes).text;
-  return {
-    content: [{ type: 'text', text }, ...extracted.blocks],
-    structuredContent: bounded.payload
-  };
+}
+
+function resultRecoveryDetails(value: WireValue): Record<string, WireValue> {
+  if (!isObject(value)) return {};
+  const kept: Record<string, WireValue> = {};
+  for (const key of [
+    'execution_id',
+    'request_accepted',
+    'next_request_id',
+    'first_accepted_at',
+    'replayed'
+  ]) {
+    const child = value[key];
+    if (child !== undefined) kept[key] = child;
+  }
+  return kept;
 }
 
 /** Expose connection lifetime without rewriting arbitrary notebook values. */
-function publicResult(value: WireValue): WireValue {
-  if (Array.isArray(value)) return value.map(publicResult);
+function publicResult(tool: string, value: WireValue): WireValue {
+  const projected = publicCommon(value);
+  if (!isObject(projected)) return projected;
+  if (tool === 'notebook_read' && projected['notebook_ref'] === undefined) {
+    const summary = projected['summary'];
+    if (isObject(summary) && typeof summary['notebook_ref'] === 'string') {
+      projected['notebook_ref'] = summary['notebook_ref'];
+    }
+  }
+  if (tool === 'notebook_execute' || tool === 'execution_get') {
+    const cells = projected['cells'];
+    if (!Array.isArray(cells)) return projected;
+    return {
+      ...projected,
+      cells: cells.map((entry) => {
+        if (!isObject(entry)) return entry;
+        const observation = entry['current_observation'];
+        const { cell_id: _cellId, source_revision: _sentRevision, current_observation: _observation, ...rest } = entry;
+        return isObject(observation) && typeof observation['cell_ref'] === 'string'
+          ? { ...rest, cell_ref: observation['cell_ref'] }
+          : { ...rest, cell_ref_unavailable: true };
+      })
+    };
+  }
+  if (tool === 'execution_cancel') {
+    const cancelled = projected['cancelled_cells'];
+    const sent = projected['already_sent_cells'];
+    const refs = (entries: WireValue | undefined): WireValue[] =>
+      Array.isArray(entries)
+        ? entries.flatMap((entry) =>
+            isObject(entry) && typeof entry['cell_ref'] === 'string' ? [entry['cell_ref']] : [])
+        : [];
+    const { cancelled_cells: _cancelled, already_sent_cells: _sent, ...rest } = projected;
+    return {
+      ...rest,
+      cancelled_cell_refs: refs(cancelled),
+      already_sent_cell_refs: refs(sent)
+    };
+  }
+  return projected;
+}
+
+function publicCommon(value: WireValue): WireValue {
+  if (Array.isArray(value)) return value.map(publicCommon);
   if (!isObject(value)) return value;
   const result: WireObject = {};
   for (const [key, child] of Object.entries(value)) {
@@ -848,7 +1014,7 @@ function publicResult(value: WireValue): WireValue {
           ? child['released_by'].map((event) => event === 'session_close' ? 'connection_close' : event)
           : []
       };
-    } else result[key] = publicResult(child);
+    } else result[key] = publicCommon(child);
   }
   return result;
 }

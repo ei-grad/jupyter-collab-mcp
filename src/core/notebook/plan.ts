@@ -138,6 +138,30 @@ function outputsOfJson(json: CellJsonObject): NbOutput[] {
   return Array.isArray(raw) ? (raw as NbOutput[]) : [];
 }
 
+function observationDetails(cell: SimCell): Record<string, unknown> {
+  if (cell.entry === null) return { cell_id: cell.id };
+  // Planning is all-or-nothing: on a validation error none of the simulated
+  // earlier operations are applied, so the refresh ref must describe the
+  // actual pre-batch object rather than an unreachable simulated state.
+  const type = cellTypeOfJson(cell.original);
+  return {
+    cell_id: cell.id,
+    identity_token: cell.entry.identityToken,
+    source_revision: sourceRevision(type, sourceOfJson(cell.original)),
+    cell_revision: cellRevision(cell.original as JsonValue),
+    outputs_revision: type === 'code' ? outputsRevision(outputsOfJson(cell.original)) : null
+  };
+}
+
+function requireTargetIdentity(cell: SimCell, expected: string | undefined): void {
+  if (expected === undefined) return;
+  if (cell.entry === null || cell.entry.identityToken !== expected) {
+    throw coreError('CELL_REPLACED', `cell ${JSON.stringify(cell.id)} was replaced`, {
+      details: { cell_id: cell.id }
+    });
+  }
+}
+
 /** The simulated document a batch is validated against. */
 class Simulation {
   readonly order: SimCell[];
@@ -242,7 +266,9 @@ function anchorIndex(sim: Simulation, operation: Extract<ModelOperation, { op: '
   // operation can still arrive as arbitrary JSON.
   const anchored = operation as {
     beforeCellId?: unknown;
+    beforeCellIdentityToken?: unknown;
     afterCellId?: unknown;
+    afterCellIdentityToken?: unknown;
     position?: unknown;
   };
   const anchors = [
@@ -265,9 +291,26 @@ function anchorIndex(sim: Simulation, operation: Extract<ModelOperation, { op: '
     }
     return sim.order.length;
   }
-  if (typeof anchored.beforeCellId === 'string') return sim.find(anchored.beforeCellId).at;
-  if (typeof anchored.afterCellId === 'string') return sim.find(anchored.afterCellId).at + 1;
+  if (typeof anchored.beforeCellId === 'string') {
+    const anchor = sim.find(anchored.beforeCellId);
+    requireAnchorIdentity(anchor.cell.entry, anchored.beforeCellIdentityToken, anchored.beforeCellId);
+    return anchor.at;
+  }
+  if (typeof anchored.afterCellId === 'string') {
+    const anchor = sim.find(anchored.afterCellId);
+    requireAnchorIdentity(anchor.cell.entry, anchored.afterCellIdentityToken, anchored.afterCellId);
+    return anchor.at + 1;
+  }
   throw coreError('INVALID_ARGUMENT', 'add_cell anchor must be a cell id string');
+}
+
+function requireAnchorIdentity(entry: CellEntry | null, expected: unknown, cellId: string): void {
+  if (expected === undefined) return;
+  if (typeof expected !== 'string' || entry === null || entry.identityToken !== expected) {
+    throw coreError('CELL_REPLACED', `anchor ${JSON.stringify(cellId)} was replaced`, {
+      details: { cell_id: cellId }
+    });
+  }
 }
 
 /**
@@ -318,17 +361,18 @@ export function planOperations(
       case 'replace_source': {
         requireKind(operation.expectedSourceRevision, 'source', 'expected_source_revision');
         const { cell } = sim.find(operation.cellId);
+        requireTargetIdentity(cell, operation.expectedCellIdentityToken);
         const type = cellTypeOfJson(cell.json);
         const current = sourceOfJson(cell.json);
         sim.guard(
           operation.expectedSourceRevision,
           sourceRevision(type, current),
           sourceRevision(cellTypeOfJson(cell.original), sourceOfJson(cell.original)),
-          { cell_id: operation.cellId },
+          observationDetails(cell),
           () => boundedPreview(current),
           // A full overwrite of a source this batch already rewrote must quote
           // the value it is overwriting, not the pre-batch one.
-          cell.sourceEdits > 0
+          operation.expectedCellIdentityToken !== undefined || cell.sourceEdits > 0
         );
         const edit = minimalReplace(current, operation.source);
         cell.json['source'] = operation.source;
@@ -344,24 +388,26 @@ export function planOperations(
       case 'replace_text': {
         requireKind(operation.expectedSourceRevision, 'source', 'expected_source_revision');
         const { cell } = sim.find(operation.cellId);
+        requireTargetIdentity(cell, operation.expectedCellIdentityToken);
         const type = cellTypeOfJson(cell.json);
         const current = sourceOfJson(cell.json);
         sim.guard(
           operation.expectedSourceRevision,
           sourceRevision(type, current),
           sourceRevision(cellTypeOfJson(cell.original), sourceOfJson(cell.original)),
-          { cell_id: operation.cellId },
-          () => boundedPreview(current)
+          observationDetails(cell),
+          () => boundedPreview(current),
+          operation.expectedCellIdentityToken !== undefined
         );
         const found = findSingleOccurrence(current, operation.oldText);
         if (found.kind === 'not_found') {
           throw coreError('MATCH_NOT_FOUND', 'old_text does not occur in the cell source', {
-            details: { cell_id: operation.cellId }
+            details: observationDetails(cell)
           });
         }
         if (found.kind === 'not_unique') {
           throw coreError('MATCH_NOT_UNIQUE', 'old_text occurs more than once in the cell source', {
-            details: { cell_id: operation.cellId, occurrences: found.count }
+            details: { ...observationDetails(cell), occurrences: found.count }
           });
         }
         const edit: TextEdit = {
@@ -385,12 +431,14 @@ export function planOperations(
       case 'delete_cell': {
         requireKind(operation.expectedCellRevision, 'cell', 'expected_cell_revision');
         const { cell, at } = sim.find(operation.cellId);
+        requireTargetIdentity(cell, operation.expectedCellIdentityToken);
         sim.guard(
           operation.expectedCellRevision,
           cellRevision(cell.json as JsonValue),
           cellRevision(cell.original as JsonValue),
-          { cell_id: operation.cellId },
-          () => boundedPreview(sourceOfJson(cell.json))
+          observationDetails(cell),
+          () => boundedPreview(sourceOfJson(cell.json)),
+          operation.expectedCellIdentityToken !== undefined
         );
         sim.order.splice(at, 1);
         ops.push({ kind: 'delete', op: 'delete_cell', at, target: cell });
@@ -400,6 +448,7 @@ export function planOperations(
       case 'clear_outputs': {
         requireKind(operation.expectedOutputsRevision, 'outputs', 'expected_outputs_revision');
         const { cell } = sim.find(operation.cellId);
+        requireTargetIdentity(cell, operation.expectedCellIdentityToken);
         if (cellTypeOfJson(cell.json) !== 'code') {
           throw coreError('INVALID_ARGUMENT', 'clear_outputs targets a cell with no output area', {
             details: { cell_id: operation.cellId, cell_type: cellTypeOfJson(cell.json) }
@@ -410,8 +459,9 @@ export function planOperations(
           operation.expectedOutputsRevision,
           outputsRevision(outputs),
           outputsRevision(outputsOfJson(cell.original)),
-          { cell_id: operation.cellId },
-          () => outputsPreview(outputs)
+          observationDetails(cell),
+          () => outputsPreview(outputs),
+          operation.expectedCellIdentityToken !== undefined
         );
         cell.json['outputs'] = [];
         ops.push(
@@ -431,12 +481,14 @@ export function planOperations(
         }
         const path = normalizePath(operation.key);
         const { cell } = sim.find(operation.cellId);
+        requireTargetIdentity(cell, operation.expectedCellIdentityToken);
         sim.guard(
           operation.expectedCellRevision,
           cellRevision(cell.json as JsonValue),
           cellRevision(cell.original as JsonValue),
-          { cell_id: operation.cellId },
-          () => metadataPreview(asObject(cell.json['metadata']))
+          observationDetails(cell),
+          () => metadataPreview(asObject(cell.json['metadata'])),
+          operation.expectedCellIdentityToken !== undefined
         );
         const before = asObject(cell.json['metadata']);
         const after = remove ? deleteAtPath(before, path) : setAtPath(before, path, operation.value);
@@ -465,12 +517,19 @@ export function planOperations(
           throw coreError('INVALID_ARGUMENT', 'set_notebook_metadata value must not be undefined');
         }
         const path = normalizePath(operation.key);
+        const currentMetadataRevision = notebookMetadataRevision(
+          sim.metadata as Record<string, JsonValue | undefined>
+        );
+        const liveMetadataRevision = notebookMetadataRevision(
+          sim.originalMetadata as Record<string, JsonValue | undefined>
+        );
         sim.guard(
           operation.expectedNotebookMetadataRevision,
-          notebookMetadataRevision(sim.metadata as Record<string, JsonValue | undefined>),
-          notebookMetadataRevision(sim.originalMetadata as Record<string, JsonValue | undefined>),
-          {},
-          () => metadataPreview(sim.metadata)
+          currentMetadataRevision,
+          liveMetadataRevision,
+          { notebook_metadata_revision: liveMetadataRevision },
+          () => metadataPreview(sim.metadata),
+          operation.expectedNotebookObserved === true
         );
         const after = remove
           ? deleteAtPath(sim.metadata, path)

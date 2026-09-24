@@ -154,6 +154,8 @@ export type CellSelector =
 /** One cell of `notebook_read(view: 'cells')` (SPEC.md §9). */
 export interface CellRead {
   readonly cellId: string;
+  /** Internal identity of the live Y.Map; retained through the service layer. */
+  readonly identityToken?: string;
   readonly index: number;
   readonly cellType: CellType;
   /** Possibly truncated; see {@link sourceTruncated} and {@link sourceBytes}. */
@@ -205,8 +207,12 @@ export interface OutputRead {
 /** Outputs of one cell. */
 export interface CellOutputsRead {
   readonly cellId: string;
+  /** Internal identity of the live Y.Map; retained through the service layer. */
+  readonly identityToken?: string;
   readonly index: number;
   readonly cellType: CellType;
+  readonly sourceRevision: SourceRevision;
+  readonly cellRevision: CellRevision;
   /** `null` for markdown and raw cells, which have no output area. */
   readonly outputsRevision: OutputsRevision | null;
   readonly outputs: readonly OutputRead[];

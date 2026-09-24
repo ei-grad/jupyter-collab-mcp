@@ -101,8 +101,7 @@ async function main(): Promise<number> {
     let notebookId = '';
     let changesCursor = '';
     let requestId = '1';
-    let cellId = '';
-    let sourceRevision = '';
+    let cellRef = '';
     let executionId = '';
     let outputId = '';
     let outputUri = '';
@@ -157,12 +156,11 @@ async function main(): Promise<number> {
         operations: [{ op: 'add_cell', cell_type: 'code', source: CELL_SOURCE, position: 'end' }]
       });
       requestId = str(answer['next_request_id']);
-      cellId = str(list(answer['results'])[0]?.['cell_id']);
-      sourceRevision = str(list(answer['results'])[0]?.['source_revision']);
+      cellRef = str(list(answer['results'])[0]?.['cell_ref']);
       expect(answer['applied_locally'] === true, 'applied locally');
       expect(answer['delivery'] === 'sent', 'handed to the server');
       expect(answer['persistence'] === 'unconfirmed', 'and honestly not confirmed on disk');
-      return `cell ${cellId}, delivery=sent persistence=unconfirmed`;
+      return `cell ${cellRef}, delivery=sent persistence=unconfirmed`;
     });
 
     await row('Document data', 'notebook_read summary and cells', async () => {
@@ -170,9 +168,11 @@ async function main(): Promise<number> {
       const cells = await child.call('notebook_read', {
         notebook_id: notebookId,
         view: 'cells',
-        cell_ids: [cellId]
+        cell_refs: [cellRef]
       });
       expect(Number(obj(summary['summary'])['cell_count']) >= 1, 'the summary counts the cell');
+      expect(str(summary['notebook_ref']).startsWith('@'), 'summary carries notebook_ref');
+      expect(str(cells['notebook_ref']).startsWith('@'), 'cells carry notebook_ref');
       expect(str(list(cells['cells'])[0]?.['source']).includes('hello from the kernel'), 'source round trip');
       return `${str(obj(summary['summary'])['cell_count'])} cell(s), source read back verbatim`;
     });
@@ -227,7 +227,7 @@ async function main(): Promise<number> {
       const job = await child.call('notebook_execute', {
         notebook_id: notebookId,
         request_id: requestId,
-        cells: [{ cell_id: cellId, expected_source_revision: sourceRevision }],
+        cells: [{ cell_ref: cellRef }],
         wait_ms: 500
       });
       requestId = str(job['next_request_id']);
@@ -241,7 +241,7 @@ async function main(): Promise<number> {
       const read = await child.call('notebook_read', {
         notebook_id: notebookId,
         view: 'outputs',
-        cell_ids: [cellId],
+        cell_refs: [cellRef],
         limits: { max_bytes: 60_000, max_output_bytes: 40_000 }
       });
       const cell = list(read['cells'])[0];

@@ -118,18 +118,15 @@ const SERVER_STATUS = result({
 
 const CELL_SUMMARY = obj(
   {
-    cell_id: str(),
+    cell_ref: str(),
     index: num(),
     cell_type: str('code | markdown | raw'),
-    source_revision: str(),
-    cell_revision: str(),
-    outputs_revision: nullableStr(),
     execution_count: nullableNum(),
     execution_state: str('running | idle'),
     preview: str('Short excerpt, never the whole source.'),
     duplicate_id: bool()
   },
-  ['cell_id', 'index', 'cell_type', 'source_revision', 'cell_revision', 'preview']
+  ['cell_ref', 'index', 'cell_type', 'preview']
 );
 
 const NOTEBOOK_SUMMARY = obj(
@@ -146,7 +143,7 @@ const NOTEBOOK_SUMMARY = obj(
     cells: arr(CELL_SUMMARY),
     truncated: bool(),
     structure_revision: str(),
-    notebook_metadata_revision: str(),
+    notebook_ref: str('Current notebook-metadata observation.'),
     duplicate_cell_ids: arr(str()),
     changes_cursor: str(),
     page_cursor: str()
@@ -196,9 +193,9 @@ const OUTPUT_ENTRY = obj(
 
 const EXECUTION_CELL = obj(
   {
-    cell_id: str(),
+    cell_ref: str('Current live observation of the same cell object, when it still exists.'),
+    cell_ref_unavailable: bool('true when that object was deleted or replaced; re-read the notebook.'),
     state: str('queued | sent | succeeded | failed | aborted | not_sent | unknown'),
-    source_revision: str('Revision of the text actually sent.'),
     msg_id: str(),
     execution_count: nullableNum(),
     not_sent_reason: str('The cell provably never reached the kernel.'),
@@ -210,7 +207,7 @@ const EXECUTION_CELL = obj(
     outputs_reset: bool('true when outputs replace the state represented by the request cursor, including an empty clear.'),
     outputs_truncated: bool()
   },
-  ['cell_id', 'state', 'source_revision', 'source_changed', 'cell_deleted', 'output_incomplete', 'outputs', 'outputs_reset', 'outputs_truncated']
+  ['state', 'source_changed', 'cell_deleted', 'output_incomplete', 'outputs', 'outputs_reset', 'outputs_truncated']
 );
 
 const EXECUTION_VIEW: Record<string, JsonSchema> = {
@@ -255,8 +252,6 @@ const requestId = z
     'Canonical decimal request number of this connection, starting at "1" and growing by one. Always take it from next_request_id of the previous answer; never invent or reconstruct one. A repeat with the same payload replays the stored result; a different payload is REQUEST_ID_CONFLICT.'
   );
 
-const revision = (what: string) => z.string().min(1).describe(`Expected ${what} revision, taken from a previous read. A mismatch is REVISION_CONFLICT and nothing is applied. Full digests remain accepted; use the short connection-scoped @ reference returned by the server when available.`);
-
 const limits = z
   .object({
     max_cells: z.number().int().positive().optional().describe('Cells in this answer. Clamped to the configured budget (default 100).'),
@@ -287,8 +282,8 @@ const addCell = z.object({
   cell_type: z.enum(['code', 'markdown', 'raw']),
   source: z.string(),
   metadata: z.record(z.string(), z.unknown()).optional(),
-  before_cell_id: z.string().optional(),
-  after_cell_id: z.string().optional(),
+  before_cell_ref: z.string().optional(),
+  after_cell_ref: z.string().optional(),
   position: z.literal('end').optional()
 });
 
@@ -296,49 +291,43 @@ const OPERATION = z.discriminatedUnion('op', [
   addCell,
   z.object({
     op: z.literal('replace_source'),
-    cell_id: z.string(),
-    expected_source_revision: revision('source'),
+    cell_ref: z.string(),
     source: z.string()
   }),
   z.object({
     op: z.literal('replace_text'),
-    cell_id: z.string(),
-    expected_source_revision: revision('source'),
+    cell_ref: z.string(),
     old_text: z.string().min(1).describe('Must occur exactly once, otherwise MATCH_NOT_FOUND / MATCH_NOT_UNIQUE.'),
     new_text: z.string()
   }),
   z.object({
     op: z.literal('delete_cell'),
-    cell_id: z.string(),
-    expected_cell_revision: revision('cell')
+    cell_ref: z.string()
   }),
   z.object({
     op: z.literal('clear_outputs'),
-    cell_id: z.string(),
-    expected_outputs_revision: revision('outputs')
+    cell_ref: z.string()
   }),
   z.object({
     op: z.literal('set_cell_metadata'),
-    cell_id: z.string(),
-    expected_cell_revision: revision('cell'),
+    cell_ref: z.string(),
     key: z.string().describe('One key. Other keys of the cell are left untouched.'),
     value: z.unknown()
   }),
   z.object({
     op: z.literal('delete_cell_metadata'),
-    cell_id: z.string(),
-    expected_cell_revision: revision('cell'),
+    cell_ref: z.string(),
     key: z.string()
   }),
   z.object({
     op: z.literal('set_notebook_metadata'),
-    expected_notebook_metadata_revision: revision('notebook metadata'),
+    notebook_ref: z.string(),
     key: z.string(),
     value: z.unknown()
   }),
   z.object({
     op: z.literal('delete_notebook_metadata'),
-    expected_notebook_metadata_revision: revision('notebook metadata'),
+    notebook_ref: z.string(),
     key: z.string()
   })
 ]);
@@ -534,11 +523,11 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_read',
     title: 'Read a notebook',
     description:
-      'Read the live replica: view "summary" (one row per cell with revisions and a preview), "cells" (source, metadata, attachments) or "outputs" (bounded outputs with an output_id for anything large). The snapshot and changes_cursor are taken together, so nothing can slip between them. Before readiness the current snapshot is served and marked stale. Read-only, takes no request_id — and the cheapest way to recover next_request_id after losing your counter.',
+      'Read the live replica: view "summary" (one cell_ref per cell with a preview), "cells" (source, metadata, attachments) or "outputs" (bounded outputs with an output_id for anything large). A cell_ref is one immutable observed version and can be refreshed only while the same cell object remains live. The snapshot and changes_cursor are taken together, so nothing can slip between them. Before readiness the current snapshot is served and marked stale. Read-only, takes no request_id — and the cheapest way to recover next_request_id after losing your counter.',
     input: z.object({
       notebook_id: notebookId,
       view: z.enum(['summary', 'cells', 'outputs']),
-      cell_ids: z.array(z.string()).optional().describe('Explicit selection for cells or outputs. Mutually exclusive with cursor; ignored for summary.'),
+      cell_refs: z.array(z.string()).optional().describe('Explicit observed cell selection for cells or outputs. Mutually exclusive with cursor; ignored for summary.'),
       cursor: z.string().optional().describe('page_cursor or source cursor from a previous cells read. A source cursor continues the same source before later cells; a changed source, replacement, or structural change gives CURSOR_EXPIRED.'),
       limits
     }),
@@ -553,7 +542,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
         summary: NOTEBOOK_SUMMARY,
         cells: arr(
           obj({
-            cell_id: str(),
+            cell_ref: str(),
             index: num(),
             cell_type: str(),
             source: str(),
@@ -561,9 +550,6 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
             source_bytes: num(),
             metadata: anyObject(),
             attachments: anyObject(),
-            source_revision: str(),
-            cell_revision: str(),
-            outputs_revision: nullableStr(),
             execution_count: nullableNum(),
             execution_state: str(),
             duplicate_id: bool(),
@@ -572,11 +558,11 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
           })
         ),
         notebook_metadata: anyObject(),
-        notebook_metadata_revision: str(),
+        notebook_ref: str('Current notebook-metadata observation, present on every read view.'),
         truncated: bool(),
         next_cursor: str()
       },
-      ['notebook_id', 'view', 'connection_state', 'stale', 'structure_revision', 'changes_cursor']
+      ['notebook_id', 'notebook_ref', 'view', 'connection_state', 'stale', 'structure_revision', 'changes_cursor']
     ),
     readOnly: true,
     deduplicated: false
@@ -589,7 +575,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     input: z.object({
       notebook_id: notebookId,
       request_id: requestId,
-      operations: z.array(OPERATION).min(1).describe('Non-empty, applied in order. add_cell needs exactly one anchor: before_cell_id, after_cell_id or position:"end".')
+      operations: z.array(OPERATION).min(1).describe('Non-empty, applied in order. add_cell needs exactly one anchor: before_cell_ref, after_cell_ref or position:"end".')
     }),
     output: result(
       {
@@ -598,12 +584,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
           obj(
             {
               op: str(),
-              cell_id: str('Target, or the id assigned to a new cell.'),
+              cell_ref: str('Final observation of a surviving target or newly added cell.'),
+              notebook_ref: str('Final notebook-metadata observation for a notebook metadata operation.'),
               index: num(),
-              source_revision: str(),
-              cell_revision: str(),
-              outputs_revision: str(),
-              notebook_metadata_revision: str()
             },
             ['op']
           )
@@ -632,12 +615,11 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       cells: z
         .array(
           z.object({
-            cell_id: z.string().min(1),
-            expected_source_revision: revision('source')
+            cell_ref: z.string().min(1)
           })
         )
         .min(1)
-        .describe('Ordered, code cells only. A non-code target is INVALID_ARGUMENT before the job is accepted. Each revision is re-checked immediately before its cell is sent; a late mismatch makes that cell and the rest not_sent.'),
+        .describe('Ordered, code cells only. A non-code target is INVALID_ARGUMENT before the job is accepted. Each observed source and cell identity is re-checked immediately before send; a late mismatch makes that cell and the rest not_sent.'),
       stop_on_error: z.boolean().optional().describe('Stop the queue on the first failure. Default true.'),
       wait_ms: waitMs,
       limits
@@ -650,7 +632,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'execution_get',
     title: 'Read a run',
     description:
-      `State of a job plus the outputs after cursor; with wait_ms it waits for the next change instead of polling. Delivered output is never repeated. ${NOT_A_TOOL_ERROR} Takes no request_id.`,
+      `State of a job plus the outputs after cursor; with wait_ms it waits for the next change instead of polling. A returned cell_ref describes current live state of the same cell object, not necessarily the source that was sent. Missing/replaced cells set cell_ref_unavailable. Delivered output is never repeated. ${NOT_A_TOOL_ERROR} Takes no request_id.`,
     input: z.object({
       execution_id: executionId,
       cursor: z.string().optional().describe('cursor from the previous answer. Omitted, the whole current state comes back.'),
@@ -702,11 +684,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
         execution_id: str(),
         notebook_id: str('Owning notebook handle for the returned cell references.'),
         state: str(),
-        cancelled_cell_ids: arr(str(), 'Removed from the queue; now not_sent with reason cancelled.'),
-        already_sent_cell_ids: arr(str(), 'Already handed to the kernel; their outcome is whatever the kernel reports.'),
+        cancelled_cell_refs: arr(str(), 'Live same-object observations for cells removed from the queue.'),
+        already_sent_cell_refs: arr(str(), 'Live same-object observations for cells already handed to the kernel.'),
+        unavailable_cancelled_cells: num('Cancelled cells whose accepted object was deleted or replaced.'),
+        unavailable_already_sent_cells: num('Sent cells whose accepted object was deleted or replaced.'),
         kernel_interrupted: bool('Always false.')
       },
-      ['execution_id', 'notebook_id', 'state', 'cancelled_cell_ids', 'already_sent_cell_ids', 'kernel_interrupted']
+      ['execution_id', 'notebook_id', 'state', 'cancelled_cell_refs', 'already_sent_cell_refs', 'unavailable_cancelled_cells', 'unavailable_already_sent_cells', 'kernel_interrupted']
     ),
     readOnly: false,
     deduplicated: false

@@ -15,7 +15,7 @@ import type { WireObject } from '../../src/mcp/wire.js';
 describe('key naming', () => {
   const pairs: [string, string][] = [
     ['notebookId', 'notebook_id'],
-    ['expectedSourceRevision', 'expected_source_revision'],
+    ['cellRef', 'cell_ref'],
     ['nbformatMinor', 'nbformat_minor'],
     ['jupyterSessionId', 'jupyter_session_id'],
     ['waitMs', 'wait_ms'],
@@ -32,8 +32,8 @@ describe('key naming', () => {
 describe('toWire / fromWire', () => {
   it('renames nested keys and drops undefined members', () => {
     expect(
-      toWire({ notebookId: 'nb', summary: { cellCount: 2, pageCursor: undefined, cells: [{ cellId: 'c' }] } })
-    ).toEqual({ notebook_id: 'nb', summary: { cell_count: 2, cells: [{ cell_id: 'c' }] } });
+      toWire({ notebookId: 'nb', summary: { cellCount: 2, pageCursor: undefined, cells: [{ cellRef: '@c' }] } })
+    ).toEqual({ notebook_id: 'nb', summary: { cell_count: 2, cells: [{ cell_ref: '@c' }] } });
   });
 
   it('leaves metadata, value, output and details untouched', () => {
@@ -41,14 +41,14 @@ describe('toWire / fromWire', () => {
       metadata: { 'user/Weird Key': { nestedCamel: 1 } },
       value: { alsoCamel: [1] },
       output: { output_type: 'display_data', data: { 'image/png': 'AAA' }, metadata: {} },
-      details: { cell_id: 'c', current_source_revision: 's1_x' }
+      details: { current_cell_ref: '@cell-ref' }
     };
     expect(toWire(value)).toEqual(value);
     expect(fromWire(value)).toEqual(value);
   });
 
   it('is the inverse of itself for our own keys', () => {
-    const camel = { notebookId: 'nb', cells: [{ cellId: 'a', expectedSourceRevision: 's1_x' }] };
+    const camel = { notebookId: 'nb', cells: [{ cellRef: '@cell-ref' }] };
     expect(fromWire(toWire(camel))).toEqual(camel);
   });
 });

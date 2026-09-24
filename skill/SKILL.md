@@ -1,13 +1,14 @@
 ---
 name: jupyter-collab
-description: Work inside a live JupyterLab notebook through the jupyter-collab-mcp server - open a notebook over RTC, read the summary and cells by ID and revision, apply edits, run cells so the user sees them run, read plots and errors, follow concurrent changes, and control the kernel. Use whenever the user wants a real notebook edited, executed or inspected instead of a script.
+description: Work inside a live JupyterLab notebook through the jupyter-collab-mcp server - open a notebook over RTC, read observed cell refs, apply edits, run cells so the user sees them run, read plots and errors, follow concurrent changes, and control the kernel. Use whenever the user wants a real notebook edited, executed or inspected instead of a script.
 ---
 
 # Jupyter collaboration (RTC)
 
 The notebook is a shared document. Every edit appears in the user's open
 JupyterLab immediately, and the user edits the same document at the same time.
-Work from IDs and revisions, never from remembered line numbers.
+Work from `cell_ref` and `notebook_ref` observations, never from remembered
+line numbers or reconstructed identifiers.
 
 ## 1. Server and notebook
 
@@ -30,49 +31,47 @@ Work from IDs and revisions, never from remembered line numbers.
    one mutation counter.
    Handles bind their server; subsequent handle-based calls need no server ID.
 
-## 2. Summary, IDs, revisions
+## 2. Summary and observed refs
 
 `notebook_read {notebook_id, view}` with `view`:
 
-- `summary` - cell IDs, types, source previews, `execution_count`, revisions.
-- `cells` - full source, metadata, attachments (`cell_ids` or a `cursor`).
+- `summary` - `cell_ref`, types, source previews, and `execution_count`.
+- `cells` - full source, metadata, attachments (`cell_refs` or a `cursor`).
 - `outputs` - output entries with `mime_types`, `byte_size`, `truncated`,
   `output_id`.
 
-The server may return short connection-scoped references for notebook, cell,
-execution, output, and revision values. Pass them back exactly as returned;
-they preserve the full underlying identity and expire with the connection.
-Full values remain valid for compatible callers. Values beginning with `@` or
-`raw:` are reserved syntax; pass a custom literal with either prefix as the
-single-level escape `raw:<base64url(UTF-8)>`. Its decoded value must begin with
-one of those prefixes. A cell or revision can remain a full value when its
-response has no notebook context. If a cells read reports a source cursor,
-continue it before acting on the incomplete source.
-
-Use the revision named by each guarded operation from the answer you just read:
-`source_revision` (text), `cell_revision` (whole cell), `outputs_revision`, or
-`notebook_metadata_revision`. `structure_revision` identifies the structure
-snapshot and binds page cursors; current apply operations do not accept it as a
-guard. Page cursors and `changes_cursor` are different types and are not
-interchangeable.
+Each `cell_ref` is one immutable observation of the cell object plus all guards
+needed by edit, delete, clear-output, metadata, and execution operations. Each
+read also returns a `notebook_ref` for notebook metadata. Pass refs back exactly
+as returned; they are scoped to this connection and notebook handle. A read by
+`cell_refs` refreshes the observation only while the same cell object remains
+live. A deleted or replacement object fails instead of redirecting the ref to a
+new cell with the same internal ID. If a cells read reports a source cursor,
+continue it before acting on the incomplete source. Page cursors and
+`changes_cursor` are different types and are not interchangeable.
 
 ## 3. Edits and visible execution
 
 `notebook_apply {notebook_id, request_id, operations[]}`, operations:
 `add_cell`, `replace_source`, `replace_text`, `delete_cell`, `clear_outputs`,
 `set_cell_metadata`, `delete_cell_metadata`, `set_notebook_metadata`,
-`delete_notebook_metadata`. Prefer `replace_text` (exact, unique substring)
-over rewriting a whole cell. The answer gives new revisions,
+`delete_notebook_metadata`. Cell operations use `cell_ref`; notebook metadata
+operations use `notebook_ref`; add-cell anchors are `before_cell_ref` or
+`after_cell_ref`. Prefer `replace_text` (exact, unique substring) over rewriting
+a whole cell. The answer gives final refs for surviving targets,
 `delivery` and `persistence`: an applied edit is not a saved file.
 
-`notebook_execute {notebook_id, request_id, cells[{cell_id,
-expected_source_revision}], wait_ms?}` runs the cells in the notebook, so the
+`notebook_execute {notebook_id, request_id, cells[{cell_ref}], wait_ms?}` runs
+the cells in the notebook, so the
 user sees `[*]`, outputs and the final `execution_count`. A positive `wait_ms`
 waits for completion or the deadline, without holding the mutation lock.
 Intermediate updates do not return early. If `wait_timed_out` is true, continue
 with `execution_get {execution_id, cursor?, wait_ms?}` until `state` is terminal;
 that read-only tool still waits for the next update rather than completion.
 Never run notebook code with a shell tool instead: it would be invisible.
+An execution view's `cell_ref` is a fresh observation of current live state for
+the same cell object, not a claim that its source is the code already sent. If
+the object was deleted or replaced, the view says `cell_ref_unavailable`.
 
 Before the first execution, call `kernel_status {notebook_id}`. If it returns
 `kernel_id: null`, bind/start the notebook kernel with `kernel_control {action:
@@ -124,8 +123,9 @@ one speculatively. Never guess `expected_kernel_id`.
 ## 5. Conflicts, reconnect, uncertain execution
 
 - `REVISION_CONFLICT`, `MATCH_NOT_FOUND`, `MATCH_NOT_UNIQUE`, `CELL_REPLACED`:
-  another participant changed the cell. Re-read, decide again, then re-apply
-  with the new revision. Do not force the old text back.
+  another participant changed the cell. Use `current_cell_ref` or
+  `current_notebook_ref` when supplied; otherwise re-read, decide again, then
+  re-apply. Do not force the old text back.
 - `NOT_READY` is retryable; `RTC_SESSION_REJECTED`, `RTC_CONFLICT`,
   `FILE_ID_CHANGED` mean this replica is dead. Do not call `notebook_open`
   immediately: the same session would reuse the terminal handle. First let
@@ -152,8 +152,9 @@ one speculatively. Never guess `expected_kernel_id`.
 - `notebook_close` and connection teardown release *our* handles only. The kernel
   keeps running and the user's JupyterLab is untouched.
 - `execution_cancel {execution_id}` drops cells we have not sent yet and returns
-  the owning `notebook_id` with the affected cell references. Cells already
-  handed to the kernel keep running.
+  the owning `notebook_id`, available `cancelled_cell_refs` and
+  `already_sent_cell_refs`, and unavailable counts for deleted/replaced cells.
+  Cells already handed to the kernel keep running.
 - `kernel_control {action: "interrupt", expected_kernel_id, request_id}` stops
   the whole kernel's current work, possibly someone else's. Only on request.
 - `restart` clears no outputs and re-runs nothing; variables are gone.
@@ -206,12 +207,12 @@ Tell the user the server is up and let them configure the token themselves.
 // -> kernel_id "k_1", next_request_id "2"
 // 5. notebook_apply
 {"notebook_id":"nb_A","request_id":"2","operations":[
-  {"op":"replace_text","cell_id":"cell_B","expected_source_revision":"rev_1",
+  {"op":"replace_text","cell_ref":"@observed_cell_before",
    "old_text":"df.head()","new_text":"df.head(20)"}]}
-// -> results[0].source_revision "rev_2", next_request_id "3"
+// -> results[0].cell_ref "@observed_cell_after", next_request_id "3"
 // 6. notebook_execute
 {"notebook_id":"nb_A","request_id":"3",
- "cells":[{"cell_id":"cell_B","expected_source_revision":"rev_2"}],
+ "cells":[{"cell_ref":"@observed_cell_after"}],
  "wait_ms":2000}
 // -> execution_id "ex_1", terminal state or wait_timed_out true,
 //    cursor "...", next_request_id "4"

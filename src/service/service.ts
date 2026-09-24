@@ -39,6 +39,7 @@ import {
   toCoreError,
   withDefaults,
   type CellContent,
+  type CellObservation,
   type CellOutputsView,
   type CollabService,
   type CoreError,
@@ -108,7 +109,12 @@ import type {
   KernelSpecEntry,
   ServerClient
 } from '../jupyter/server-client.js';
-import type { ExecutionCellRequest, Revalidate, RevalidateResult } from '../kernel/index.js';
+import type {
+  ExecutionCellRequest,
+  KernelCellRecord,
+  Revalidate,
+  RevalidateResult
+} from '../kernel/index.js';
 import {
   buildExecutionView,
   effectiveLimits,
@@ -220,6 +226,16 @@ function withAcceptedExecutionDetails(error: unknown, executionId: string): Core
     retryable: core.retryable,
     sideEffects: 'applied',
     details: { ...(core.details ?? {}), execution_id: executionId },
+    cause: core
+  });
+}
+
+function withNotebookDetails(error: unknown, notebookId: string): CoreError {
+  const core = toCoreError(error);
+  return coreError(core.code, core.message, {
+    retryable: core.retryable,
+    sideEffects: core.sideEffects,
+    details: { notebook_id: notebookId, ...(core.details ?? {}) },
     cause: core
   });
 }
@@ -668,15 +684,18 @@ class CollabServiceImpl implements CollabService {
         return { ...(result as NotebookReadResultFor<R>), ...session.envelope() };
       }
       if (request.view === 'cells') {
-        if (request.cellIds !== undefined && request.cursor !== undefined) {
-          throw coreError('INVALID_ARGUMENT', 'cell_ids and cursor are mutually exclusive');
+        if ((request.cellIds !== undefined || request.observedCells !== undefined) && request.cursor !== undefined) {
+          throw coreError('INVALID_ARGUMENT', 'cell_refs and cursor are mutually exclusive');
         }
+        const selectedIds = request.observedCells === undefined
+          ? request.cellIds
+          : request.observedCells.map((cell) => handle.model.observeCell(cell).cellId);
         const changesCursor = handle.model.changesCursor;
-        const selector = request.cellIds === undefined
+        const selector = selectedIds === undefined
           ? request.cursor === undefined
             ? {}
             : { cursor: request.cursor }
-          : { cellIds: request.cellIds };
+          : { cellIds: selectedIds };
         const metadata = notebookMetadata(handle);
         const duplicates = new Set(handle.model.duplicateCellIds);
         let contentBudget = limits.maxBytes;
@@ -711,14 +730,17 @@ class CollabServiceImpl implements CollabService {
           details: { max_bytes: this.#config.limits.responseMaxBytes }
         });
       }
-      if (request.cellIds !== undefined && request.cursor !== undefined) {
-        throw coreError('INVALID_ARGUMENT', 'cell_ids and cursor are mutually exclusive');
+      if ((request.cellIds !== undefined || request.observedCells !== undefined) && request.cursor !== undefined) {
+        throw coreError('INVALID_ARGUMENT', 'cell_refs and cursor are mutually exclusive');
       }
       const changesCursor = handle.model.changesCursor;
       let cellIds: readonly string[];
       let nextCursor: PageCursor | undefined;
       let structure;
-      if (request.cellIds !== undefined) {
+      if (request.observedCells !== undefined) {
+        cellIds = request.observedCells.map((cell) => handle.model.observeCell(cell).cellId);
+        structure = handle.model.structureRevision;
+      } else if (request.cellIds !== undefined) {
         cellIds = request.cellIds;
         structure = handle.model.structureRevision;
       } else {
@@ -748,6 +770,7 @@ class CollabServiceImpl implements CollabService {
         structureRevision: structure,
         changesCursor,
         cells,
+        notebookMetadataRevision: metadataRevisionOf(handle.notebook),
         truncated: read.truncated,
         ...(nextCursor === undefined ? {} : { nextCursor })
       };
@@ -781,7 +804,10 @@ class CollabServiceImpl implements CollabService {
         // planner is pure, so running it twice costs a walk of the batch.
         planOperations(handle.notebook, handle.model.index, request.operations);
       } catch (error) {
-        throw withEnvelopeDetails(error, session.envelope({ requestAccepted: false }));
+        throw withEnvelopeDetails(
+          withNotebookDetails(error, handle.notebookId),
+          session.envelope({ requestAccepted: false })
+        );
       }
 
       const decision = this.#begin(
@@ -853,6 +879,14 @@ class CollabServiceImpl implements CollabService {
         // any output area is touched (SPEC.md §8).
         for (const target of request.cells) {
           const entry = handle.model.index.require(target.cellId);
+          if (
+            target.expectedIdentityToken !== undefined &&
+            entry.identityToken !== target.expectedIdentityToken
+          ) {
+            throw coreError('CELL_REPLACED', `cell ${target.cellId} was replaced`, {
+              details: { cell_id: target.cellId }
+            });
+          }
           const cell = resolveCell(handle.notebook, entry);
           if (!isCodeCell(cell)) {
             throw coreError('INVALID_ARGUMENT', `cell ${target.cellId} is not a code cell`, {
@@ -861,11 +895,19 @@ class CollabServiceImpl implements CollabService {
           }
           const current = sourceRevision('code', cell.getSource());
           if (current !== target.expectedSourceRevision) {
+            const observed = handle.model.observeCell({
+              cellId: target.cellId,
+              identityToken: entry.identityToken
+            });
             throw coreError('REVISION_CONFLICT', `cell ${target.cellId} changed since the read`, {
               details: {
-                cell_id: target.cellId,
+                notebook_id: handle.notebookId,
+                cell_id: observed.cellId,
+                identity_token: observed.identityToken,
                 expected_source_revision: target.expectedSourceRevision,
-                source_revision: current
+                source_revision: observed.sourceRevision,
+                cell_revision: observed.cellRevision,
+                outputs_revision: observed.outputsRevision
               }
             });
           }
@@ -984,21 +1026,29 @@ class CollabServiceImpl implements CollabService {
     const { session, record } = this.#locateExecution(request.executionId);
     try {
       const snapshot = record.registry.cancel(request.executionId);
-      const cancelled: string[] = [];
-      const alreadySent: string[] = [];
+      const cancelled: CellObservation[] = [];
+      const alreadySent: CellObservation[] = [];
+      let unavailableCancelled = 0;
+      let unavailableAlreadySent = 0;
       for (const cell of snapshot.job.cells) {
         if (cell.state === 'not_sent' && cell.notSentReason === 'cancelled') {
-          cancelled.push(cell.cellId);
+          const observed = observeExecutionCell(record, cell);
+          if (observed === null) unavailableCancelled++;
+          else cancelled.push(observed);
         } else if (cell.msgId !== undefined) {
-          alreadySent.push(cell.cellId);
+          const observed = observeExecutionCell(record, cell);
+          if (observed === null) unavailableAlreadySent++;
+          else alreadySent.push(observed);
         }
       }
       return {
         executionId: request.executionId,
         notebookId: record.notebookId,
         state: snapshot.job.state,
-        cancelledCellIds: cancelled,
-        alreadySentCellIds: alreadySent,
+        cancelledCells: cancelled,
+        unavailableCancelledCells: unavailableCancelled,
+        alreadySentCells: alreadySent,
+        unavailableAlreadySentCells: unavailableAlreadySent,
         // SPEC.md §8: cancelling never interrupts the kernel.
         kernelInterrupted: false,
         ...session.envelope()
@@ -1878,13 +1928,22 @@ class CollabServiceImpl implements CollabService {
     }
     // The watcher normally does this, but a caller that waited should never
     // see a finished cell whose `[*]` is still on screen (SPEC.md §8).
-    return buildExecutionView(record, snapshot, {
+    const view = buildExecutionView(record, snapshot, {
       limits: this.#config.limits,
       requested: options.limits,
       positions: parsed?.positions ?? null,
       waitTimedOut,
       outputs: session.outputs
     });
+    return {
+      ...view,
+      cells: view.cells.map((cell, position) => {
+        const observed = observeExecutionCell(record, snapshot.job.cells[position]!);
+        return observed === null
+          ? { ...cell, cellRefUnavailable: true }
+          : { ...cell, currentObservation: observed };
+      })
+    };
   }
 
   // -- kernels ---------------------------------------------------------------
@@ -2299,6 +2358,22 @@ function notebookMetadata(handle: NotebookHandle): Readonly<Record<string, unkno
     if (metadata === null || typeof metadata !== 'object') return null;
     const size = Buffer.byteLength(JSON.stringify(metadata) ?? 'null', 'utf8');
     return size > 8 * 1024 ? null : (metadata as Readonly<Record<string, unknown>>);
+  } catch {
+    return null;
+  }
+}
+
+/** Current live observation of the exact CRDT object accepted for a job. */
+function observeExecutionCell(
+  record: ExecutionRecord,
+  cell: KernelCellRecord
+): CellObservation | null {
+  if (cell.identityToken === undefined || record.handle.closed) return null;
+  try {
+    return record.handle.model.observeCell({
+      cellId: cell.cellId,
+      identityToken: cell.identityToken
+    });
   } catch {
     return null;
   }

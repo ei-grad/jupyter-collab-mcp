@@ -266,8 +266,7 @@ describe('Reopening / Separate conversations (SPEC §12)', () => {
 });
 
 describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
-  let codeCellId: string;
-  let codeRevision: string;
+  let codeCellRef: string;
 
   it('applies add / replace_text / replace_source / metadata / delete and refuses a stale revision', async () => {
     const added = await mcp.call('notebook_apply', {
@@ -285,13 +284,12 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
     expect(added['persistence']).toBe('unconfirmed');
     const results = list(added['results']);
     expect(results).toHaveLength(3);
-    codeCellId = str(results[0]?.['cell_id']);
-    codeRevision = str(results[0]?.['source_revision']);
-    // Kept on purpose: after the next edit this is a *known stale* revision,
+    expect(results.every((entry) => !('cell_id' in entry) && !('source_revision' in entry) && !('cell_revision' in entry))).toBe(true);
+    codeCellRef = str(results[0]?.['cell_ref']);
+    // Kept on purpose: after the next edit this is a known stale observation,
     // which is the shape SPEC §12 "Concurrent edits" asks about.
-    const staleRevision = codeRevision;
-    const doomedId = str(results[2]?.['cell_id']);
-    const doomedCellRevision = str(results[2]?.['cell_revision']);
+    const staleRef = codeCellRef;
+    const doomedRef = str(results[2]?.['cell_ref']);
 
     // -- replace_text with the right revision -------------------------------
     const replaced = await mcp.call('notebook_apply', {
@@ -300,15 +298,14 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
       operations: [
         {
           op: 'replace_text',
-          cell_id: codeCellId,
-          expected_source_revision: codeRevision,
+          cell_ref: codeCellRef,
           old_text: 'one',
           new_text: 'two'
         }
       ]
     });
     main.counter.take(replaced);
-    codeRevision = str(list(replaced['results'])[0]?.['source_revision']);
+    codeCellRef = str(list(replaced['results'])[0]?.['cell_ref']);
 
     // -- a stale revision changes nothing (no distributed CAS promised) -----
     const conflict = await mcp.fail('notebook_apply', {
@@ -317,8 +314,7 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
       operations: [
         {
           op: 'replace_source',
-          cell_id: codeCellId,
-          expected_source_revision: staleRevision,
+          cell_ref: staleRef,
           source: 'print("clobbered")'
         }
       ]
@@ -327,50 +323,55 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
     expect(conflict.side_effects).toBe('none');
     // Rejected before acceptance: the number was not consumed.
     expect(conflict.request_accepted).toBe(false);
+    expect(conflict.current_cell_ref).toMatch(/^@/u);
     const stillThere = await mcp.call('notebook_read', {
       notebook_id: docId,
       view: 'cells',
-      cell_ids: [codeCellId]
+      cell_refs: [codeCellRef]
     });
+    expect(stillThere['notebook_ref']).toMatch(/^@/u);
     expect(list(stillThere['cells'])[0]?.['source']).toBe('print("two")');
 
     // -- replace_source, metadata and delete in one batch --------------------
-    const cellRevision = str(list(stillThere['cells'])[0]?.['cell_revision']);
-    const metadataRevision = str(stillThere['notebook_metadata_revision']);
+    const refreshedCellRef = str(list(stillThere['cells'])[0]?.['cell_ref']);
+    expect(refreshedCellRef).toBe(conflict.current_cell_ref);
+    const notebookRef = str(stillThere['notebook_ref']);
     const batch = await mcp.call('notebook_apply', {
       notebook_id: docId,
       request_id: main.counter.value,
       operations: [
         {
-          op: 'replace_source',
-          cell_id: codeCellId,
-          expected_source_revision: codeRevision,
-          source: 'print("hello from the kernel")'
-        },
-        {
           op: 'set_cell_metadata',
-          cell_id: codeCellId,
-          expected_cell_revision: cellRevision,
+          cell_ref: refreshedCellRef,
           key: 'acceptance',
           value: { run: RUN }
         },
         {
+          op: 'replace_source',
+          cell_ref: refreshedCellRef,
+          source: 'print("hello from the kernel")'
+        },
+        {
           op: 'set_notebook_metadata',
-          expected_notebook_metadata_revision: metadataRevision,
+          notebook_ref: notebookRef,
           key: 'acceptance_run',
           value: RUN
         },
-        { op: 'delete_cell', cell_id: doomedId, expected_cell_revision: doomedCellRevision }
+        { op: 'delete_cell', cell_ref: doomedRef }
       ]
     });
     main.counter.take(batch);
     expect(list(batch['results'])).toHaveLength(4);
-    codeRevision = str(list(batch['results'])[0]?.['source_revision']);
+    const batchResults = list(batch['results']);
+    expect(batchResults[0]?.['cell_ref']).toBe(batchResults[1]?.['cell_ref']);
+    expect(batchResults[2]?.['notebook_ref']).toBeTypeOf('string');
+    expect(batchResults[3]).not.toHaveProperty('cell_ref');
+    codeCellRef = str(batchResults[1]?.['cell_ref']);
 
     const after = await mcp.call('notebook_read', {
       notebook_id: docId,
       view: 'cells',
-      cell_ids: [codeCellId]
+      cell_refs: [codeCellRef]
     });
     const cell = list(after['cells'])[0];
     expect(cell?.['source']).toBe('print("hello from the kernel")');
@@ -381,7 +382,7 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
     const gone = await mcp.fail('notebook_read', {
       notebook_id: docId,
       view: 'cells',
-      cell_ids: [doomedId]
+      cell_refs: [doomedRef]
     });
     expect(gone.code).toBe('CELL_NOT_FOUND');
   }, 120_000);
@@ -407,7 +408,7 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
     });
     const secondCells = list(obj(second['summary'])['cells']);
     expect(secondCells).toHaveLength(1);
-    expect(secondCells[0]?.['cell_id']).not.toBe(list(summary['cells'])[0]?.['cell_id']);
+    expect(secondCells[0]?.['cell_ref']).not.toBe(list(summary['cells'])[0]?.['cell_ref']);
 
     // The outputs view answers for every cell, with nothing run yet.
     const outputs = await mcp.call('notebook_read', { notebook_id: docId, view: 'outputs' });
@@ -438,7 +439,7 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
       operations: [{ op: 'add_cell', cell_type: 'code', source, position: 'end' }]
     });
     main.counter.take(added);
-    const cellId = str(list(added['results'])[0]?.['cell_id']);
+    const cellRef = str(list(added['results'])[0]?.['cell_ref']);
 
     const chunks: string[] = [];
     let cursor: string | undefined;
@@ -446,11 +447,11 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
       const page = await mcp.call('notebook_read', {
         notebook_id: docId,
         view: 'cells',
-        ...(cursor === undefined ? { cell_ids: [cellId] } : { cursor }),
+        ...(cursor === undefined ? { cell_refs: [cellRef] } : { cursor }),
         limits: { max_bytes: 16_384 }
       });
       chunks.push(...list(page['cells'])
-        .filter((cell) => cell['cell_id'] === cellId)
+        .filter((cell) => cell['cell_ref'] !== undefined)
         .map((cell) => str(cell['source'])));
       cursor = page['next_cursor'] as string | undefined;
     } while (cursor !== undefined);
@@ -458,12 +459,12 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
   }, 120_000);
 
   it('exposes the code cell the execution scenarios use', () => {
-    expect(codeCellId).toBeTypeOf('string');
-    executionTarget = { cellId: codeCellId, revision: codeRevision };
+    expect(codeCellRef).toBeTypeOf('string');
+    executionTarget = { cellRef: codeCellRef };
   });
 });
 
-let executionTarget: { cellId: string; revision: string };
+let executionTarget: { cellRef: string };
 
 describe('Retries / Replay and call ordering (SPEC §12)', () => {
   it('replays the same id+payload, conflicts on a different payload and rejects a skipped number', async () => {
@@ -481,13 +482,13 @@ describe('Retries / Replay and call ordering (SPEC §12)', () => {
     expect(first['replayed']).not.toBe(true);
     expect(first['request_accepted']).toBe(true);
     const firstAcceptedAt = first['first_accepted_at'];
-    const newCellId = str(list(first['results'])[0]?.['cell_id']);
+    const newCellRef = str(list(first['results'])[0]?.['cell_ref']);
 
     // -- the same number with the same payload replays the stored receipt ---
     const replay = await mcp.call('notebook_apply', payload);
     expect(replay['replayed']).toBe(true);
     expect(replay['first_accepted_at']).toBe(firstAcceptedAt);
-    expect(str(list(replay['results'])[0]?.['cell_id'])).toBe(newCellId);
+    expect(str(list(replay['results'])[0]?.['cell_ref'])).toBe(newCellRef);
     expect(replay['next_request_id']).toBe(first['next_request_id']);
 
     const after = obj(await mcp.call('notebook_read', { notebook_id: docId, view: 'summary' }));
@@ -530,7 +531,7 @@ describe('Retries / Replay and call ordering (SPEC §12)', () => {
     });
     main.counter.take(again);
     expect(again['replayed']).not.toBe(true);
-    expect(str(list(again['results'])[0]?.['cell_id'])).not.toBe(newCellId);
+    expect(str(list(again['results'])[0]?.['cell_ref'])).not.toBe(newCellRef);
 
     // Clean the probes up so the later reads stay small.
     const summaryNow = obj(
@@ -545,8 +546,7 @@ describe('Retries / Replay and call ordering (SPEC §12)', () => {
         request_id: main.counter.value,
         operations: probes.map((entry) => ({
           op: 'delete_cell',
-          cell_id: entry['cell_id'],
-          expected_cell_revision: entry['cell_revision']
+          cell_ref: entry['cell_ref']
         }))
       });
       main.counter.take(cleanup);
@@ -554,8 +554,8 @@ describe('Retries / Replay and call ordering (SPEC §12)', () => {
   }, 120_000);
 });
 
-describe('Retries: revision-bearing operations', () => {
-  it('resending an identical revision-bearing apply replays instead of conflicting', async () => {
+describe('Retries: observed-ref operations', () => {
+  it('resending an identical observed-ref apply replays instead of conflicting', async () => {
     const session = await openContext();
     const mcp = session.client;
     const created = await mcp.call('notebook_create', {
@@ -578,16 +578,24 @@ describe('Retries: revision-bearing operations', () => {
       operations: [
         {
           op: 'delete_cell',
-          cell_id: str(target['cell_id']),
-          expected_cell_revision: str(target['cell_revision'])
+          cell_ref: str(target['cell_ref'])
         }
       ]
     };
-    await mcp.call('notebook_apply', payload);
+    const deleted = await mcp.call('notebook_apply', payload);
+    session.counter.take(deleted);
+    const intervening = await mcp.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: session.counter.value,
+      operations: [{ op: 'add_cell', cell_type: 'raw', source: 'later edit', position: 'end' }]
+    });
+    session.counter.take(intervening);
     try {
-      // The agent lost the answer and resends the very same request.
+      // The agent lost the answer and resends the same accepted request after
+      // deletion and a later live edit. Receipt replay precedes ref validation.
       const replay = await mcp.call('notebook_apply', payload);
       expect(replay['replayed']).toBe(true);
+      expect(replay['next_request_id']).toBe(session.counter.value);
     } finally {
       await mcp.close();
     }
@@ -707,7 +715,7 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     const before = await mcp.call('notebook_read', {
       notebook_id: docId,
       view: 'outputs',
-      cell_ids: [executionTarget.cellId]
+      cell_refs: [executionTarget.cellRef]
     });
     const outputsBefore = list(list(before['cells'])[0]?.['outputs']);
 
@@ -715,7 +723,7 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
       notebook_id: docId,
       request_id: main.counter.value,
       cells: [
-        { cell_id: executionTarget.cellId, expected_source_revision: executionTarget.revision }
+        { cell_ref: executionTarget.cellRef }
       ]
     });
     expect(error.code).toBe('KERNEL_NOT_BOUND');
@@ -726,7 +734,7 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     const after = await mcp.call('notebook_read', {
       notebook_id: docId,
       view: 'outputs',
-      cell_ids: [executionTarget.cellId]
+      cell_refs: [executionTarget.cellRef]
     });
     expect(list(list(after['cells'])[0]?.['outputs'])).toHaveLength(outputsBefore.length);
     const cellAfter = list(after['cells'])[0];
@@ -848,19 +856,18 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
       operations: [
         {
           op: 'replace_source',
-          cell_id: executionTarget.cellId,
-          expected_source_revision: executionTarget.revision,
+          cell_ref: executionTarget.cellRef,
           source: png
         }
       ]
     });
     main.counter.take(rewrite);
-    executionTarget.revision = str(list(rewrite['results'])[0]?.['source_revision']);
+    executionTarget.cellRef = str(list(rewrite['results'])[0]?.['cell_ref']);
 
     const job = await mcp.call('notebook_execute', {
       notebook_id: docId,
       request_id: main.counter.value,
-      cells: [{ cell_id: executionTarget.cellId, expected_source_revision: executionTarget.revision }],
+      cells: [{ cell_ref: executionTarget.cellRef }],
       wait_ms: 500
     });
     main.counter.take(job);
@@ -871,6 +878,10 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     const finished = await settle(mcp, executionId);
     expect(finished['state']).toBe('succeeded');
     expect(list(finished['cells'])[0]?.['state']).toBe('succeeded');
+    const finishedRef = str(list(finished['cells'])[0]?.['cell_ref']);
+    expect(finishedRef).toMatch(/^@/u);
+    expect(finishedRef).not.toBe(executionTarget.cellRef);
+    executionTarget.cellRef = finishedRef;
 
     const afterRun = await mcp.call('kernel_status', { notebook_id: docId });
     expect(afterRun['channel_state']).toBe('connected');
@@ -881,7 +892,7 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     const read = await mcp.call('notebook_read', {
       notebook_id: docId,
       view: 'outputs',
-      cell_ids: [executionTarget.cellId],
+      cell_refs: [executionTarget.cellRef],
       limits: { max_bytes: 60_000, max_output_bytes: 40_000 }
     });
     const cell = list(read['cells'])[0];
@@ -1016,10 +1027,7 @@ describe('Interruption and cancellation (SPEC §12)', () => {
       ]
     });
     session.counter.take(applied);
-    const cells = list(applied['results']).map((result) => ({
-      cell_id: str(result['cell_id']),
-      expected_source_revision: str(result['source_revision'])
-    }));
+    const cells = list(applied['results']).map((result) => ({ cell_ref: str(result['cell_ref']) }));
 
     const started = await mcp.call('kernel_control', {
       notebook_id: notebookId,
@@ -1081,8 +1089,19 @@ describe('Interruption and cancellation (SPEC §12)', () => {
     // -- execution_cancel drops what was not sent, and interrupts nothing ---
     const cancelled = await mcp.call('execution_cancel', { execution_id: executionId });
     expect(cancelled['kernel_interrupted']).toBe(false);
-    expect(list(cancelled['cancelled_cell_ids']) as unknown as string[]).toContain(cells[1]!.cell_id);
-    expect(list(cancelled['already_sent_cell_ids']) as unknown as string[]).toContain(cells[0]!.cell_id);
+    expect(list(cancelled['cancelled_cell_refs']) as unknown as string[]).toContain(cells[1]!.cell_ref);
+    const alreadySentRef = str(list(cancelled['already_sent_cell_refs'])[0]);
+    expect(alreadySentRef).toMatch(/^@/u);
+    expect(alreadySentRef).not.toBe(cells[0]!.cell_ref);
+    expect(cancelled['unavailable_cancelled_cells']).toBe(0);
+    expect(cancelled['unavailable_already_sent_cells']).toBe(0);
+    const runningCell = await mcp.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_refs: [alreadySentRef]
+    });
+    expect(str(list(runningCell['cells'])[0]?.['cell_ref'])).toBe(alreadySentRef);
+    expect(str(list(runningCell['cells'])[0]?.['source'])).toContain('print("running"');
 
     // -- a close while a job is active is refused (SPEC §4) -----------------
     const closeError = await mcp.fail('notebook_close', { notebook_id: notebookId });
@@ -1125,9 +1144,9 @@ describe('Interruption and cancellation (SPEC §12)', () => {
 describe('Retry limit (SPEC §12)', () => {
   it('evicts the oldest receipts and answers REQUEST_ID_EXPIRED without an effect', async () => {
     // The receipt registry holds 4 096 entries (SPEC §9), so the number "1"
-    // is only forgotten after 4 096 further acceptances. The cheapest
-    // accepted mutation is one notebook-metadata key, which also chains its
-    // own expected revision, so no read is needed between the calls.
+    // is only forgotten after 4 096 further acceptances. Repeatedly clearing
+    // already-empty outputs consumes receipts while preserving one observed
+    // cell state and therefore one stable cell_ref.
     const session = await openContext();
     const mcp = session.client;
     const created = await mcp.call('notebook_create', {
@@ -1145,35 +1164,30 @@ describe('Retry limit (SPEC §12)', () => {
       notebook_id: notebookId,
       request_id: session.counter.value,
       operations: [
-        { op: 'add_cell', cell_type: 'raw', source: 'receipt probe', position: 'end' }
+        { op: 'add_cell', cell_type: 'code', source: 'receipt probe', position: 'end' }
       ]
     };
     const first = await mcp.call('notebook_apply', firstPayload);
     session.counter.take(first);
-    const cellsAfterFirst = Number(
-      obj(obj(await mcp.call('notebook_read', { notebook_id: notebookId, view: 'summary' }))['summary'])[
-        'cell_count'
-      ]
-    );
-    let metadataRevision = str(obj(created['summary'])['notebook_metadata_revision']);
+    let receiptCellRef = str(list(first['results'])[0]?.['cell_ref']);
+    const afterFirst = await mcp.call('notebook_read', { notebook_id: notebookId, view: 'summary' });
+    const cellsAfterFirst = Number(obj(afterFirst['summary'])['cell_count']);
 
     // Fill the registry past its 4 096 receipts.
     const started = Date.now();
-    for (let index = 1; index <= 4_096; index += 1) {
+    for (let remaining = 4_096; remaining > 0; remaining -= 1) {
       const answer = await mcp.call('notebook_apply', {
         notebook_id: notebookId,
         request_id: session.counter.value,
         operations: [
           {
-            op: 'set_notebook_metadata',
-            expected_notebook_metadata_revision: metadataRevision,
-            key: 'acceptance_counter',
-            value: index
+            op: 'clear_outputs',
+            cell_ref: receiptCellRef
           }
         ]
       });
       session.counter.take(answer);
-      metadataRevision = str(list(answer['results'])[0]?.['notebook_metadata_revision']);
+      receiptCellRef = str(list(answer['results'])[0]?.['cell_ref']);
     }
     const elapsed = Date.now() - started;
     expect(Number(session.counter.value)).toBeGreaterThan(4_096);
@@ -1186,17 +1200,16 @@ describe('Retry limit (SPEC §12)', () => {
     expect(expired.side_effects).toBe('unknown');
     expect(expired.request_accepted).toBeNull();
     expect(expired.next_request_id).toBe(session.counter.value);
-    // Nothing ran again: no second cell, and the metadata still holds the
-    // last value rather than a replayed one.
+    // Nothing ran again: no second cell, and the stable observation still
+    // addresses the original probe cell.
     const read = await mcp.call('notebook_read', { notebook_id: notebookId, view: 'summary' });
     expect(Number(obj(read['summary'])['cell_count'])).toBe(cellsAfterFirst);
-    // The notebook metadata is part of the "cells" view.
-    const metadata = await mcp.call('notebook_read', {
+    const receiptCell = await mcp.call('notebook_read', {
       notebook_id: notebookId,
       view: 'cells',
-      limits: { max_cells: 1 }
+      cell_refs: [receiptCellRef]
     });
-    expect(obj(metadata['notebook_metadata'])['acceptance_counter']).toBe(4_096);
+    expect(str(list(receiptCell['cells'])[0]?.['source'])).toBe('receipt probe');
 
     // Two concurrent calls with one number produce a single effect. The
     // payload is an `add_cell` on purpose: it has no expected revision, so
@@ -1215,7 +1228,7 @@ describe('Retry limit (SPEC §12)', () => {
     session.counter.take(left);
     expect([left['replayed'], right['replayed']].filter((flag) => flag === true)).toHaveLength(1);
     expect(left['first_accepted_at']).toBe(right['first_accepted_at']);
-    expect(str(list(left['results'])[0]?.['cell_id'])).toBe(str(list(right['results'])[0]?.['cell_id']));
+    expect(str(list(left['results'])[0]?.['cell_ref'])).toBe(str(list(right['results'])[0]?.['cell_ref']));
     const afterConcurrent = await mcp.call('notebook_read', {
       notebook_id: notebookId,
       view: 'summary'

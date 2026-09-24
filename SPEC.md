@@ -144,14 +144,20 @@ All handles are opaque and belong to a specific service process. A supplied
 global "current notebook." Likewise, an `execution_id` addresses a specific
 execution. After a restart, old handles return `HANDLE_EXPIRED`. The agent
 explicitly reopens the document; unfinished code is not automatically retried.
-The MCP adapter may present notebook, durable cell, execution, output, and
-revision values as short typed references. Each reference expands only inside
-the connection that issued it, never in notebook payload data, and is never
-reused after close or restart. Its token carries a process epoch and connection
-generation, so an old token cannot select a new object. Full opaque values
-remain accepted for compatible callers and remain the values used for identity
-and revision comparisons. A cell or revision without an enclosing notebook
-handle remains a full value rather than receiving a portable short reference.
+The MCP adapter presents each observed cell version as one immutable `cell_ref`
+and each observed notebook-metadata version as one immutable `notebook_ref`.
+They expand only inside the connection that issued them, never in notebook
+payload data, and are never reused after close or restart. A token carries a
+process epoch and connection generation, is scoped to the full notebook handle,
+and cannot be rebound to a replacement object with the same durable ID. The
+table is bounded to 4,096 cell and notebook observations per connection,
+non-evicting, and immutable: exhaustion is `RESOURCE_LIMIT`, not retargeting.
+Issuance is transactional with response publication. Response bounding commits
+only refs present in the final structured payload; rows removed by paging consume
+no capacity, while visible tokens keep their assigned values. A response that
+cannot be published consumes none of its new refs. Notebook, execution, and
+output handles remain opaque public values; the stored full cell identity and
+operation-specific revisions remain internal comparison inputs.
 `@` and `raw:` begin reserved reference syntax; a valid custom identifier
 beginning with either prefix is passed as the single-level escape
 `raw:<base64url(UTF-8)>`. The decoded literal must itself begin with `@` or
@@ -453,20 +459,23 @@ persistence of a particular revision.
 
 ## 7. Cells and concurrent edits
 
-A cell is primarily addressed by its persistent `cell_id`. Its index is
-returned for display and list construction, but is not used as a durable edit
-or execution reference. A document ID is likewise not its path.
+A cell has a persistent internal `cell_id`, but the public MCP mutation and
+execution interface addresses the version an agent actually observed. Every
+cell row of `notebook_read` returns one `cell_ref`, plus its current index, type,
+execution state and requested content. Every read view also returns one
+top-level `notebook_ref` for notebook metadata. Public results do not expose the
+cell identity token or its source/cell/outputs revision tuple.
 
-For each cell, `notebook_read` returns its ID, current index, type,
-`source_revision`, `cell_revision`, `outputs_revision`, execution count, and a
-short preview. Source, metadata, attachments, and outputs are read explicitly
-and with limits. `source_revision` is an opaque digest of the exact source and
-cell type; output changes do not alter it. `cell_revision` covers the entire
-cell, while `outputs_revision` covers only outputs. The hash format is stable
-within an API version; a short display hash is not used for stale-edit
-protection. Shared `execution_state` and `notebook_metadata_revision` are also
-returned. The latter covers notebook metadata, excluding internal state and
-awareness.
+Internally, a `cell_ref` stores the notebook handle, durable ID, immutable Y.Map
+identity, source revision, full-cell revision, and outputs revision captured in
+one synchronous observation. Source edits/runs use its source guard; delete and
+cell-metadata operations use its full-cell guard; clear-output uses its output
+guard. A `notebook_ref` stores the notebook handle and metadata revision. Source
+revision covers exact source plus cell type, full-cell revision covers the
+entire cell, outputs revision covers only outputs, and notebook metadata
+revision excludes internal state and awareness. These distinct scopes remain
+observable through conflict behavior without requiring the agent to select a
+hash.
 
 A cells read that cuts source text returns a source cursor. Continuing it must
 serve the remaining UTF-8 bytes of that same cell before any later cell. The
@@ -475,22 +484,26 @@ binding, and byte offset; a source edit, replacement, reorder, add, or delete
 expires it with `CURSOR_EXPIRED`. A response never issues a source cursor that
 cannot advance because the next UTF-8 code point exceeds its byte budget.
 
-Source replacement requires `expected_source_revision`. Full replacement is
+Source replacement requires `cell_ref`. Full replacement is
 applied as minimal changes to the existing Y.Text, preserving the cell object.
 Exact substring replacement requires exactly one match, otherwise
-`MATCH_NOT_UNIQUE`/`MATCH_NOT_FOUND`. Deletion requires
-`expected_cell_revision`; clearing outputs requires `expected_outputs_revision`.
-On mismatch, return `REVISION_CONFLICT` with the current revision and a bounded
-preview, without changing anything.
+`MATCH_NOT_UNIQUE`/`MATCH_NOT_FOUND`. Delete, clear-output, and cell metadata
+operations also accept only `cell_ref`; notebook metadata operations accept
+`notebook_ref`. The adapter expands the saved immutable precondition before
+request receipt comparison. On mismatch, `REVISION_CONFLICT` returns a fresh
+`current_cell_ref` or `current_notebook_ref` when the same object remains live,
+plus a bounded preview, without changing anything.
 
 Metadata changes use keyed `set_cell_metadata`/`delete_cell_metadata` with
-`expected_cell_revision`, or `set_notebook_metadata`/
-`delete_notebook_metadata` with `expected_notebook_metadata_revision`.
+`cell_ref`, or `set_notebook_metadata`/`delete_notebook_metadata` with
+`notebook_ref`.
 Untouched keys are preserved; cell type and attachments are currently only
 read and preserved. Cell creation may select code/markdown/raw.
 
-Insertion uses exactly one of `before_cell_id`, `after_cell_id`, or
+Insertion uses exactly one of `before_cell_ref`, `after_cell_ref`, or
 `position: "end"`. A missing anchor returns `CELL_NOT_FOUND` without insertion.
+A surviving anchor is guarded only by object identity, so a content edit does
+not invalidate insertion relative to it; deletion or Y.Map replacement does.
 A duplicate ID yields `CELL_ID_AMBIGUOUS` for an operation that addresses it or
 uses it as an anchor; the first object must not be selected silently and IDs
 must not be rewritten. Summary exposes duplicates and current indices for
@@ -513,6 +526,14 @@ transaction with rollback. All expected errors must be detected before the
 first mutation. If an unexpected error occurs after writing begins, the response
 explicitly reports a possible partial result and requires rereading affected
 cells.
+
+An observed ref never advances implicitly within a batch. Reusing one ref after
+an earlier operation in that batch changed its guarded scope conflicts, while
+legacy internal library callers that supply explicit revisions retain their
+existing batch semantics. A successful apply result returns refs for the final
+state of every surviving target; delete returns no usable cell ref. Replaying
+the exact accepted payload returns its stored result semantics after later
+edits, deletion, or replacement. A fresh request checks the current live object.
 
 Revision checks protect against changes already visible to the local client.
 They are not distributed compare-and-swap: a remote edit not yet received may
@@ -563,13 +584,14 @@ or send both requests. An incompatible execution configuration returns
 
 ### Executions
 
-`notebook_execute` accepts a nonempty ordered list of
-`{cell_id, expected_source_revision}` and returns an `execution_id`. The
+`notebook_execute` accepts a nonempty ordered list of `{cell_ref}` and returns
+an `execution_id`. The
 all/to/from operations construct this list from a `notebook_read` snapshot; a
 cell inserted later is not automatically included. The list contains code
 cells; an explicit target of another type returns `INVALID_ARGUMENT` before the
-execution is accepted. Immediately before each cell is sent, its existence and
-revision are checked again; a mismatch stops the queue before that cell runs.
+execution is accepted. Immediately before each cell is sent, its saved object
+identity and source revision are checked again; a mismatch stops the queue
+before that cell runs.
 The kernel request contains the validated source snapshot and supported
 `cellId` metadata.
 
@@ -617,6 +639,14 @@ late output may still arrive and can be retrieved in a subsequent read.
 without its wait condition being met; every earlier answer, including such an
 immediate one, reports false. A long computation does not block reads, RTC updates, or
 kernel control.
+
+Each execution cell carries a `cell_ref` only while the exact object accepted
+for the job still exists. That ref describes the cell's current live state at
+the time of the execution view, not the source snapshot sent to the kernel.
+Deletion or replacement sets `cell_ref_unavailable`; the execution record and
+outputs remain available. `execution_cancel` similarly returns live
+`cancelled_cell_refs` and `already_sent_cell_refs` plus counts for accepted
+objects that are no longer available.
 
 Cell completion requires the matching `execute_reply` and IOPub `idle`, in
 either arrival order. The output handler must support `stream`,
@@ -708,12 +738,12 @@ read results and changes.
 | `notebook_create` | `server_id?`, `directory`, `name?`, `request_id` | Untitled → optional rename → open; actual path, fileId, notebook_id, changes_cursor |
 | `notebook_open` | `server_id?`, `path` | Reusable handle, lifetime, status, summary, and `changes_cursor` |
 | `notebook_close` | `notebook_id` | Release the replica |
-| `notebook_read` | `notebook_id`, `view`, `cell_ids?`, `cursor?`, `limits?` | Summary, source/metadata/attachments or outputs, revisions, page cursor, `changes_cursor` |
-| `notebook_apply` | `notebook_id`, `request_id`, `operations[]` | Added IDs, new revisions, delivery state |
+| `notebook_read` | `notebook_id`, `view`, `cell_refs?`, `cursor?`, `limits?` | Summary, source/metadata/attachments or outputs, refreshed refs, page cursor, `changes_cursor` |
+| `notebook_apply` | `notebook_id`, `request_id`, `operations[]` | Final refs for surviving targets and delivery state |
 | `notebook_execute` | `notebook_id`, `request_id`, `cells[]`, `wait_ms?` | `execution_id`, state, initial results |
-| `execution_get` | `execution_id`, `cursor?`, `wait_ms?`, `limits?` | State, new outputs, and content references |
+| `execution_get` | `execution_id`, `cursor?`, `wait_ms?`, `limits?` | State, new outputs, and current-live same-object cell refs |
 | `output_read` | `output_id`, `cursor?`, `limits?` | Chunks of a specific output snapshot, MIME/size, next cursor |
-| `execution_cancel` | `execution_id` | Cancel remaining unsent cells; owning `notebook_id` and affected cells |
+| `execution_cancel` | `execution_id` | Cancel remaining unsent cells; owning `notebook_id`, available refs, and unavailable counts |
 | `notebook_changes` | `notebook_id`, `cursor`, `wait_ms?`, `limit?` | Changes after the cursor or `CURSOR_EXPIRED` |
 | `notebook_save` | `notebook_id` | Server save acknowledgement or uncertainty |
 | `kernel_list` | `server_id?` | Kernelspecs and running kernels, without executing code |
@@ -810,8 +840,7 @@ Example edit arguments and the subsequent execution call:
   "request_id": "17",
   "operations": [{
     "op": "replace_text",
-    "cell_id": "cell_B",
-    "expected_source_revision": "rev_before",
+    "cell_ref": "@observed_cell_before",
     "old_text": "df.head()",
     "new_text": "df.head(20)"
   }]
@@ -822,13 +851,13 @@ Example edit arguments and the subsequent execution call:
 {
   "notebook_id": "nb_A",
   "request_id": "18",
-  "cells": [{"cell_id": "cell_B", "expected_source_revision": "rev_after"}],
+  "cells": [{"cell_ref": "@observed_cell_after"}],
   "wait_ms": 1000
 }
 ```
 
 Here, `17` is the previously returned `next_request_id`; `18` is returned after
-accepting the edit. `rev_after` comes from the edit response. If execution does
+accepting the edit. `@observed_cell_after` comes from the edit response. If execution does
 not occur, the agent reports that separately; a successful edit is not rolled
 back.
 
@@ -897,7 +926,8 @@ live handle within its automatic context.
 
 Tool errors return `isError: true` and structured `code`, `message`,
 `retryable`, and `side_effects: none|applied|unknown`; when applicable, also
-`execution_id`, `execution_ids`, and the current revision. Sanitized recovery
+`execution_id`, `execution_ids`, `current_cell_ref`, and
+`current_notebook_ref`. Sanitized recovery
 details are present in the text content as well as the structured error metadata.
 The SDK handles malformed JSON-RPC. A Python error is a specific execution
 result with state `failed`; MCP transport may remain healthy.
@@ -940,6 +970,13 @@ under a new ID.
 Python error, `aborted`, `interrupted`, and execution `unknown` are execution
 states with reasons, not JSON-RPC errors. `save_status: skipped` is returned as
 a distinct unconfirmed outcome, not disguised as success.
+
+If an accepted effect succeeds but its response needs more observed refs than
+the connection can retain, the tool returns `RESOURCE_LIMIT` with
+`side_effects: applied`. It preserves `request_accepted`, `next_request_id`,
+`replayed`, `first_accepted_at`, and `execution_id` when applicable. The
+receipt remains authoritative: replay returns the same acceptance semantics
+without repeating the effect, even after the target was deleted or replaced.
 
 Summary and source are limited by cell count and bytes. Large outputs are
 paged; responses always state `truncated`, available MIME types, sizes, and how
@@ -988,7 +1025,7 @@ response, up to 30 seconds of waiting per tool call, 10,000 notebook-log events,
 32 open replicas, and 64 server bindings per context. These design values make
 no claim about measured limits. Input request and compact receipt sizes are also
 bounded and checked before effects; outputs are not copied into the replay registry.
-Replicas, output buffers, and the deduplication registry have separate memory
+Replicas, output buffers, observed refs, and the deduplication registry have separate memory
 budgets. On exhaustion, new operations/handles fail with `RESOURCE_LIMIT`;
 active executions are not evicted, and completed receipts are released only
 while retaining the no-reuse rule encoded by `H`. An oversized document returns
@@ -1043,14 +1080,15 @@ the assistant's name/color and disappears on disconnect; it is not proof of
 authorship or a lock.
 
 Background replica updates do not mean the LLM has seen a change. The skill
-must require reading changes/revisions before dependent edits. MCP notifications
+must require reading changes and refreshing observed refs before dependent edits. MCP notifications
 and resource subscriptions are optional enhancements for supporting hosts; they
 do not replace explicit agent reads.
 
 The new skill must be substantially shorter than the old CLI catalog and cover:
 
 1. Selecting a server and opening a notebook in the implicit context.
-2. Reading the summary and required cells; using IDs and revisions.
+2. Reading the summary and required cells; using `cell_ref` and `notebook_ref`
+   observations and rereading after changes.
 3. Editing and visible notebook execution; obtaining the execution and result.
    Mutations with `request_id` are sequential per connection context, with every
    number taken from the latest response. After compaction or losing the
@@ -1130,6 +1168,7 @@ browser test. Checking only a local `Y.Doc` or tool-response text is insufficien
 | Separate conversations | Two session IDs in one stdio process do not mix handles, cursors, or execution results |
 | Bidirectional RTC | A second client sees add/edit/delete/metadata/outputs without reload; MCP sees user changes |
 | Concurrent edits | A known stale revision changes nothing; concurrent edits converge without promising distributed CAS |
+| Observed refs | Read → `cell_ref` → apply/execute uses the captured guard scope; same-object reread refreshes it, replacement/deletion/close rejects it, exact accepted replay preserves its receipt, and bounded issuance is all-or-nothing |
 | Identity and ranges | Browser insertion/reorder does not redirect planned execution to another cell; deleting the target stops the queue |
 | Outputs | stdout/stderr, traceback exactly once, MIME metadata, PNG, `clear_output(wait)`, and update display match for an independent observer |
 | Execution completion | Both reply/idle orders, aborted, Python error, late output, and edit/delete/rerun during execution |

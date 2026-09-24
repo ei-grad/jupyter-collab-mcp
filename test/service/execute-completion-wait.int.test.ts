@@ -197,7 +197,7 @@ it('cancels unsent cells without interrupting the cell whose completion is await
   await marker(executionId, 'cancel-ready');
   const cancelled = await service.executionCancel({ executionId });
   expect(cancelled.kernelInterrupted).toBe(false);
-  expect(cancelled.cancelledCellIds).toEqual([request.cells[1]!.cellId]);
+  expect(cancelled.cancelledCells.map((cell) => cell.cellId)).toEqual([request.cells[1]!.cellId]);
   expect(answered).toBe(false);
   const result = await waiting;
   expect(result.state).toBe('cancelled');

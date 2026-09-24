@@ -70,7 +70,7 @@ try {
   });
   const job = await call(first, 'notebook_execute', {
     notebook_id: notebookId, request_id: kernel['next_request_id'], wait_ms: 0,
-    cells: [{ cell_id: cell['cell_id'], expected_source_revision: cell['source_revision'] }]
+    cells: [{ cell_ref: cell['cell_ref'] }]
   });
   assert.equal(job['state'], 'running');
   const held = await registry.acquire(first);
@@ -113,7 +113,7 @@ try {
   const checkCell = (check['results'] as Result[])[0]!;
   const checked = await call(renewed, 'notebook_execute', {
     notebook_id: notebookId, request_id: check['next_request_id'], wait_ms: 0,
-    cells: [{ cell_id: checkCell['cell_id'], expected_source_revision: checkCell['source_revision'] }]
+    cells: [{ cell_ref: checkCell['cell_ref'] }]
   });
   let complete: Result = checked;
   const finishedBy = Date.now() + 35_000;

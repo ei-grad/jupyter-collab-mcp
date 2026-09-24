@@ -142,6 +142,7 @@ export function summaryRow(
   const state = executionStateOf(cell);
   return {
     cellId: entry.cellId,
+    identityToken: entry.identityToken,
     index: entry.index,
     cellType: type,
     sourceRevision: sourceRevision(type, source),
@@ -306,6 +307,7 @@ export function readCells(
     const state = executionStateOf(cell);
     cells.push({
       cellId: entry.cellId,
+      identityToken: entry.identityToken,
       index: entry.index,
       cellType: type,
       source: cut.text,
@@ -418,8 +420,11 @@ export function readOutputs(
     const state = executionStateOf(cell);
     cells.push({
       cellId: entry.cellId,
+      identityToken: entry.identityToken,
       index: entry.index,
       cellType: cellTypeOf(cell),
+      sourceRevision: sourceRevision(cellTypeOf(cell), cell.getSource()),
+      cellRevision: cellRevision(cellJson(cell)),
       outputsRevision: code ? outputsRevision(outputs) : null,
       outputs: reads,
       executionCount: code ? cell.execution_count : null,

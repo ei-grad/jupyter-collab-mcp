@@ -68,6 +68,7 @@ export type {
   CellRunState,
   CellSummary,
   CellType,
+  CellObservation,
   ChangeEvent,
   ChangeKind,
   ChangeRevisions,

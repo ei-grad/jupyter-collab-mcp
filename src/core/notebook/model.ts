@@ -30,6 +30,7 @@ import type { CoreError } from '../errors.js';
 import type { StructureRevision } from '../revision.js';
 import { cellRevision, outputsRevision, sourceRevision } from '../revision.js';
 import type {
+  CellObservation,
   ChangeEvent,
   ChangesCursor,
   ConnectionState,
@@ -183,6 +184,26 @@ export class NotebookModel {
     this.#assertLive();
     const entry = this.index.requireSame(ref);
     return { cellId: entry.cellId, index: entry.index, identityToken: entry.identityToken };
+  }
+
+  /** Capture identity and every operation guard from one live cell object. */
+  observeCell(ref: { readonly cellId: string; readonly identityToken?: string }): CellObservation {
+    this.#assertLive();
+    const entry = this.index.require(ref.cellId);
+    if (ref.identityToken !== undefined && entry.identityToken !== ref.identityToken) {
+      throw coreError('CELL_REPLACED', `cell ${JSON.stringify(ref.cellId)} was replaced`, {
+        details: { cell_id: ref.cellId }
+      });
+    }
+    const cell = resolveCell(this.notebook, entry);
+    const type = cellTypeOf(cell);
+    return {
+      cellId: entry.cellId,
+      identityToken: entry.identityToken,
+      sourceRevision: sourceRevision(type, cell.getSource()),
+      cellRevision: cellRevision(cellJson(cell)),
+      outputsRevision: isCodeCell(cell) ? outputsRevision(outputsOf(cell)) : null
+    };
   }
 
   /** Ids that currently address more than one cell (SPEC.md §7). */
@@ -387,17 +408,18 @@ export class NotebookModel {
       return { op, notebookMetadataRevision: metadataRevisionOf(this.notebook) };
     }
     if (cellId === null) return { op };
-    if (op === 'delete_cell' || !this.index.isUnique(cellId)) return { op, cellId };
+    if (op === 'delete_cell' || !this.index.isUnique(cellId)) return { op };
     const entry = this.index.require(cellId);
     const cell = resolveCell(this.notebook, entry);
     const type = cellTypeOf(cell);
     return {
       op,
       cellId,
+      identityToken: entry.identityToken,
       index: entry.index,
       sourceRevision: sourceRevision(type, cell.getSource()),
       cellRevision: cellRevision(cellJson(cell)),
-      ...(isCodeCell(cell) ? { outputsRevision: outputsRevision(outputsOf(cell)) } : {})
+      outputsRevision: isCodeCell(cell) ? outputsRevision(outputsOf(cell)) : null
     };
   }
 

@@ -77,6 +77,7 @@ const brand = <T>(value: string): T => value as unknown as T;
 const SRC: SourceRevision = brand('s1_aaaaaaaaaaaaaaaa');
 const CELL: CellRevision = brand('c1_bbbbbbbbbbbbbbbb');
 const OUT: OutputsRevision = brand('o1_cccccccccccccccc');
+const OUT_AFTER_EXECUTION: OutputsRevision = brand('o1_ffffffffffffffff');
 const NBMETA: NotebookMetadataRevision = brand('m1_dddddddddddddddd');
 const STRUCT: StructureRevision = brand('x1_eeeeeeeeeeeeeeee');
 const CURSOR: ChangesCursor = brand('chg_7');
@@ -124,6 +125,7 @@ const SUMMARY: NotebookSummary = {
   cells: [
     {
       cellId: 'cell_a',
+      identityToken: 'identity-cell-a',
       index: 0,
       cellType: 'code',
       sourceRevision: SRC,
@@ -135,6 +137,7 @@ const SUMMARY: NotebookSummary = {
     },
     {
       cellId: 'cell_b',
+      identityToken: 'identity-cell-b',
       index: 1,
       cellType: 'markdown',
       sourceRevision: SRC,
@@ -165,11 +168,20 @@ export interface FakeOptions {
   readonly bigImage?: boolean;
   /** Emit this many summary cells, to exercise the response budget. */
   readonly bulkCells?: number;
+  /** Mutable opaque preview used to verify reference-shaped user text. */
+  readonly refLikePreview?: { value: string };
   readonly oversizedMetadata?: boolean;
+  readonly oversizedMetadataSwitch?: { value: boolean };
   /** Put output-shaped user values in metadata and attachments. */
   readonly outputShapedOpaqueData?: boolean;
   /** Return a completed execution whose kernel result is failed. */
   readonly executionFailed?: boolean;
+  /** Return an execution cell whose original Y.Map no longer exists. */
+  readonly executionCellUnavailable?: boolean;
+  /** Return a live execution observation that needs a newly issued ref. */
+  readonly executionObservationChanged?: boolean;
+  /** Return cancellation counts for accepted cells whose Y.Map no longer exists. */
+  readonly cancelCellsUnavailable?: boolean;
   /** Make `readOutputResource` answer "too large for one read". */
   readonly resourceTooLarge?: boolean;
   /** Number of resource descriptors exposed through paginated listing. */
@@ -309,13 +321,16 @@ export class FakeCollabService implements CollabService {
       pageCursor: PAGE,
       cells: Array.from({ length: bulk }, (_unused, index) => ({
         cellId: `cell_${String(index)}`,
+        identityToken: `identity-cell-${String(index)}`,
         index,
         cellType: 'code' as const,
         sourceRevision: SRC,
         cellRevision: CELL,
         outputsRevision: OUT,
         executionCount: null,
-        preview: `# a fairly long preview line number ${String(index)} ${'x'.repeat(200)}`
+        preview: index === 0 && this.options.refLikePreview?.value !== undefined
+          ? this.options.refLikePreview.value
+          : `# a fairly long preview line number ${String(index)} ${'x'.repeat(200)}`
       }))
     };
   }
@@ -351,6 +366,14 @@ export class FakeCollabService implements CollabService {
         ...(summary.pageCursor === undefined ? {} : { nextCursor: summary.pageCursor })
       };
     } else if (request.view === 'cells') {
+      const cursorOffset = request.cursor === undefined
+        ? undefined
+        : Number(String(request.cursor).slice(String(request.cursor).lastIndexOf('.') + 1));
+      const selected = request.observedCells?.[0];
+      const selectedCellId = selected?.cellId ??
+        (this.options.bulkCells !== undefined && cursorOffset !== undefined ? `cell_${String(cursorOffset)}` : 'cell_a');
+      const selectedIdentity = selected?.identityToken ??
+        (this.options.bulkCells !== undefined && cursorOffset !== undefined ? `identity-cell-${String(cursorOffset)}` : 'identity-cell-a');
       const outputShapedValue = {
         output_type: 'display_data',
         index: 91,
@@ -361,14 +384,15 @@ export class FakeCollabService implements CollabService {
         view: 'cells',
         cells: [
           {
-            cellId: 'cell_a',
+            cellId: selectedCellId,
+            identityToken: selectedIdentity,
             index: 0,
             cellType: 'code',
-            source: 'df.head()',
+            source: selectedCellId === 'cell_a' ? 'df.head()' : `source for ${selectedCellId}`,
             sourceTruncated: false,
             sourceBytes: 9,
             metadata:
-              this.options.oversizedMetadata === true
+              this.options.oversizedMetadata === true || this.options.oversizedMetadataSwitch?.value === true
                 ? { payload: 'x'.repeat(100_000) }
                 : this.options.outputShapedOpaqueData === true
                   ? { 'user/Weird Key': outputShapedValue, value: ['kept', { exactlyAsGiven: true }] }
@@ -393,14 +417,18 @@ export class FakeCollabService implements CollabService {
         cells: [
           {
             cellId: 'cell_a',
+            identityToken: 'identity-cell-a',
             index: 0,
             cellType: 'code',
+            sourceRevision: SRC,
+            cellRevision: CELL,
             outputsRevision: OUT,
             outputs: this.outputs(),
             executionCount: 3,
             truncated: false
           }
         ],
+        notebookMetadataRevision: NBMETA,
         truncated: false
       };
     }
@@ -444,9 +472,11 @@ export class FakeCollabService implements CollabService {
       results: request.operations.map((operation) => ({
         op: operation.op,
         cellId: 'cell_a',
+        identityToken: 'identity-cell-a',
         index: 0,
         sourceRevision: SRC,
-        cellRevision: CELL
+        cellRevision: CELL,
+        outputsRevision: OUT
       })),
       appliedLocally: true,
       delivery: 'sent' as const,
@@ -474,6 +504,17 @@ export class FakeCollabService implements CollabService {
           cellId: 'cell_a',
           state: failed ? 'failed' : 'succeeded',
           sourceRevision: SRC,
+          ...(this.options.executionCellUnavailable === true
+            ? {}
+            : {
+                currentObservation: {
+                  cellId: 'cell_a',
+                  identityToken: 'identity-cell-a',
+                  sourceRevision: SRC,
+                  cellRevision: CELL,
+                  outputsRevision: this.options.executionObservationChanged === true ? OUT_AFTER_EXECUTION : OUT
+                }
+              }),
           msgId: 'msg_1',
           executionCount: 4,
           sourceChanged: false,
@@ -511,12 +552,19 @@ export class FakeCollabService implements CollabService {
   }
 
   async executionCancel(request: ExecutionCancelRequest): Promise<WithEnvelope<ExecutionCancelResult>> {
+    const unavailable = this.options.cancelCellsUnavailable === true;
     return this.record('executionCancel', request, {
       executionId: request.executionId,
       notebookId: 'nb_1',
       state: 'cancelled' as const,
-      cancelledCellIds: ['cell_b'],
-      alreadySentCellIds: ['cell_a'],
+      cancelledCells: unavailable ? [] : [{
+        cellId: 'cell_b', identityToken: 'identity-cell-b', sourceRevision: SRC, cellRevision: CELL, outputsRevision: null
+      }],
+      unavailableCancelledCells: unavailable ? 1 : 0,
+      alreadySentCells: unavailable ? [] : [{
+        cellId: 'cell_a', identityToken: 'identity-cell-a', sourceRevision: SRC, cellRevision: CELL, outputsRevision: OUT
+      }],
+      unavailableAlreadySentCells: unavailable ? 1 : 0,
       kernelInterrupted: false,
       ...envelope
     });

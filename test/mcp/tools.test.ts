@@ -24,25 +24,6 @@ const VALID_ARGS: Record<string, Record<string, unknown>> = {
   notebook_open: { server_id: 'default', path: 'work/analysis.ipynb' },
   notebook_close: { notebook_id: 'nb_1' },
   notebook_read: { notebook_id: 'nb_1', view: 'summary' },
-  notebook_apply: {
-    notebook_id: 'nb_1',
-    request_id: '2',
-    operations: [
-      {
-        op: 'replace_text',
-        cell_id: 'cell_a',
-        expected_source_revision: 's1_aaaaaaaaaaaaaaaa',
-        old_text: 'df.head()',
-        new_text: 'df.head(20)'
-      }
-    ]
-  },
-  notebook_execute: {
-    notebook_id: 'nb_1',
-    request_id: '3',
-    cells: [{ cell_id: 'cell_a', expected_source_revision: 's1_aaaaaaaaaaaaaaaa' }],
-    wait_ms: 1000
-  },
   execution_get: { execution_id: 'exe_1' },
   output_read: { output_id: 'out_1' },
   execution_cancel: { execution_id: 'exe_1' },
@@ -52,6 +33,26 @@ const VALID_ARGS: Record<string, Record<string, unknown>> = {
   kernel_status: { notebook_id: 'nb_1' },
   kernel_control: { notebook_id: 'nb_1', request_id: '4', action: 'start', expected_kernel_id: null }
 };
+
+async function argsFor(name: string, connection: Harness): Promise<Record<string, unknown>> {
+  if (name !== 'notebook_apply' && name !== 'notebook_execute') return VALID_ARGS[name]!;
+  const { notebookId, cellRef } = await openRefs(connection);
+  return name === 'notebook_apply'
+    ? {
+        notebook_id: notebookId,
+        request_id: '2',
+        operations: [{ op: 'replace_text', cell_ref: cellRef, old_text: 'df.head()', new_text: 'df.head(20)' }]
+      }
+    : { notebook_id: notebookId, request_id: '3', cells: [{ cell_ref: cellRef }], wait_ms: 1000 };
+}
+
+async function openRefs(connection: Harness): Promise<{ notebookId: string; cellRef: string }> {
+  const opened = await connection.call('notebook_open', VALID_ARGS['notebook_open']);
+  return {
+    notebookId: String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']),
+    cellRef: String((((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!)['cell_ref'])
+  };
+}
 
 describe('tools/list', () => {
   it('publishes all 18 SPEC §9 tools with an input and an output schema', async () => {
@@ -86,16 +87,63 @@ describe('tools/list', () => {
     }
   });
 
+  it('publishes observed refs without public cell ids or revision guards', async () => {
+    harness = await connect();
+    const tools = (await harness.client.listTools()).tools;
+    for (const name of ['notebook_read', 'notebook_apply', 'notebook_execute']) {
+      const tool = tools.find((entry) => entry.name === name)!;
+      const schema = JSON.stringify({ input: tool.inputSchema, output: tool.outputSchema });
+      expect(schema, name).toContain('cell_ref');
+      expect(schema, name).not.toMatch(/"cell_id"|expected_(?:source|cell|outputs|notebook_metadata)_revision/u);
+    }
+    expect(JSON.stringify(tools.find((entry) => entry.name === 'notebook_read')?.inputSchema)).toContain('cell_refs');
+    expect(JSON.stringify(tools.find((entry) => entry.name === 'notebook_apply')?.inputSchema)).toContain('notebook_ref');
+    expect(JSON.stringify(tools.find((entry) => entry.name === 'kernel_control')?.inputSchema)).toContain('expected_kernel_id');
+  });
+
   it('returns a failed kernel execution as a successful tool result', async () => {
     harness = await connect({ fake: { executionFailed: true } });
     for (const name of ['notebook_execute', 'execution_get']) {
-      const answer = await harness.call(name, VALID_ARGS[name]);
+      const answer = await harness.call(name, await argsFor(name, harness));
       expect(answer.isError ?? false, name).toBe(false);
       expect(answer.structuredContent?.['state'], name).toBe('failed');
       expect(answer.structuredContent?.['reason'], name).toBe('ValueError: boom');
       const cells = answer.structuredContent?.['cells'] as Array<Record<string, unknown>>;
       expect(cells[0]?.['state'], name).toBe('failed');
+      expect(cells[0]?.['cell_ref']).toMatch(/^@/u);
+      expect(cells[0]).not.toHaveProperty('cell_id');
+      expect(cells[0]).not.toHaveProperty('source_revision');
     }
+  });
+
+  it('does not mint a cell ref when the executed object was deleted or replaced', async () => {
+    harness = await connect({ fake: { executionCellUnavailable: true } });
+    const answer = await harness.call('execution_get', { execution_id: 'exe_1' });
+    expect(answer.isError ?? false).toBe(false);
+    const cell = (answer.structuredContent?.['cells'] as Array<Record<string, unknown>>)[0]!;
+    expect(cell).not.toHaveProperty('cell_ref');
+    expect(cell).not.toHaveProperty('cell_id');
+    expect(cell).not.toHaveProperty('source_revision');
+    expect(cell['cell_ref_unavailable']).toBe(true);
+  });
+
+  it('retains accepted execution recovery when a new cell ref cannot be issued', async () => {
+    harness = await connect({
+      fake: { executionObservationChanged: true },
+      server: { observedRefMaxEntries: 3 }
+    });
+    const args = await argsFor('notebook_execute', harness);
+    const answer = await harness.call('notebook_execute', args);
+    expect(answer.isError).toBe(true);
+    expect(metaError(answer)).toMatchObject({
+      code: 'RESOURCE_LIMIT',
+      side_effects: 'applied',
+      execution_id: expect.stringMatching(/^@/u),
+      next_request_id: '4',
+      request_accepted: true,
+      replayed: false,
+      first_accepted_at: '2026-09-06T10:03:00Z'
+    });
   });
 });
 
@@ -103,7 +151,7 @@ describe('every tool round-trips', () => {
   for (const spec of TOOL_SPECS) {
     it(`${spec.name} answers with structuredContent and text`, async () => {
       harness = await connect();
-      const answer = await harness.call(spec.name, VALID_ARGS[spec.name]);
+      const answer = await harness.call(spec.name, await argsFor(spec.name, harness));
       expect(answer.isError ?? false, JSON.stringify(answer.content)).toBe(false);
       expect(answer.structuredContent).toBeDefined();
       const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
@@ -114,25 +162,45 @@ describe('every tool round-trips', () => {
 
   it('renames snake_case arguments to the camelCase of CollabService', async () => {
     harness = await connect();
-    await harness.call('notebook_execute', VALID_ARGS['notebook_execute']);
+    await harness.call('notebook_execute', await argsFor('notebook_execute', harness));
     expect(harness.fake.lastRequest('notebookExecute')).toEqual({
       notebookId: 'nb_1',
       requestId: '3',
-      cells: [{ cellId: 'cell_a', expectedSourceRevision: 's1_aaaaaaaaaaaaaaaa' }],
+      cells: [{
+        cellId: 'cell_a',
+        expectedSourceRevision: 's1_aaaaaaaaaaaaaaaa',
+        expectedIdentityToken: 'identity-cell-a'
+      }],
       waitMs: 1000
     });
   });
 
+  it('returns an immediately reusable final ref from notebook_apply', async () => {
+    harness = await connect();
+    const args = await argsFor('notebook_apply', harness);
+    const applied = await harness.call('notebook_apply', args);
+    const cellRef = String((applied.structuredContent?.['results'] as Record<string, unknown>[])[0]!['cell_ref']);
+    expect(cellRef).toMatch(/^@/u);
+    expect((applied.structuredContent?.['results'] as Record<string, unknown>[])[0]).not.toHaveProperty('cell_id');
+    const read = await harness.call('notebook_read', {
+      notebook_id: args['notebook_id'],
+      view: 'cells',
+      cell_refs: [cellRef]
+    });
+    expect(read.isError).not.toBe(true);
+  });
+
   it('keeps user-chosen metadata keys verbatim in both directions', async () => {
     harness = await connect();
+    const applyArgs = await argsFor('notebook_apply', harness);
+    const cellRef = String(((applyArgs['operations'] as Record<string, unknown>[])[0]!)['cell_ref']);
     await harness.call('notebook_apply', {
-      notebook_id: 'nb_1',
+      notebook_id: applyArgs['notebook_id'],
       request_id: '2',
       operations: [
         {
           op: 'set_cell_metadata',
-          cell_id: 'cell_a',
-          expected_cell_revision: 'c1_bbbbbbbbbbbbbbbb',
+          cell_ref: cellRef,
           key: 'user/Weird Key',
           value: { deepKey: [1, 2] }
         }
@@ -159,13 +227,54 @@ describe('every tool round-trips', () => {
     const read = await harness.call('notebook_read', VALID_ARGS['notebook_read']);
     expect(read.structuredContent?.['next_request_id']).toBe('5');
     expect(read.structuredContent?.['request_accepted']).toBeUndefined();
+    expect(read.structuredContent?.['notebook_ref']).toMatch(/^@/u);
   });
 });
 
 describe('text rendering', () => {
+  it('keeps exact structured notebook refs usable in text-only create, open and read answers', async () => {
+    harness = await connect({ server: { responseMaxBytes: 8192 } });
+    const created = await harness.call('notebook_create', VALID_ARGS['notebook_create']);
+    const opened = await harness.call('notebook_open', VALID_ARGS['notebook_open']);
+    const read = await harness.call('notebook_read', VALID_ARGS['notebook_read']);
+    const cases = [
+      {
+        answer: created,
+        notebookRef: String((created.structuredContent?.['summary'] as Record<string, unknown>)['notebook_ref'])
+      },
+      {
+        answer: opened,
+        notebookRef: String((opened.structuredContent?.['summary'] as Record<string, unknown>)['notebook_ref'])
+      },
+      { answer: read, notebookRef: String(read.structuredContent?.['notebook_ref']) }
+    ];
+    for (const { answer, notebookRef } of cases) {
+      expect(notebookRef).toMatch(/^@/u);
+      const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+      expect(text).toContain(`notebook_ref=${notebookRef}`);
+      expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(8192);
+    }
+  });
+
+  it('enumerates exact cancellation refs and unavailable counts in bounded text', async () => {
+    harness = await connect({ server: { responseMaxBytes: 2048 } });
+    const answer = await harness.call('execution_cancel', { execution_id: 'exe_1' });
+    expect(answer.isError ?? false).toBe(false);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    const cancelled = answer.structuredContent?.['cancelled_cell_refs'] as string[];
+    const sent = answer.structuredContent?.['already_sent_cell_refs'] as string[];
+    for (const ref of [...cancelled, ...sent]) {
+      expect(ref).toMatch(/^@/u);
+      expect(text).toContain(ref);
+    }
+    expect(text).toContain('unavailable_cancelled_cells=0');
+    expect(text).toContain('unavailable_already_sent_cells=0');
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(2048);
+  });
+
   it('renders every record in each bounded service page', () => {
     const cells = Array.from({ length: 31 }, (_unused, index) => ({
-      cell_id: `cell-${String(index)}`,
+      cell_ref: `cell-${String(index)}`,
       index,
       state: 'succeeded',
       outputs: index === 0
@@ -176,10 +285,12 @@ describe('text rendering', () => {
           }))
         : []
     }));
-    expect(renderText('notebook_read', {
+    const summaryText = renderText('notebook_read', {
       view: 'summary',
       summary: { cell_count: 21, cells: cells.slice(0, 21) }
-    })).toContain('cell-20');
+    });
+    expect(summaryText).toContain('cell_ref=cell-20');
+    expect(summaryText).not.toContain('cell_id=');
     expect(renderText('notebook_apply', {
       results: cells.map((cell) => ({ op: 'add_cell', ...cell }))
     })).toContain('cell-30');
@@ -206,23 +317,39 @@ describe('reference ownership', () => {
     harness = await connect();
     const cancelled = await harness.call('execution_cancel', { execution_id: 'exe_1' });
     const notebookId = String(cancelled.structuredContent?.['notebook_id']);
-    const cancelledCell = String((cancelled.structuredContent?.['cancelled_cell_ids'] as string[])[0]);
+    const cancelledCell = String((cancelled.structuredContent?.['cancelled_cell_refs'] as string[])[0]);
     expect(notebookId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.n1$/u);
-    expect(cancelledCell).toMatch(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.c1$/u);
-    expect(cancelled.structuredContent?.['already_sent_cell_ids']).toEqual([
-      expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.c2$/u)
-    ]);
+    expect(cancelledCell).toMatch(/^@/u);
+    expect(cancelled.structuredContent?.['already_sent_cell_refs']).toEqual([expect.stringMatching(/^@/u)]);
+    expect(cancelled.structuredContent).toMatchObject({
+      unavailable_cancelled_cells: 0,
+      unavailable_already_sent_cells: 0
+    });
 
     const read = await harness.call('notebook_read', {
       notebook_id: notebookId,
       view: 'cells',
-      cell_ids: [cancelledCell]
+      cell_refs: [cancelledCell]
     });
     expect(read.isError).not.toBe(true);
     expect(harness.fake.lastRequest('notebookRead')).toMatchObject({
       notebookId: 'nb_1',
-      cellIds: ['cell_b']
+      observedCells: [{ cellId: 'cell_b', identityToken: 'identity-cell-b' }]
     });
+  });
+
+  it('reports unavailable cancellation observations without leaking durable ids', async () => {
+    harness = await connect({ fake: { cancelCellsUnavailable: true } });
+    const cancelled = await harness.call('execution_cancel', { execution_id: 'exe_1' });
+    expect(cancelled.isError ?? false).toBe(false);
+    expect(cancelled.structuredContent).toMatchObject({
+      cancelled_cell_refs: [],
+      already_sent_cell_refs: [],
+      unavailable_cancelled_cells: 1,
+      unavailable_already_sent_cells: 1
+    });
+    expect(cancelled.structuredContent).not.toHaveProperty('cancelled_cell_ids');
+    expect(cancelled.structuredContent).not.toHaveProperty('already_sent_cell_ids');
   });
 });
 
@@ -279,14 +406,13 @@ describe('error mapping', () => {
               request_accepted: false,
               execution_id: 'exe_9',
               execution_ids: ['exe_9', 'exe_10'],
-              revision: 's1_x',
-              cell_id: 'cell_a'
+              phase: 'binding'
             }
           })
         }
       }
     });
-    const answer = await harness.call('notebook_execute', VALID_ARGS['notebook_execute']);
+    const answer = await harness.call('notebook_execute', await argsFor('notebook_execute', harness));
     expect(answer.isError).toBe(true);
     expect(metaError(answer)).toMatchObject({
       code: 'KERNEL_NOT_BOUND',
@@ -298,14 +424,13 @@ describe('error mapping', () => {
       execution_ids: [
         expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e1$/u),
         expect.stringMatching(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e2$/u)
-      ],
-      revision: 's1_x'
+      ]
     });
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
     expect(text).toContain('KERNEL_NOT_BOUND');
     expect(text).toContain('next_request_id=4');
     expect(text).toMatch(/execution_ids=@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e1,@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.e2/u);
-    expect(text).toContain('"cell_id":"cell_a"');
+    expect(text).toContain('"phase":"binding"');
   });
 
   it('maps an unknown throw to INTERNAL_ERROR with side_effects unknown', async () => {
@@ -342,8 +467,6 @@ describe('error mapping', () => {
             details: {
               next_request_id: '3',
               request_accepted: false,
-              current_source_revision: 's1_current',
-              expected_source_revision: 's1_expected',
               nested,
               bulky: 'x'.repeat(100_000)
             }
@@ -351,7 +474,7 @@ describe('error mapping', () => {
         }
       }
     });
-    const answer = await harness.call('notebook_execute', VALID_ARGS['notebook_execute']);
+    const answer = await harness.call('notebook_execute', await argsFor('notebook_execute', harness));
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
     const error = metaError(answer);
     expect(answer.isError).toBe(true);
@@ -415,12 +538,114 @@ describe('error mapping', () => {
 });
 
 describe('response size and output content', () => {
+  it('commits only observed refs that survive response bounding', async () => {
+    harness = await connect({
+      fake: { bulkCells: 100 },
+      server: { observedRefMaxEntries: 101, responseMaxBytes: 8192 }
+    });
+    const opened = await harness.call('notebook_open', VALID_ARGS['notebook_open']);
+    expect(opened.isError ?? false).toBe(false);
+    expect(jsonByteSize(opened.structuredContent)).toBeLessThanOrEqual(8192);
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const summary = opened.structuredContent?.['summary'] as Record<string, unknown>;
+    const published = summary['cells'] as Record<string, unknown>[];
+    expect(published).toHaveLength(12);
+    const publishedRefs = published.map((cell) => String(cell['cell_ref']));
+
+    const execution = await harness.call('execution_get', { execution_id: 'fresh-execution' });
+    expect(execution.isError ?? false).toBe(false);
+    expect(((execution.structuredContent?.['cells'] as Record<string, unknown>[])[0])?.['cell_ref']).toMatch(/^@/u);
+
+    const cursor = String(summary['page_cursor']);
+    expect(Number(cursor.slice(cursor.lastIndexOf('.') + 1))).toBe(published.length);
+    const continued = await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cursor
+    });
+    expect(continued.isError ?? false).toBe(false);
+    const continuedRef = String(((continued.structuredContent?.['cells'] as Record<string, unknown>[])[0])?.['cell_ref']);
+    expect(continuedRef).toMatch(/^@/u);
+    expect(publishedRefs).not.toContain(continuedRef);
+
+    const visible = await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_refs: [publishedRefs[0]!]
+    });
+    expect(visible.isError ?? false).toBe(false);
+    expect(harness.fake.lastRequest('notebookRead')).toMatchObject({
+      observedCells: [{ cellId: 'cell_0', identityToken: 'identity-cell-0' }]
+    });
+    const omitted = await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_refs: [continuedRef]
+    });
+    expect(omitted.isError ?? false).toBe(false);
+    expect(harness.fake.lastRequest('notebookRead')).toMatchObject({
+      observedCells: [{ cellId: `cell_${String(published.length)}`, identityToken: `identity-cell-${String(published.length)}` }]
+    });
+  });
+
+  it('does not resolve a hidden observed ref mentioned only in opaque preview text', async () => {
+    const preview = { value: '' };
+    harness = await connect({
+      fake: { bulkCells: 100, refLikePreview: preview },
+      server: { responseMaxBytes: 8192 }
+    });
+    const closed = await harness.call('notebook_close', { notebook_id: 'nb_1' });
+    const notebookAlias = String(closed.structuredContent?.['notebook_id']);
+    const prefix = notebookAlias.match(/^(@[^.]+\.[^.]+)\.n[1-9][0-9]*$/u)?.[1];
+    expect(prefix).toBeTypeOf('string');
+    const hiddenRef = `${String(prefix)}.v88`;
+    preview.value = hiddenRef;
+
+    const opened = await harness.call('notebook_open', VALID_ARGS['notebook_open']);
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const summary = opened.structuredContent?.['summary'] as Record<string, unknown>;
+    const cells = summary['cells'] as Record<string, unknown>[];
+    expect(cells[0]?.['preview']).toBe(hiddenRef);
+    expect(cells.map((cell) => cell['cell_ref'])).not.toContain(hiddenRef);
+
+    const redirected = await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_refs: [hiddenRef]
+    });
+    expect(metaError(redirected)).toMatchObject({ code: 'HANDLE_EXPIRED' });
+  });
+
+  it('rolls back observed refs when the response cannot be published', async () => {
+    const oversized = { value: true };
+    harness = await connect({
+      fake: { oversizedMetadataSwitch: oversized },
+      server: { observedRefMaxEntries: 2 }
+    });
+    const failed = await harness.call('notebook_read', { notebook_id: 'nb_1', view: 'cells' });
+    expect(metaError(failed)).toMatchObject({ code: 'RESOURCE_LIMIT' });
+
+    oversized.value = false;
+    const recovered = await harness.call('notebook_read', { notebook_id: 'nb_1', view: 'cells' });
+    expect(recovered.isError ?? false).toBe(false);
+    const notebookId = String(recovered.structuredContent?.['notebook_id']);
+    const cellRef = String(((recovered.structuredContent?.['cells'] as Record<string, unknown>[])[0])?.['cell_ref']);
+    expect(recovered.structuredContent?.['notebook_ref']).toMatch(/^@/u);
+    expect(cellRef).toMatch(/^@/u);
+    expect((await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_refs: [cellRef]
+    })).isError ?? false).toBe(false);
+  });
+
   it('extracts only protocol outputs and leaves opaque notebook data byte-identical', async () => {
     harness = await connect({ fake: { outputShapedOpaqueData: true } });
+    const { notebookId, cellRef } = await openRefs(harness);
     const cellsAnswer = await harness.call('notebook_read', {
-      notebook_id: 'nb_1',
+      notebook_id: notebookId,
       view: 'cells',
-      cell_ids: ['cell_a']
+      cell_refs: [cellRef]
     });
     const cells = cellsAnswer.structuredContent?.['cells'] as Record<string, unknown>[];
     const outputShapedValue = {
@@ -444,6 +669,8 @@ describe('response size and output content', () => {
       notebook_id: 'nb_1',
       view: 'outputs'
     });
+    expect(outputsAnswer.structuredContent?.['notebook_ref']).toMatch(/^@/u);
+    expect(((outputsAnswer.structuredContent?.['cells'] as Record<string, unknown>[])[0])?.['cell_ref']).toMatch(/^@/u);
     const image = outputsAnswer.content.find((block) => block.type === 'image');
     expect(image).toMatchObject({ type: 'image', mimeType: 'image/png', data: TINY_PNG });
   });
@@ -538,10 +765,11 @@ describe('response size and output content', () => {
 
   it('returns a bounded RESOURCE_LIMIT instead of an oversized metadata success', async () => {
     harness = await connect({ fake: { oversizedMetadata: true } });
+    const { notebookId, cellRef } = await openRefs(harness);
     const answer = await harness.call('notebook_read', {
-      notebook_id: 'nb_1',
+      notebook_id: notebookId,
       view: 'cells',
-      cell_ids: ['cell_a']
+      cell_refs: [cellRef]
     });
     expect(answer.isError).toBe(true);
     expect(answer.structuredContent).toBeUndefined();

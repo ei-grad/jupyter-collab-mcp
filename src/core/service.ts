@@ -37,6 +37,7 @@ import type { CoreError } from './errors.js';
 import type {
   AbortedReason,
   CellRunState,
+  CellObservation,
   CellSummary,
   CellType,
   ChangeEvent,
@@ -521,6 +522,8 @@ export interface NotebookCellsReadRequest {
   readonly view: 'cells';
   /** Explicit selection; mutually exclusive with {@link cursor}. */
   readonly cellIds?: readonly string[];
+  /** Internal immutable observations expanded from public `cell_refs`. */
+  readonly observedCells?: readonly Pick<CellObservation, 'cellId' | 'identityToken'>[];
   readonly cursor?: PageCursor | SourceCursor;
   readonly limits?: ResponseLimits;
 }
@@ -528,6 +531,8 @@ export interface NotebookCellsReadRequest {
 /** One cell of the `cells` view: text, metadata and attachments. */
 export interface CellContent {
   readonly cellId: string;
+  /** Internal identity of the live Y.Map; MCP turns this into a cell_ref. */
+  readonly identityToken?: string;
   readonly index: number;
   readonly cellType: CellType;
   /** May be cut to the byte budget; see {@link sourceTruncated}. */
@@ -562,6 +567,7 @@ export interface NotebookOutputsReadRequest {
   readonly notebookId: NotebookId;
   readonly view: 'outputs';
   readonly cellIds?: readonly string[];
+  readonly observedCells?: readonly Pick<CellObservation, 'cellId' | 'identityToken'>[];
   readonly cursor?: PageCursor;
   readonly limits?: ResponseLimits;
 }
@@ -616,8 +622,12 @@ export interface OutputSnapshotRef {
 /** Outputs of one cell. */
 export interface CellOutputsView {
   readonly cellId: string;
+  /** Internal identity of the live Y.Map; MCP turns this into a cell_ref. */
+  readonly identityToken?: string;
   readonly index: number;
   readonly cellType: CellType;
+  readonly sourceRevision: SourceRevision;
+  readonly cellRevision: CellRevision;
   /** `null` for markdown and raw cells, which have no output area. */
   readonly outputsRevision: OutputsRevision | null;
   readonly outputs: readonly OutputEntry[];
@@ -630,6 +640,8 @@ export interface CellOutputsView {
 export interface NotebookOutputsReadResult extends NotebookReadCommon {
   readonly view: 'outputs';
   readonly cells: readonly CellOutputsView[];
+  /** Captured with the output view so every read returns a notebook_ref. */
+  readonly notebookMetadataRevision: NotebookMetadataRevision;
   readonly truncated: boolean;
   readonly nextCursor?: PageCursor;
 }
@@ -705,6 +717,8 @@ export interface NotebookApplyResult {
 /** One target of `notebook_execute` (SPEC.md §8 "Jobs"). */
 export interface ExecuteTarget {
   readonly cellId: string;
+  /** Internal object-identity guard expanded from the public `cell_ref`. */
+  readonly expectedIdentityToken?: string;
   /**
    * Checked at acceptance and re-checked immediately before the cell is sent.
    * A mismatch stops the queue before that cell runs; the remaining cells get
@@ -736,6 +750,10 @@ export interface ExecutionCellView {
   readonly state: CellRunState;
   /** Revision of the text actually sent; later edits do not change it. */
   readonly sourceRevision: SourceRevision;
+  /** Current live state of the same CRDT object; never the sent-code snapshot. */
+  readonly currentObservation?: CellObservation;
+  /** True when that object was deleted or replaced, so no ref is issued. */
+  readonly cellRefUnavailable?: boolean;
   /** `execute_request` header id; absent while the cell is still queued. */
   readonly msgId?: string;
   /** Final count, written to the shared model at completion only. */
@@ -816,9 +834,11 @@ export interface ExecutionCancelResult {
   readonly notebookId: NotebookId;
   readonly state: JobState;
   /** Cells removed from the queue, now `not_sent` with reason `cancelled`. */
-  readonly cancelledCellIds: readonly string[];
+  readonly cancelledCells: readonly CellObservation[];
+  readonly unavailableCancelledCells: number;
   /** Cells already sent; their outcome stays whatever the kernel reports. */
-  readonly alreadySentCellIds: readonly string[];
+  readonly alreadySentCells: readonly CellObservation[];
+  readonly unavailableAlreadySentCells: number;
   /** Always `false`: cancelling never interrupts the kernel (SPEC.md §8). */
   readonly kernelInterrupted: boolean;
 }

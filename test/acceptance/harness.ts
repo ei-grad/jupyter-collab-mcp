@@ -180,6 +180,8 @@ export interface WireError {
   next_request_id?: string | null;
   request_accepted?: boolean | null;
   execution_id?: string;
+  current_cell_ref?: string;
+  current_notebook_ref?: string;
   revision?: string;
   details?: Record<string, unknown>;
 }
