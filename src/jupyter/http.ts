@@ -42,6 +42,10 @@ export interface HttpRequestOptions {
   /** Statuses that must not be turned into an error (e.g. `[404]`). */
   readonly allowStatus?: readonly number[];
   readonly signal?: AbortSignal;
+  /** Bypass HTTP caches for independent persistence readback. */
+  readonly noCache?: boolean;
+  /** Optional cap for callers that read a full persisted document. */
+  readonly maxResponseBytes?: number;
   /** Injected in tests; defaults to the global `fetch`. */
   readonly fetchImpl?: typeof fetch;
   /** Maximum same-origin redirects to follow. Default 5. */
@@ -170,10 +174,15 @@ export async function httpRequest(
     const headers = new Headers(authHeaders);
     if (authHeaders === undefined) headers.set('Authorization', `token ${token}`);
     if (body !== undefined) headers.set('Content-Type', 'application/json');
+    if (options.noCache) {
+      headers.set('Cache-Control', 'no-cache, no-store');
+      headers.set('Pragma', 'no-cache');
+    }
 
     const init: RequestInit = { method, headers, redirect: 'manual' };
     if (body !== undefined) init.body = body;
     if (options.signal !== undefined) init.signal = options.signal;
+    if (options.noCache) init.cache = 'no-store';
 
     try {
       response = await fetchImpl(current, init);
@@ -187,7 +196,7 @@ export async function httpRequest(
 
     // Read (and discard) the body so the connection can be reused.
     try {
-      await response.text();
+      await readResponseText(response, options.maxResponseBytes);
     } catch (error) {
       throw mapTransportError(new Error(scrub(error instanceof Error ? error.message : 'transport failure')), method, scrub(current));
     }
@@ -220,7 +229,7 @@ export async function httpRequest(
 
   let text: string;
   try {
-    text = await response.text();
+    text = await readResponseText(response, options.maxResponseBytes);
   } catch (error) {
     throw mapTransportError(new Error(scrub(error instanceof Error ? error.message : 'transport failure')), method, scrub(current));
   }
@@ -231,6 +240,40 @@ export async function httpRequest(
   }
 
   return { status: response.status, ok: response.ok, headers: response.headers, text, redactDiagnostic: scrub };
+}
+
+async function readResponseText(response: Response, maxBytes?: number): Promise<string> {
+  if (maxBytes === undefined) return response.text();
+  if (response.body === null) return '';
+  const declaredLength = Number(response.headers.get('Content-Length'));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    void response.body.cancel().catch(() => undefined);
+    throw coreError('DOCUMENT_TOO_LARGE', 'Contents readback exceeds the response byte limit');
+  }
+  const reader = response.body.getReader();
+  let buffer = new Uint8Array(Math.min(maxBytes, 64 * 1024));
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const required = bytes + value.byteLength;
+      if (required > maxBytes) {
+        void reader.cancel().catch(() => undefined);
+        throw coreError('DOCUMENT_TOO_LARGE', 'Contents readback exceeds the response byte limit');
+      }
+      if (required > buffer.length) {
+        const grown = new Uint8Array(Math.min(maxBytes, Math.max(required, buffer.length * 2)));
+        grown.set(buffer.subarray(0, bytes));
+        buffer = grown;
+      }
+      buffer.set(value, bytes);
+      bytes = required;
+    }
+    return new TextDecoder().decode(buffer.subarray(0, bytes));
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 /**

@@ -984,7 +984,8 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
   it('notebook_save reports success and the file on disk carries the run', async () => {
     const saved = await mcp.call('notebook_save', { notebook_id: docId, timeout_ms: 20_000 });
     expect(saved['save_status']).toBe('success');
-    expect(saved['revision_persistence']).toBe('unknown');
+    expect(saved['revision_persistence']).toBe('confirmed');
+    expect(saved['persistence_confirmation']).toMatchObject({ method: 'contents-api-readback' });
     expect(saved['autosave_enabled']).toBe(true);
 
     const file = await apiFetchOk(

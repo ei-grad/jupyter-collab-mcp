@@ -220,7 +220,7 @@ const EXECUTION_VIEW: Record<string, JsonSchema> = {
   created_at: str(),
   finished_at: str(),
   reason: str(),
-  cursor: str('Pass to execution_get; already delivered output is never repeated.'),
+  cursor: str('Pass to execution_get; outputs_reset means replace prior cell outputs and may repeat a previously delivered prefix.'),
   wait_timed_out: bool('true when wait_ms elapsed. The job keeps running; nothing was interrupted.'),
   lifetime: LIFETIME
 };
@@ -632,7 +632,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'execution_get',
     title: 'Read a run',
     description:
-      `State of a job plus the outputs after cursor; with wait_ms it waits for the next change instead of polling. A returned cell_ref describes current live state of the same cell object, not necessarily the source that was sent. Missing/replaced cells set cell_ref_unavailable. Delivered output is never repeated. ${NOT_A_TOOL_ERROR} Takes no request_id.`,
+      `State of a job plus the outputs after cursor; with wait_ms it waits for the next change instead of polling. A returned cell_ref describes current live state of the same cell object, not necessarily the source that was sent; missing or replaced cells set cell_ref_unavailable. When outputs_reset is true, replace that cell's prior outputs; an updated stream or display snapshot can repeat previously delivered text. ${NOT_A_TOOL_ERROR} Takes no request_id.`,
     input: z.object({
       execution_id: executionId,
       cursor: z.string().optional().describe('cursor from the previous answer. Omitted, the whole current state comes back.'),
@@ -738,21 +738,28 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_save',
     title: 'Save the notebook',
     description:
-      'Ask the collaborative server to write the .ipynb and report what it said. save_status "skipped" and "timeout" are honest non-confirmations, not success; only revision_persistence:"confirmed" proves a revision reached disk. Not deduplicated: a repeat may store newer state. A server-reported failure is SAVE_FAILED; a lost connection with the save in flight is OPERATION_UNCERTAIN.',
+      'Save through RTC, then read back through the Contents API within one timeout. revision_persistence:"confirmed" means that read matched the immutable full normalized snapshot captured at requested_at; persistence_confirmation gives its digest and observation time. This does not confirm an earlier caller read, latest RTC state, filesystem durability, or future persistence; custom Contents managers may cache. Capture and each readback are capped at 16 MiB; exceeding the cap leaves persistence unknown. Skipped/timeout or unsuccessful readback return unknown with null confirmation. Not deduplicated: a repeat captures newer state. A server-reported failure is SAVE_FAILED; a lost connection with save in flight is OPERATION_UNCERTAIN.',
     input: z.object({
       notebook_id: notebookId,
-      timeout_ms: z.number().int().positive().optional().describe('Clamped to 30 s.')
+      timeout_ms: z.number().int().positive().optional().describe('Total budget for save and readback; defaults to 20 s and is clamped to 30 s.')
     }),
     output: result(
       {
         notebook_id: str(),
         save_status: str('success | skipped | timeout'),
         revision_persistence: str('unconfirmed | confirmed | unknown'),
+        persistence_confirmation: {
+          anyOf: [obj({
+            method: { const: 'contents-api-readback', type: 'string' },
+            snapshot_digest: str('sha256 of the normalized snapshot at requested_at, not raw file bytes or an earlier caller read.'),
+            observed_at: str('RFC 3339 time the matching Contents response was observed.')
+          }, ['method', 'snapshot_digest', 'observed_at']), { type: 'null' }]
+        },
         structure_revision: str(),
         requested_at: str(),
         autosave_enabled: bool('The server may also save on its own debounce; that confirms no specific revision either.')
       },
-      ['notebook_id', 'save_status', 'revision_persistence', 'structure_revision', 'requested_at', 'autosave_enabled']
+      ['notebook_id', 'save_status', 'revision_persistence', 'persistence_confirmation', 'structure_revision', 'requested_at', 'autosave_enabled']
     ),
     readOnly: false,
     deduplicated: false
@@ -799,7 +806,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'kernel_control',
     title: 'Control the kernel',
     description:
-      `Bind or act on the notebook's kernel. "start" reuses the single existing Jupyter session for this path or creates one; "interrupt", "restart" and "shutdown" act on the whole kernel and may hit another participant's code; "switch" rebinds to another kernelspec. Restart clears no outputs and re-runs no cells. Every action requires expected_kernel_id so it cannot land on a kernel you did not mean — a mismatch is KERNEL_CHANGED. ${SEQUENTIAL} A lost confirmation is OPERATION_UNCERTAIN and the effect is never re-issued.`,
+      `Bind or act on the notebook's kernel. "start" reuses the single existing Jupyter session for this path or creates one; when kernel_name is omitted it uses the available default, or the sole installed kernelspec if the default is unavailable; "interrupt", "restart" and "shutdown" act on the whole kernel and may hit another participant's code; "switch" rebinds to another kernelspec. Restart clears no outputs and re-runs no cells. Every action requires expected_kernel_id so it cannot land on a kernel you did not mean — a mismatch is KERNEL_CHANGED. ${SEQUENTIAL} A lost confirmation is OPERATION_UNCERTAIN and the effect is never re-issued.`,
     input: z.object({
       notebook_id: notebookId,
       request_id: requestId,

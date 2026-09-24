@@ -613,6 +613,7 @@ export class FakeCollabService implements CollabService {
       notebookId: request.notebookId,
       saveStatus: 'skipped' as const,
       revisionPersistence: 'unknown' as const,
+      persistenceConfirmation: null,
       structureRevision: STRUCT,
       requestedAt: '2026-09-06T10:04:00Z',
       autosaveEnabled: true,

@@ -219,6 +219,15 @@ export class ServerClient {
     return parseJsonBody<ServerStatus>(response, route);
   }
 
+  /** Read the storage provider's notebook representation independently of RTC. */
+  async readNotebookContents(path: string, signal: AbortSignal, maxResponseBytes: number): Promise<unknown> {
+    const route = `/api/contents/${encodeContentsPath(normalizeContentsPath(path))}?content=1&type=notebook`;
+    const response = await this.#request(route, { method: 'GET', signal, noCache: true, maxResponseBytes });
+    const model = parseJsonBody<ContentsModel>(response, route);
+    if (model.type !== 'notebook') throw coreError('INVALID_ARGUMENT', 'Contents readback is not a notebook');
+    return model.content;
+  }
+
   /**
    * `GET /api/contents/<dir>?content=1`, filtered to notebooks and directories
    * (SPEC.md §9 `notebook_list`).
@@ -558,11 +567,17 @@ export class ServerClient {
       json?: unknown;
       allowStatus?: readonly number[];
       notFoundCode?: ErrorCode;
+      signal?: AbortSignal;
+      noCache?: boolean;
+      maxResponseBytes?: number;
     }
   ): ReturnType<typeof httpRequest> {
     return httpRequest(joinUrl(this.apiBaseUrl, route), this.#token, {
       method: options.method,
       fetchImpl: this.#fetch,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.noCache === undefined ? {} : { noCache: options.noCache }),
+      ...(options.maxResponseBytes === undefined ? {} : { maxResponseBytes: options.maxResponseBytes }),
       ...(this.#authHeaders === undefined ? {} : { authHeaders: this.#authHeaders }),
       ...(this.#resolveAuthHeaders === undefined ? {} : { resolveAuthHeaders: this.#resolveAuthHeaders }),
       ...(options.json === undefined ? {} : { json: options.json }),

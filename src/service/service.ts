@@ -30,6 +30,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { captureNotebookPersistence, notebookPersistenceDigest, SAVE_CONFIRMATION_MAX_BYTES } from '../core/notebook/persistence.js';
 
 import {
   coreError,
@@ -1156,20 +1157,50 @@ class CollabServiceImpl implements CollabService {
     const { session, handle } = this.#locate(request.notebookId);
     try {
       handle.assertWritable();
+      const deadline = Date.now() + this.#clampWait(request.timeoutMs, 20_000);
       const structureRevision = handle.model.structureRevision;
       const requestedAt = this.#now().toISOString();
-      const status = await handle.connection.save(this.#clampWait(request.timeoutMs, 20_000));
+      const snapshotDigest = captureNotebookPersistence(handle.notebook);
+      const status = await handle.connection.save(Math.max(0, deadline - Date.now()));
       if (status === 'failed') {
         throw coreError('SAVE_FAILED', 'the server reported a failed save', {
           details: { notebook_id: handle.notebookId, save_status: status }
         });
       }
+      let persistenceConfirmation: NotebookSaveResult['persistenceConfirmation'] = null;
+      if (status === 'success' && snapshotDigest !== null && Date.now() < deadline) {
+        const client = this.#servers.clientFor(session.server);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - Date.now()));
+        try {
+          while (Date.now() < deadline && !handle.closed) {
+            const contents = await client.readNotebookContents(handle.path, controller.signal, SAVE_CONFIRMATION_MAX_BYTES);
+            if (Date.now() >= deadline) break;
+            const digest = notebookPersistenceDigest(contents);
+            if (Date.now() >= deadline) break;
+            if (digest === null) break;
+            if (digest === snapshotDigest) {
+              persistenceConfirmation = {
+                method: 'contents-api-readback', snapshotDigest,
+                observedAt: this.#now().toISOString()
+              };
+              break;
+            }
+            await sleep(Math.max(0, Math.min(100, deadline - Date.now())));
+          }
+        } catch {
+          // Readback is optional evidence: transport, permission, unsupported
+          // storage and parsing failures must not change the RAW save result.
+        } finally {
+          clearTimeout(timer);
+          controller.abort();
+        }
+      }
       return {
         notebookId: handle.notebookId,
         saveStatus: status,
-        // SPEC.md §6: without a verified ordering of updates against the save,
-        // no specific revision may be called persisted.
-        revisionPersistence: 'unknown',
+        revisionPersistence: persistenceConfirmation === null ? 'unknown' : 'confirmed',
+        persistenceConfirmation,
         structureRevision,
         requestedAt,
         autosaveEnabled: true,
@@ -1276,6 +1307,12 @@ class CollabServiceImpl implements CollabService {
               ? request.kernelName
               : (bound?.kernelName ?? request.kernelName ?? available.defaultName);
           selectedSpec = available.specs.find((spec) => spec.name === selectedName) ?? null;
+          if (
+            selectedSpec === null && request.action === 'start' &&
+            request.kernelName === undefined && bound === null && available.specs.length === 1
+          ) {
+            selectedSpec = available.specs[0]!;
+          }
           if (selectedSpec === null) {
             throw coreError('INVALID_ARGUMENT', 'the selected kernelspec is not available', {
               details: { kernel_name: selectedName }
@@ -2188,7 +2225,7 @@ class CollabServiceImpl implements CollabService {
         if (bound !== null) break; // An existing session is reused (SPEC.md §8).
         after = await client.startSession({
           path: handle.path,
-          ...(request.kernelName === undefined ? {} : { kernelName: request.kernelName })
+          kernelName: selectedSpec!.name
         });
         effects.kernelStarted = true;
         effects.bindingChanged = true;
