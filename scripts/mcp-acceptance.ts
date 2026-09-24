@@ -21,6 +21,15 @@ const PORT = Number(process.env['PORT'] ?? 8878);
 const TOKEN = `acc-tok-${Math.random().toString(36).slice(2, 10)}`;
 const RUN = Date.now().toString(36);
 const NOTEBOOK = `acceptance-${RUN}.ipynb`;
+const EXPECTED_TOOLS = [
+  'server_list', 'server_status', 'server_start',
+  'notebook_list', 'notebook_create', 'notebook_open', 'notebook_close',
+  'notebook_read', 'notebook_apply', 'notebook_execute',
+  'execution_get', 'output_read', 'execution_cancel',
+  'notebook_changes', 'notebook_save',
+  'kernel_list', 'kernel_status', 'kernel_control'
+] as const;
+const EXPECTED_TOOL_NAMES: ReadonlySet<string> = new Set(EXPECTED_TOOLS);
 
 /** A `print` plus a 1x1 PNG: the two output shapes SPEC.md §12 names. */
 const CELL_SOURCE = [
@@ -111,12 +120,18 @@ async function main(): Promise<number> {
 
     await row('Protocol', 'initialize + tools/list', async () => {
       const tools = (await child.client.listTools()).tools;
-      expect(tools.length === 16, `expected 16 tools, got ${String(tools.length)}`);
+      const names = tools.map((tool) => tool.name);
+      const missing = EXPECTED_TOOLS.filter((name) => !names.includes(name));
+      const unexpected = names.filter((name) => !EXPECTED_TOOL_NAMES.has(name));
+      expect(
+        missing.length === 0 && unexpected.length === 0 && names.length === EXPECTED_TOOLS.length,
+        `tool list differs from SPEC.md §9: missing=${missing.join(',') || 'none'}, unexpected=${unexpected.join(',') || 'none'}, count=${String(names.length)}`
+      );
       expect(
         tools.every((tool) => tool.inputSchema !== undefined && tool.outputSchema !== undefined),
         'every tool publishes an input and an output schema'
       );
-      return `16 tools with input+output schemas, protocol 2026-07-28`;
+      return `${String(EXPECTED_TOOLS.length)} tools with input+output schemas, protocol 2026-07-28`;
     });
 
     await row('Servers', 'server_list is credential-free', async () => {
