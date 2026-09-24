@@ -176,6 +176,8 @@ export interface FakeOptions {
   readonly outputShapedOpaqueData?: boolean;
   /** Return a completed execution whose kernel result is failed. */
   readonly executionFailed?: boolean;
+  /** Return a save whose captured snapshot was confirmed by Contents readback. */
+  readonly saveConfirmed?: boolean;
   /** Return an execution cell whose original Y.Map no longer exists. */
   readonly executionCellUnavailable?: boolean;
   /** Return a live execution observation that needs a newly issued ref. */
@@ -609,11 +611,18 @@ export class FakeCollabService implements CollabService {
   }
 
   async notebookSave(request: NotebookSaveRequest): Promise<WithEnvelope<NotebookSaveResult>> {
+    const confirmed = this.options.saveConfirmed === true;
     return this.record('notebookSave', request, {
       notebookId: request.notebookId,
-      saveStatus: 'skipped' as const,
-      revisionPersistence: 'unknown' as const,
-      persistenceConfirmation: null,
+      saveStatus: confirmed ? 'success' as const : 'skipped' as const,
+      revisionPersistence: confirmed ? 'confirmed' as const : 'unknown' as const,
+      persistenceConfirmation: confirmed
+        ? {
+            method: 'contents-api-readback' as const,
+            snapshotDigest: 'sha256:0123456789abcdef',
+            observedAt: '2026-09-06T10:04:01Z'
+          }
+        : null,
       structureRevision: STRUCT,
       requestedAt: '2026-09-06T10:04:00Z',
       autosaveEnabled: true,

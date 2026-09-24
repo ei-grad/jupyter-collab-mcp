@@ -639,11 +639,18 @@ export function renderText(tool: string, payload: WireObject): string {
       }
       break;
     }
-    case 'notebook_save':
+    case 'notebook_save': {
       lines.push(
         `save ${s(payload['save_status'])} revision_persistence=${s(payload['revision_persistence'])} autosave=${s(payload['autosave_enabled'])}${payload['save_status'] === 'skipped' || payload['save_status'] === 'timeout' ? ' — this is NOT a confirmation that the file was written' : ''}`
       );
+      const confirmation = payload['persistence_confirmation'];
+      lines.push(
+        isObject(confirmation)
+          ? `persistence_confirmation.method=${s(confirmation['method'])} persistence_confirmation.snapshot_digest=${s(confirmation['snapshot_digest'])} persistence_confirmation.observed_at=${s(confirmation['observed_at'])}`
+          : 'persistence_confirmation=null (persistence remains unknown)'
+      );
       break;
+    }
     case 'kernel_list': {
       const specs = payload['kernelspecs'];
       const running = payload['running'];

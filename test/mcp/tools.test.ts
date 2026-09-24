@@ -272,6 +272,43 @@ describe('text rendering', () => {
     expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(2048);
   });
 
+  it('renders exact confirmed persistence evidence within the text budget', async () => {
+    harness = await connect({
+      fake: { saveConfirmed: true },
+      server: { responseMaxBytes: 1024 }
+    });
+    const answer = await harness.call('notebook_save', { notebook_id: 'nb_1' });
+    expect(answer.isError ?? false).toBe(false);
+    const confirmation = answer.structuredContent?.['persistence_confirmation'] as Record<string, unknown>;
+    expect(answer.structuredContent).toMatchObject({
+      revision_persistence: 'confirmed',
+      persistence_confirmation: {
+        method: 'contents-api-readback',
+        snapshot_digest: 'sha256:0123456789abcdef',
+        observed_at: '2026-09-06T10:04:01Z'
+      }
+    });
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(text).toContain(`persistence_confirmation.method=${String(confirmation['method'])}`);
+    expect(text).toContain(`persistence_confirmation.snapshot_digest=${String(confirmation['snapshot_digest'])}`);
+    expect(text).toContain(`persistence_confirmation.observed_at=${String(confirmation['observed_at'])}`);
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(1024);
+  });
+
+  it('renders null persistence evidence as explicitly unknown', async () => {
+    harness = await connect({ server: { responseMaxBytes: 1024 } });
+    const answer = await harness.call('notebook_save', { notebook_id: 'nb_1' });
+    expect(answer.isError ?? false).toBe(false);
+    expect(answer.structuredContent).toMatchObject({
+      revision_persistence: 'unknown',
+      persistence_confirmation: null
+    });
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(text).toContain('revision_persistence=unknown');
+    expect(text).toContain('persistence_confirmation=null (persistence remains unknown)');
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(1024);
+  });
+
   it('renders every record in each bounded service page', () => {
     const cells = Array.from({ length: 31 }, (_unused, index) => ({
       cell_ref: `cell-${String(index)}`,

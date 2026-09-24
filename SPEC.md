@@ -464,6 +464,9 @@ confirmation while preserving `save_status`. RAW `failed` still throws
 and deadline exhaustion do not confirm persistence. Aborting a readback must
 also abort its response-body read. Waiting holds no mutation lock and does
 not consume a request ID. Concurrent RTC edits never replace the target snapshot.
+The bounded text result repeats the exact confirmation method, snapshot digest,
+and observation time when present, and explicitly reports
+`persistence_confirmation=null` when persistence remains unknown.
 Snapshot capture and each streamed Contents response are limited to 16 MiB.
 Exceeding either limit skips confirmation and returns `unknown` with null
 confirmation; it does not change the RAW save status or mean saving failed.
