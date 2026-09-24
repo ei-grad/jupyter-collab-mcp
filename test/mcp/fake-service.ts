@@ -168,6 +168,8 @@ export interface FakeOptions {
   readonly bigImage?: boolean;
   /** Emit this many summary cells, to exercise the response budget. */
   readonly bulkCells?: number;
+  /** Make summary cells share one durable ID while retaining distinct observations. */
+  readonly duplicateSummaryCellIds?: boolean;
   /** Mutable opaque preview used to verify reference-shaped user text. */
   readonly refLikePreview?: { value: string };
   readonly oversizedMetadata?: boolean;
@@ -322,7 +324,7 @@ export class FakeCollabService implements CollabService {
       truncated: true,
       pageCursor: PAGE,
       cells: Array.from({ length: bulk }, (_unused, index) => ({
-        cellId: `cell_${String(index)}`,
+        cellId: this.options.duplicateSummaryCellIds === true ? 'cell_a' : `cell_${String(index)}`,
         identityToken: `identity-cell-${String(index)}`,
         index,
         cellType: 'code' as const,

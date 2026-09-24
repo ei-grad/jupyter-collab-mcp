@@ -536,7 +536,12 @@ describe('error mapping', () => {
         failWith: {
           method: 'notebookSave',
           error: coreError('FILE_ID_CHANGED', 'the path now names another file', {
-            details: { expected: 'file-id-before', actual: 'file-id-after', room: 'json:notebook:file-id-before' }
+            details: {
+              expected: 'file-id-before',
+              current: 'file-id-after',
+              room: 'json:notebook:file-id-before',
+              nested: [{ expected: 'nested-before', current: 'nested-after' }]
+            }
           })
         }
       }
@@ -546,13 +551,341 @@ describe('error mapping', () => {
       code: 'FILE_ID_CHANGED',
       details: {
         expected: 'file-id-before',
-        actual: 'file-id-after',
-        room: 'json:notebook:file-id-before'
+        current: 'file-id-after',
+        room: 'json:notebook:file-id-before',
+        nested: [{ expected: 'nested-before', current: 'nested-after' }]
       }
     });
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
     expect(text).toContain('"expected":"file-id-before"');
-    expect(text).toContain('"actual":"file-id-after"');
+    expect(text).toContain('"current":"file-id-after"');
+    expect(text).toContain('"expected":"nested-before"');
+  });
+
+  it('retains expected and current diagnostics for unrelated error codes', async () => {
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookOpen',
+          error: coreError('NETWORK_ERROR', 'the remote changed state', {
+            details: {
+              expected: 'remote-before',
+              current: 'remote-after',
+              nested: [{ target: 'diagnostic-target', targets: ['diagnostic-a', 'diagnostic-b'] }]
+            }
+          })
+        }
+      }
+    });
+    const answer = await harness.call('notebook_open', VALID_ARGS['notebook_open']);
+    const error = metaError(answer);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(error).toMatchObject({
+      code: 'NETWORK_ERROR',
+      details: {
+        expected: 'remote-before',
+        current: 'remote-after',
+        nested: [{ target: 'diagnostic-target', targets: ['diagnostic-a', 'diagnostic-b'] }]
+      }
+    });
+    expect(text).toContain('"expected":"remote-before"');
+    expect(text).toContain('"current":"remote-after"');
+    expect(text).toContain('"target":"diagnostic-target"');
+  });
+
+  it('uses the submitted ref and hides nested durable identity in a missing-cell error', async () => {
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookRead',
+          error: coreError('CELL_NOT_FOUND', 'no cell with id "cell_a"', {
+            details: {
+              cell_id: 'cell_a',
+              nested: {
+                cell_id: 'cell_a',
+                target: 'cell_a',
+                entries: [
+                  { before_cell_id: 'cell_a', targets: ['cell_a'] },
+                  { identity_token: 'identity-cell-a', expected_source_revision: 's1_aaaaaaaaaaaaaaaa' }
+                ]
+              }
+            }
+          })
+        }
+      }
+    });
+    const { notebookId, cellRef } = await openRefs(harness);
+    const answer = await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_refs: [cellRef]
+    });
+    const error = metaError(answer);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(error).toMatchObject({
+      code: 'CELL_NOT_FOUND',
+      message: `cell_ref "${cellRef}" no longer identifies a live cell`
+    });
+    expect(JSON.stringify(error)).toContain(cellRef);
+    expect(text).toContain(cellRef);
+    expect(`${JSON.stringify(error)}\n${text}`).not.toContain('cell_a');
+    expect(`${JSON.stringify(error)}\n${text}`).not.toContain('identity-cell-a');
+  });
+
+  it('uses the submitted ref and retains recovery state in a unique execute-stale error', async () => {
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookExecute',
+          error: coreError('REVISION_CONFLICT', 'cell cell_a changed since the read', {
+            details: {
+              notebook_id: 'nb_1',
+              cell_id: 'cell_a',
+              identity_token: 'identity-cell-a',
+              source_revision: 's1_aaaaaaaaaaaaaaaa',
+              cell_revision: 'c1_bbbbbbbbbbbbbbbb',
+              outputs_revision: 'o1_cccccccccccccccc',
+              next_request_id: '3',
+              request_accepted: false,
+              replayed: false,
+              first_accepted_at: '2026-09-06T10:03:00Z',
+              nested: [
+                { cell_id: 'cell_a', target: 'cell_a' },
+                { cell_ids: ['cell_a'], targets: ['cell_a'] }
+              ]
+            }
+          })
+        }
+      }
+    });
+    const { notebookId, cellRef } = await openRefs(harness);
+    const answer = await harness.call('notebook_execute', {
+      notebook_id: notebookId,
+      request_id: '2',
+      cells: [{ cell_ref: cellRef }]
+    });
+    const error = metaError(answer);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(error).toMatchObject({
+      code: 'REVISION_CONFLICT',
+      message: `cell_ref "${cellRef}" is stale because the cell changed since it was read`,
+      next_request_id: '3',
+      request_accepted: false,
+      replayed: false,
+      first_accepted_at: '2026-09-06T10:03:00Z',
+      current_cell_ref: cellRef
+    });
+    expect(JSON.stringify(error)).toContain(cellRef);
+    expect(text).toContain(`cell_ref "${cellRef}"`);
+    expect(text).toContain(`current_cell_ref=${cellRef}`);
+    expect(text).toContain('next_request_id=3');
+    expect(text).toContain('request_accepted=false');
+    expect(`${JSON.stringify(error)}\n${text}`).not.toContain('cell_a');
+  });
+
+  it('uses the submitted ref in a unique replaced-cell error', async () => {
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookApply',
+          error: coreError('CELL_REPLACED', 'cell "cell_a" was replaced', {
+            details: {
+              cell_id: 'cell_a',
+              next_request_id: '3',
+              request_accepted: false,
+              nested: [{ cell_id: 'cell_a', target: 'cell_a' }]
+            }
+          })
+        }
+      }
+    });
+    const { notebookId, cellRef } = await openRefs(harness);
+    const answer = await harness.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '2',
+      operations: [{ op: 'replace_text', cell_ref: cellRef, old_text: 'df.head()', new_text: 'df.head(20)' }]
+    });
+    const error = metaError(answer);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(error).toMatchObject({
+      code: 'CELL_REPLACED',
+      message: `cell_ref "${cellRef}" no longer identifies a live cell`,
+      next_request_id: '3',
+      request_accepted: false
+    });
+    expect(JSON.stringify(error)).toContain(cellRef);
+    expect(text).toContain(cellRef);
+    expect(`${JSON.stringify(error)}\n${text}`).not.toContain('cell_a');
+  });
+
+  it('correlates one duplicated durable identity only to the submitted ref', async () => {
+    harness = await connect({
+      fake: {
+        bulkCells: 2,
+        duplicateSummaryCellIds: true,
+        failWith: {
+          method: 'notebookRead',
+          error: coreError('CELL_ID_AMBIGUOUS', 'cell id "cell_a" addresses 2 cells', {
+            details: { cell_id: 'cell_a', indices: [0, 1] }
+          })
+        }
+      }
+    });
+    const opened = await harness.call('notebook_open', VALID_ARGS['notebook_open']);
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const refs = ((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])
+      .map((cell) => String(cell['cell_ref']));
+    const answer = await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_refs: [refs[0]!]
+    });
+    const error = metaError(answer);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(error).toMatchObject({
+      code: 'CELL_ID_AMBIGUOUS',
+      message: `cell_ref "${refs[0]!}" does not identify a unique live cell`,
+      details: { indices: [0, 1] }
+    });
+    expect(`${JSON.stringify(error)}\n${text}`).toContain(refs[0]!);
+    expect(`${JSON.stringify(error)}\n${text}`).not.toContain(refs[1]!);
+    expect(`${JSON.stringify(error)}\n${text}`).not.toContain('cell_a');
+  });
+
+  it('uses no submitted ref when duplicate durable identity matches multiple targets', async () => {
+    harness = await connect({
+      fake: {
+        bulkCells: 2,
+        duplicateSummaryCellIds: true,
+        failWith: {
+          method: 'notebookExecute',
+          error: coreError('CELL_ID_AMBIGUOUS', 'cell id "cell_a" addresses 2 cells', {
+            details: { cell_id: 'cell_a', indices: [0, 1], next_request_id: '3', request_accepted: false }
+          })
+        }
+      }
+    });
+    const opened = await harness.call('notebook_open', VALID_ARGS['notebook_open']);
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const refs = ((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])
+      .map((cell) => String(cell['cell_ref']));
+    expect(new Set(refs).size).toBe(2);
+    const answer = await harness.call('notebook_execute', {
+      notebook_id: notebookId,
+      request_id: '2',
+      cells: refs.map((cell_ref) => ({ cell_ref }))
+    });
+    const error = metaError(answer);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(error).toMatchObject({
+      code: 'CELL_ID_AMBIGUOUS',
+      message: 'a supplied cell reference does not identify a unique live cell',
+      next_request_id: '3',
+      request_accepted: false,
+      details: { indices: [0, 1] }
+    });
+    expect(`${JSON.stringify(error)}\n${text}`).not.toContain('cell_a');
+    for (const ref of refs) expect(`${JSON.stringify(error)}\n${text}`).not.toContain(ref);
+  });
+
+  it('projects a typed non-code execute error without changing other invalid arguments', async () => {
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookExecute',
+          error: coreError('INVALID_ARGUMENT', 'cell cell_a is not a code cell', {
+            details: {
+              cell_id: 'cell_a',
+              cell_type: 'markdown',
+              next_request_id: '3',
+              request_accepted: false,
+              nested: [{ target: 'cell_a' }]
+            }
+          })
+        }
+      }
+    });
+    const { notebookId, cellRef } = await openRefs(harness);
+    const answer = await harness.call('notebook_execute', {
+      notebook_id: notebookId,
+      request_id: '2',
+      cells: [{ cell_ref: cellRef }]
+    });
+    const error = metaError(answer);
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(error).toMatchObject({
+      code: 'INVALID_ARGUMENT',
+      message: `cell_ref "${cellRef}" is not a code cell`,
+      next_request_id: '3',
+      request_accepted: false,
+      details: { cell_type: 'markdown' }
+    });
+    expect(`${JSON.stringify(error)}\n${text}`).toContain(cellRef);
+    expect(`${JSON.stringify(error)}\n${text}`).not.toContain('cell_a');
+
+    await harness.close();
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookExecute',
+          error: coreError('INVALID_ARGUMENT', 'wait_ms is outside the supported range', {
+            details: { expected: '0..60000', current: '90000' }
+          })
+        }
+      }
+    });
+    const unrelated = await harness.call('notebook_execute', await argsFor('notebook_execute', harness));
+    expect(metaError(unrelated)).toMatchObject({
+      code: 'INVALID_ARGUMENT',
+      message: 'wait_ms is outside the supported range',
+      details: { expected: '0..60000', current: '90000' }
+    });
+  });
+
+  it('preserves user content even when it equals the durable cell id', async () => {
+    harness = await connect({
+      fake: {
+        failWith: {
+          method: 'notebookRead',
+          error: coreError('CELL_NOT_FOUND', 'no cell with id "cell_a"', {
+            details: {
+              cell_id: 'cell_a',
+              payload: {
+                preview: 'cell_a',
+                source: 'cell_a',
+                text: 'cell_a',
+                value: 'cell_a',
+                metadata: { cell_id: 'cell_a', target: 'cell_a' },
+                attachments: [{ cell_id: 'cell_a', target: 'cell_a' }],
+                output: { cell_id: 'cell_a', target: 'cell_a' }
+              },
+              diagnostic: { target: 'cell_a' }
+            }
+          })
+        }
+      }
+    });
+    const { notebookId, cellRef } = await openRefs(harness);
+    const answer = await harness.call('notebook_read', {
+      notebook_id: notebookId,
+      view: 'cells',
+      cell_refs: [cellRef]
+    });
+    const error = metaError(answer);
+    const details = error['details'] as Record<string, unknown>;
+    expect(details['payload']).toEqual({
+      preview: 'cell_a',
+      source: 'cell_a',
+      text: 'cell_a',
+      value: 'cell_a',
+      metadata: { cell_id: 'cell_a', target: 'cell_a' },
+      attachments: [{ cell_id: 'cell_a', target: 'cell_a' }],
+      output: { cell_id: 'cell_a', target: 'cell_a' }
+    });
+    expect(JSON.stringify(details['diagnostic'])).not.toContain('cell_a');
+    const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(text).toContain('"preview":"cell_a"');
+    expect(text).toContain(`cell_ref "${cellRef}"`);
   });
 
   it('rejects credential-bearing configured URLs before server_list serialization', async () => {

@@ -242,9 +242,12 @@ class Simulation {
   ): void {
     if (expected === current) return;
     if (!strict && expected === original) return;
+    // Strict observed refs reject reuse, but strict alone does not prove that
+    // this batch caused the mismatch: a ref may already be stale on arrival.
+    const invalidatedInBatch = strict && expected === original && current !== original;
     throw coreError(
       'REVISION_CONFLICT',
-      strict
+      invalidatedInBatch
         ? 'the expected revision predates an earlier operation of this batch'
         : 'the expected revision does not match the replica',
       { details: { ...details, expected, current, preview: preview() } }

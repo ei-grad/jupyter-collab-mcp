@@ -50,6 +50,11 @@ new cell with the same internal ID. If a cells read reports a source cursor,
 continue it before acting on the incomplete source. Page cursors and
 `changes_cursor` are different types and are not interchangeable.
 
+Change events do not issue observed refs. Their `cell_id` and revisions identify
+that historical event; they are not a `cell_ref` and cannot target an edit. They
+do not contain the complete atomic identity and guard observation needed to
+issue a ref later.
+
 ## 3. Edits and visible execution
 
 `notebook_apply {notebook_id, request_id, operations[]}`, operations:
@@ -72,6 +77,9 @@ Never run notebook code with a shell tool instead: it would be invisible.
 An execution view's `cell_ref` is a fresh observation of current live state for
 the same cell object, not a claim that its source is the code already sent. If
 the object was deleted or replaced, the view says `cell_ref_unavailable`.
+`notebook_execute` accepts code cells only. `cell_ref "<ref>" is not a code
+cell` means select a code cell; this rejected request leaves its `request_id`
+unspent, so use the unchanged `next_request_id` for the corrected request.
 
 Before the first execution, call `kernel_status {notebook_id}`. If it returns
 `kernel_id: null`, bind/start the notebook kernel with `kernel_control {action:
@@ -123,17 +131,32 @@ An explicitly requested unavailable name is an error, not a fallback.
   deletes, source/metadata/outputs edits, reordering, kernel changes and
   connection state - not a full IOPub transcript, and output updates are
   coalesced. `origin: remote` means another participant, not a known person. A
-  background update does not mean you have seen it: before any edit that depends
-  on current content, read changes or re-read the cell.
+  background update does not mean you have seen it. Before a dependent edit,
+  refresh the target: if you retained its earlier `cell_ref`, call
+  `notebook_read` with that ref; otherwise read the summary to obtain a current
+  ref, then read the cell when the decision depends on its source, metadata or
+  outputs. A notebook-metadata event likewise requires a fresh `notebook_ref`
+  from `notebook_read`. Do not use the event's `cell_id` or revisions as a
+  mutation target.
 - `CURSOR_EXPIRED` -> take a fresh snapshot (`notebook_read`) and continue from
   its `changes_cursor`.
 
 ## 5. Conflicts, reconnect, uncertain execution
 
-- `REVISION_CONFLICT`, `MATCH_NOT_FOUND`, `MATCH_NOT_UNIQUE`, `CELL_REPLACED`:
-  another participant changed the cell. Use `current_cell_ref` or
-  `current_notebook_ref` when supplied; otherwise re-read, decide again, then
-  re-apply. Do not force the old text back.
+- `CELL_NOT_FOUND`, `CELL_ID_AMBIGUOUS`, `REVISION_CONFLICT`,
+  `MATCH_NOT_FOUND`, `MATCH_NOT_UNIQUE`, `CELL_REPLACED`:
+  use `current_cell_ref` or `current_notebook_ref` when supplied; it is the
+  fresh observation of the same live object. `cell_ref "<ref>" no longer
+  identifies a live cell` means deletion or replacement: re-read the summary.
+  `cell_ref "<ref>" does not identify a unique live cell` (or `a supplied cell
+  reference ...`) means re-read the summary and select a uniquely addressable
+  cell; do not guess among duplicates.
+  `cell_ref "<ref>" is stale because the cell changed since it was read` means
+  inspect the current content and decide again. `cell_ref "<ref>" was
+  invalidated by an earlier operation in this batch` means the batch reused one
+  observed ref after changing its guarded scope; split the work or re-read
+  between operations. Apply the same recovery to `before_cell_ref` and
+  `after_cell_ref`; do not force the old text back.
 - `NOT_READY` is retryable; `RTC_SESSION_REJECTED`, `RTC_CONFLICT`,
   `FILE_ID_CHANGED` mean this replica is dead. Do not call `notebook_open`
   immediately: the same session would reuse the terminal handle. First let
@@ -241,5 +264,7 @@ Tell the user the server is up and let them configure the token themselves.
 {"execution_id":"ex_1","cursor":"...","wait_ms":5000}
 //    -> state "succeeded" | "failed", outputs, output_id for the plot
 // 8. notebook_changes {"notebook_id":"nb_A","cursor":"c7"} to see what
-//    changed meanwhile; notebook_save {"notebook_id":"nb_A"} if asked.
+//    changed meanwhile. Before an edit that depends on an event, notebook_read
+//    refreshes a cell_ref (and notebook_ref); event cell_id/revisions are only
+//    diagnostics. notebook_save {"notebook_id":"nb_A"} if asked.
 ```

@@ -375,6 +375,7 @@ describe('implicit MCP working context', () => {
     const conflict = metaError(answer);
     expect(conflict).toMatchObject({
       code: 'REVISION_CONFLICT',
+      message: `cell_ref "${observed}" was invalidated by an earlier operation in this batch`,
       next_request_id: '1',
       request_accepted: false,
       current_cell_ref: observed,
@@ -383,6 +384,7 @@ describe('implicit MCP working context', () => {
     expect(conflict['details']).not.toHaveProperty('expected');
     expect(conflict['details']).not.toHaveProperty('current');
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(text).toContain(`cell_ref "${observed}" was invalidated by an earlier operation in this batch`);
     expect(text).toContain(`current_cell_ref=${observed}`);
     expect(text).toContain(attempted);
     expect(text).not.toMatch(/"(?:expected|current)":/u);
@@ -410,7 +412,17 @@ describe('implicit MCP working context', () => {
       request_id: '2',
       cells: [{ cell_ref: observed }]
     });
-    expect(metaError(staleSource)).toMatchObject({ code: 'REVISION_CONFLICT', request_accepted: false });
+    const conflict = metaError(staleSource);
+    expect(conflict).toMatchObject({
+      code: 'REVISION_CONFLICT',
+      message: `cell_ref "${observed}" is stale because the cell changed since it was read`,
+      next_request_id: '2',
+      request_accepted: false,
+      current_cell_ref: expect.stringMatching(/^@/u)
+    });
+    expect(conflict['current_cell_ref']).not.toBe(observed);
+    const text = staleSource.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(`${JSON.stringify(conflict)}\n${text}`).not.toContain('cell one');
   });
 
   it('refreshes a stale live ref on read and guards notebook metadata with notebook_ref', async () => {

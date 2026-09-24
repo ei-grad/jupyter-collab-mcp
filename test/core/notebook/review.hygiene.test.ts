@@ -105,19 +105,58 @@ describe('review: REVISION_CONFLICT payload (SPEC.md §7)', () => {
 describe('review: batch revision guards (SPEC.md §7)', () => {
   it('refuses the second full replacement of one cell that quotes the pre-batch revision', () => {
     const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'original')]));
-    const rev = peer.model.summary().cells[0]!.sourceRevision;
+    const cell = peer.model.summary().cells[0]!;
+    const identity = peer.model.cellRef('c1').identityToken;
+    const rev = cell.sourceRevision;
     // Both operations quote the same, now-stale revision. Accepting both would
     // make the first one's text disappear with no error - a lost update the
     // caller cannot notice, because `appliedLocally` would be true and both
     // results would report the final revision. The whole batch is refused
     // before the first mutation instead (SPEC.md §7).
-    expect(() =>
+    try {
       peer.model.apply([
         { op: 'replace_source', cellId: 'c1', expectedSourceRevision: rev, source: 'FIRST' },
-        { op: 'replace_source', cellId: 'c1', expectedSourceRevision: rev, source: 'SECOND' }
-      ])
-    ).toThrowError(expect.objectContaining({ code: 'REVISION_CONFLICT' }));
+        {
+          op: 'replace_source',
+          cellId: 'c1',
+          expectedCellIdentityToken: identity,
+          expectedSourceRevision: rev,
+          source: 'SECOND'
+        }
+      ]);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: 'REVISION_CONFLICT',
+        message: 'the expected revision predates an earlier operation of this batch'
+      });
+    }
     expect(peer.notebook.getCell(0).getSource()).toBe('original');
+    peer.dispose();
+  });
+
+  it('classifies a changed live observed cell as stale rather than intra-batch', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'original')]));
+    const cell = peer.model.summary().cells[0]!;
+    const identity = peer.model.cellRef('c1').identityToken;
+    typeInto(peer.notebook, 0, 'changed by a collaborator');
+
+    try {
+      peer.model.apply([{
+        op: 'replace_source',
+        cellId: 'c1',
+        expectedCellIdentityToken: identity,
+        expectedSourceRevision: cell.sourceRevision,
+        source: 'must not apply'
+      }]);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: 'REVISION_CONFLICT',
+        message: 'the expected revision does not match the replica'
+      });
+    }
+    expect(peer.notebook.getCell(0).getSource()).toBe('changed by a collaborator');
     peer.dispose();
   });
 

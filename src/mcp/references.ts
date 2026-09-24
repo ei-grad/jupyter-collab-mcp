@@ -89,6 +89,11 @@ export interface StagedReferences {
   rollback(): void;
 }
 
+interface SubmittedCellReference {
+  readonly field: 'cell_ref' | 'before_cell_ref' | 'after_cell_ref';
+  readonly value: string;
+}
+
 interface ReferenceCheckpoint {
   readonly byFull: Map<ReferenceKind, Map<string, string>>;
   readonly byAlias: Map<ReferenceKind, Map<string, string>>;
@@ -264,6 +269,53 @@ export class ReferenceAliases {
       ...resolved,
       operations: resolved['operations'].map((entry) => this.#operation(entry as WireObject, notebook))
     };
+  }
+
+  /**
+   * Correlate one internal cell id with a public ref in the submitted request.
+   *
+   * Errors retain internal diagnostics until the MCP boundary. Projection must
+   * name a caller-supplied ref only when both its value and input role are
+   * unambiguous; otherwise the public error uses a generic cell-reference
+   * description instead of guessing.
+   */
+  submittedCellReference(
+    tool: string,
+    value: WireValue,
+    cellId: string
+  ): SubmittedCellReference | null {
+    if (!isObject(value) || typeof value['notebook_id'] !== 'string') return null;
+    let notebook: string;
+    try {
+      notebook = this.resolve('notebook', value['notebook_id']);
+    } catch {
+      return null;
+    }
+
+    const candidates = new Map<string, SubmittedCellReference>();
+    const consider = (field: SubmittedCellReference['field'], ref: unknown): void => {
+      if (typeof ref !== 'string') return;
+      const observed = this.#observedByRef.get(ref);
+      if (observed === undefined || observed.notebook !== notebook || observed.cellId !== cellId) return;
+      candidates.set(`${field}\u0000${ref}`, { field, value: ref });
+    };
+
+    if (tool === 'notebook_read' && Array.isArray(value['cell_refs'])) {
+      for (const ref of value['cell_refs']) consider('cell_ref', ref);
+    } else if (tool === 'notebook_execute' && Array.isArray(value['cells'])) {
+      for (const cell of value['cells']) {
+        if (isObject(cell)) consider('cell_ref', cell['cell_ref']);
+      }
+    } else if (tool === 'notebook_apply' && Array.isArray(value['operations'])) {
+      for (const operation of value['operations']) {
+        if (!isObject(operation)) continue;
+        consider('cell_ref', operation['cell_ref']);
+        consider('before_cell_ref', operation['before_cell_ref']);
+        consider('after_cell_ref', operation['after_cell_ref']);
+      }
+    }
+
+    return candidates.size === 1 ? [...candidates.values()][0]! : null;
   }
 
   #map(value: WireValue, transform: (kind: ReferenceKind, reference: string, notebook?: string) => string, inheritedNotebook?: string, rawNotebook = false): WireValue {

@@ -777,6 +777,61 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     expect(['connecting', 'connected']).toContain(str(status['channel_state']));
   }, 60_000);
 
+  it('rejects a stale execute ref after an independent RTC edit without leaking its cell ID', async () => {
+    const staleRef = executionTarget.cellRef;
+    const before = await mcp.call('notebook_read', {
+      notebook_id: docId,
+      view: 'cells',
+      cell_refs: [staleRef]
+    });
+    const cell = list(before['cells'])[0]!;
+    const index = Number(cell['index']);
+    const remote = await openRemote(stand, docPath);
+    try {
+      const remoteCell = remote.notebook.getCell(index);
+      const durableId = remoteCell.id;
+      const changed = `${remoteCell.getSource()}\n# stale-execute-${RUN}`;
+      remoteCell.setSource(changed);
+
+      let observedSource = '';
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline) {
+        const refreshed = await mcp.call('notebook_read', {
+          notebook_id: docId,
+          view: 'cells',
+          cell_refs: [staleRef]
+        });
+        observedSource = str(list(refreshed['cells'])[0]?.['source']);
+        if (observedSource === changed) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(observedSource).toBe(changed);
+
+      const error = await mcp.fail('notebook_execute', {
+        notebook_id: docId,
+        request_id: main.counter.value,
+        cells: [{ cell_ref: staleRef }]
+      });
+      expect(error).toMatchObject({
+        code: 'REVISION_CONFLICT',
+        message: `cell_ref "${staleRef}" is stale because the cell changed since it was read`,
+        next_request_id: main.counter.value,
+        request_accepted: false
+      });
+      expect(error.current_cell_ref).toMatch(/^@/u);
+      const raw = await mcp.raw('notebook_execute', {
+        notebook_id: docId,
+        request_id: main.counter.value,
+        cells: [{ cell_ref: staleRef }]
+      });
+      const text = raw.content.find((block) => block.type === 'text')?.text ?? '';
+      expect(`${JSON.stringify(error)}\n${text}`).not.toContain(durableId);
+      executionTarget.cellRef = str(error.current_cell_ref);
+    } finally {
+      remote.dispose();
+    }
+  }, 60_000);
+
   it('replays switch and shutdown after each action changes the binding', async () => {
     const session = await openContext();
     const mcp = session.client;

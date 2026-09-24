@@ -154,6 +154,116 @@ export interface WireError {
   readonly details?: Record<string, unknown>;
 }
 
+interface ToolErrorContext {
+  readonly tool: string;
+  readonly args: WireValue;
+}
+
+const INTRA_BATCH_REVISION_CONFLICT =
+  'the expected revision predates an earlier operation of this batch';
+
+const CELL_ERROR_CONTENT_KEYS = new Set([
+  'attachments',
+  'metadata',
+  'output',
+  'preview',
+  'source',
+  'text',
+  'value'
+]);
+const ROOT_CELL_OBSERVATION_KEYS = new Set([
+  'cell_id',
+  'identity_token',
+  'source_revision',
+  'cell_revision',
+  'outputs_revision'
+]);
+const OMIT_DIAGNOSTIC = Symbol('omit cell diagnostic');
+
+function isInternalCellDiagnosticKey(key: string): boolean {
+  return key === 'target' || key === 'targets' || key === 'cell_id' || key === 'cell_ids' ||
+    key.endsWith('_cell_id') || key.endsWith('_cell_ids') || key.endsWith('identity_token') ||
+    /^(?:expected_|current_)?(?:source|cell|outputs)_revision$/u.test(key);
+}
+
+/** Remove nested internal identity fields while leaving notebook content opaque. */
+function scrubCellErrorDetails(details: Record<string, unknown>): Record<string, unknown> {
+  const visit = (value: unknown, key?: string): unknown | typeof OMIT_DIAGNOSTIC => {
+    if (key !== undefined && CELL_ERROR_CONTENT_KEYS.has(key)) return value;
+    if (key !== undefined && isInternalCellDiagnosticKey(key)) return OMIT_DIAGNOSTIC;
+    if (Array.isArray(value)) {
+      const cleaned: unknown[] = [];
+      for (const entry of value) {
+        const item = visit(entry);
+        if (item !== OMIT_DIAGNOSTIC) cleaned.push(item);
+      }
+      return cleaned;
+    }
+    if (value !== null && typeof value === 'object') {
+      const cleaned: Record<string, unknown> = {};
+      for (const [childKey, child] of Object.entries(value as Record<string, unknown>)) {
+        const item = visit(child, childKey);
+        if (item !== OMIT_DIAGNOSTIC) cleaned[childKey] = item;
+      }
+      return cleaned;
+    }
+    return value;
+  };
+
+  const preserveCurrentObservation = typeof details['cell_id'] === 'string' &&
+    typeof details['identity_token'] === 'string' &&
+    typeof details['source_revision'] === 'string' &&
+    typeof details['cell_revision'] === 'string' &&
+    (typeof details['outputs_revision'] === 'string' || details['outputs_revision'] === null);
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(details)) {
+    if (preserveCurrentObservation && ROOT_CELL_OBSERVATION_KEYS.has(key)) {
+      cleaned[key] = value;
+      continue;
+    }
+    const item = visit(value, key);
+    if (item !== OMIT_DIAGNOSTIC) cleaned[key] = item;
+  }
+  return cleaned;
+}
+
+/** Replace internal cell identity in public errors with the submitted ref. */
+function projectSubmittedCellError(
+  wire: WireError,
+  context: ToolErrorContext | undefined,
+  references: ReferenceAliases
+): WireError {
+  if (context === undefined) return wire;
+  const cellId = wire.details?.['cell_id'];
+  if (typeof cellId !== 'string') return wire;
+  const cellTargetError = wire.code === 'CELL_NOT_FOUND' || wire.code === 'CELL_REPLACED' ||
+    wire.code === 'CELL_ID_AMBIGUOUS' || wire.code === 'REVISION_CONFLICT' ||
+    (wire.code === 'INVALID_ARGUMENT' && context.tool === 'notebook_execute' &&
+      typeof wire.details?.['cell_type'] === 'string');
+  if (!cellTargetError) return wire;
+  const submitted = references.submittedCellReference(context.tool, context.args, cellId);
+  const subject = submitted === null
+    ? 'a supplied cell reference'
+    : `${submitted.field} ${JSON.stringify(submitted.value)}`;
+  const details = scrubCellErrorDetails(wire.details!);
+  if (wire.code === 'CELL_NOT_FOUND' || wire.code === 'CELL_REPLACED') {
+    return { ...wire, message: `${subject} no longer identifies a live cell`, details };
+  }
+  if (wire.code === 'CELL_ID_AMBIGUOUS') {
+    return { ...wire, message: `${subject} does not identify a unique live cell`, details };
+  }
+  if (wire.code === 'INVALID_ARGUMENT') {
+    return { ...wire, message: `${subject} is not a code cell`, details };
+  }
+  return {
+    ...wire,
+    message: wire.message === INTRA_BATCH_REVISION_CONFLICT
+      ? `${subject} was invalidated by an earlier operation in this batch`
+      : `${subject} is stale because the cell changed since it was read`,
+    details
+  };
+}
+
 function redactDeep(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
   if (typeof value === 'string') return redactCredentials(value);
   if (depth >= 6) return '[details depth omitted]';
@@ -254,8 +364,13 @@ function boundWireError(wire: WireError, maxBytes: number): WireError {
   return { ...base, details: boundedDetails(details, available) };
 }
 
-function errorResult(thrown: unknown, maxBytes: number, references: ReferenceAliases): CallToolResult {
-  const raw = toWireError(thrown);
+function errorResult(
+  thrown: unknown,
+  maxBytes: number,
+  references: ReferenceAliases,
+  context?: ToolErrorContext
+): CallToolResult {
+  const raw = projectSubmittedCellError(toWireError(thrown), context, references);
   const capacityFallback = (cause: unknown) => coreError(
     'RESOURCE_LIMIT',
     'the connection observed-reference budget is exhausted',
@@ -859,7 +974,10 @@ function registerTool(
         return buildResult(spec.name, result, options, references);
       } catch (thrown) {
         options.log('debug', `${spec.name}: ${toWireError(thrown).code}`);
-        return errorResult(thrown, options.responseMaxBytes, references);
+        return errorResult(thrown, options.responseMaxBytes, references, {
+          tool: spec.name,
+          args: parsed.data as unknown as WireValue
+        });
       }
     }
   );

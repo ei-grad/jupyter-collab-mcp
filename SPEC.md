@@ -537,6 +537,19 @@ operations also accept only `cell_ref`; notebook metadata operations accept
 request receipt comparison. On mismatch, `REVISION_CONFLICT` returns a fresh
 `current_cell_ref` or `current_notebook_ref` when the same object remains live,
 plus a bounded preview, without changing anything.
+When `CELL_NOT_FOUND`, `CELL_REPLACED`, `CELL_ID_AMBIGUOUS`,
+`REVISION_CONFLICT`, or a non-code execution error follows expansion of a public
+cell reference, the MCP error names the submitted ref only when its value and
+input role are unambiguous. Otherwise it uses a generic cell-reference
+description rather than naming the wrong ref. These projected errors recursively
+omit internal cell address, identity, and guard fields from diagnostic objects
+and arrays, while preserving user-content fields such as previews and metadata;
+no diagnostic identity field exposes the internal durable cell ID. An identical
+string remains only when it is notebook content rather than identity metadata.
+Other error families retain their own diagnostics unchanged.
+Revision-conflict wording distinguishes an observation that was already stale
+when the request began from one invalidated by an earlier operation in the same
+batch; recovery fields and request-receipt state remain unchanged.
 
 Metadata changes use keyed `set_cell_metadata`/`delete_cell_metadata` with
 `cell_ref`, or `set_notebook_metadata`/`delete_notebook_metadata` with
