@@ -119,14 +119,16 @@ const SERVER_STATUS = result({
 const CELL_SUMMARY = obj(
   {
     cell_ref: str(),
+    cell_id: str('Stable cell address shared with notebook_changes; usable for read selection, not mutation.'),
     index: num(),
     cell_type: str('code | markdown | raw'),
     execution_count: nullableNum(),
     execution_state: str('running | idle'),
+    has_error: bool('True when an error output is currently present.'),
     preview: str('Short excerpt, never the whole source.'),
     duplicate_id: bool()
   },
-  ['cell_ref', 'index', 'cell_type', 'preview']
+  ['cell_ref', 'cell_id', 'index', 'cell_type', 'preview']
 );
 
 const NOTEBOOK_SUMMARY = obj(
@@ -148,7 +150,7 @@ const NOTEBOOK_SUMMARY = obj(
     changes_cursor: str(),
     page_cursor: str()
   },
-  ['notebook_id', 'path', 'file_id', 'connection_state', 'stale', 'cell_count', 'cells', 'truncated', 'changes_cursor']
+  ['path', 'file_id', 'connection_state', 'stale', 'cell_count', 'cells', 'truncated']
 );
 
 const NOTEBOOK_HANDLE = obj(
@@ -169,9 +171,9 @@ const SNAPSHOT_REF = obj(
     output_id: str(),
     uri: str('jupyter-output:<output_id>. Read it as an MCP resource, or with output_read.'),
     mime_types: arr(str()),
-    byte_size: num(),
+    mime_type: str('Default representation served by output_read and the resource URI.'),
+    byte_size: num('UTF-8 or binary bytes of the default MIME representation served by output_read.'),
     inline_image_advised: bool(),
-    lifetime: LIFETIME
   },
   ['output_id', 'uri', 'mime_types', 'byte_size']
 );
@@ -181,8 +183,11 @@ const OUTPUT_ENTRY = obj(
     index: num(),
     output_type: str('stream | execute_result | display_data | error'),
     mime_types: arr(str()),
-    byte_size: num('Full size, even when the payload was not inlined.'),
+    byte_size: num('UTF-8 bytes of the full serialized nbformat output; snapshot.byte_size counts only its default MIME payload.'),
     truncated: bool(),
+    output_inlined: bool('True only when the nbformat output object is present in this entry.'),
+    ename: str('Error type, always present for an error output outside the text budget.'),
+    evalue: str('Error message, always present for an error output outside the text budget.'),
     output: anyObject('The nbformat output, present only when it fit the budget.'),
     text_preview: str(),
     snapshot: SNAPSHOT_REF,
@@ -194,6 +199,7 @@ const OUTPUT_ENTRY = obj(
 const EXECUTION_CELL = obj(
   {
     cell_ref: str('Current live observation of the same cell object, when it still exists.'),
+    sent_cell_ref: str('Observation of the code accepted for execution, present after this cell was sent.'),
     cell_ref_unavailable: bool('true when that object was deleted or replaced; re-read the notebook.'),
     state: str('queued | sent | succeeded | failed | aborted | not_sent | unknown'),
     msg_id: str(),
@@ -217,6 +223,7 @@ const EXECUTION_VIEW: Record<string, JsonSchema> = {
   state: str('queued | running | succeeded | failed | cancelled | interrupted | unknown — a Python error is failed, not a tool error.'),
   stop_on_error: bool(),
   cells: arr(EXECUTION_CELL),
+  output_lifetime: LIFETIME,
   created_at: str(),
   finished_at: str(),
   reason: str(),
@@ -255,8 +262,8 @@ const requestId = z
 const limits = z
   .object({
     max_cells: z.number().int().positive().optional().describe('Cells in this answer. Clamped to the configured budget (default 100).'),
-    max_bytes: z.number().int().positive().optional().describe('UTF-8 budget of this answer. Clamped to the configured budget (default 64 KiB).'),
-    preview_chars: z.number().int().positive().optional(),
+    max_bytes: z.number().int().positive().optional().describe('UTF-8 budget for source/output data within this answer. The configured response budget separately bounds the entire reply.'),
+    preview_chars: z.number().int().positive().optional().describe('Maximum characters in source or output previews, including notebook_execute and execution_get.'),
     max_output_bytes: z.number().int().positive().optional().describe('Budget for inlined output payloads; larger ones come back as an output_id only.')
   })
   .optional()
@@ -350,7 +357,7 @@ export interface ToolSpec {
 }
 
 const SEQUENTIAL =
-  'Deduplicated and sequential: send it only after the previous mutation of this connection answered, with request_id = that answer\'s next_request_id. An error before acceptance leaves the number unused (request_accepted:false); after acceptance the number is spent even if the operation failed.';
+  'Deduplicated and sequential: send it only after the previous mutation of this connection answered, with request_id = that answer\'s next_request_id. An error before acceptance leaves the number unused (request_accepted:false); after acceptance the number is spent even if the operation failed. On replay, next_request_id is current; refs, indices, revisions and cursors in the result describe the original acceptance and may now be stale. Re-read before dependent work.';
 
 const NOT_A_TOOL_ERROR =
   'A Python error, an aborted or interrupted run and a lost kernel are job results (state failed / aborted / interrupted / unknown), never tool errors.';
@@ -502,7 +509,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_close',
     title: 'Close a notebook',
     description:
-      'Release one replica: socket, observers, journal and page cursors. The kernel keeps running and the file is not deleted. Idempotent by handle. Refuses with EXECUTION_ACTIVE while a job of this notebook is active; force:true abandons it.',
+      'Release one replica: socket, observers, journal and page cursors. This action never shuts down a kernel; kernel_left_running reports whether a kernel was still bound when the handle closed. The file is not deleted. Idempotent by handle. Refuses with EXECUTION_ACTIVE while a job of this notebook is active; force:true abandons it.',
     input: z.object({
       notebook_id: notebookId,
       force: z.boolean().optional().describe('Close despite an active job. Default false.')
@@ -512,7 +519,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
         notebook_id: str(),
         already_closed: bool(),
         dropped_execution_ids: arr(str()),
-        kernel_left_running: bool('Always true.')
+        kernel_left_running: { type: ['boolean', 'null'], description: 'Whether a kernel was bound at close; null when the Jupyter Sessions lookup failed.' }
       },
       ['notebook_id', 'already_closed', 'dropped_execution_ids', 'kernel_left_running']
     ),
@@ -523,12 +530,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_read',
     title: 'Read a notebook',
     description:
-      'Read the live replica: view "summary" (one cell_ref per cell with a preview), "cells" (source, metadata, attachments) or "outputs" (bounded outputs with an output_id for anything large). A cell_ref is one immutable observed version and can be refreshed only while the same cell object remains live. The snapshot and changes_cursor are taken together, so nothing can slip between them. Before readiness the current snapshot is served and marked stale. Read-only, takes no request_id — and the cheapest way to recover next_request_id after losing your counter.',
+      'Read the live replica: view "summary" (cell_ref and cell_id per cell with a preview), "cells" (source, metadata, attachments) or "outputs" (bounded outputs with an output_id for anything large). A cell_ref is one immutable observed version and can be refreshed only while the same cell object remains live. cell_id is a stable address shared with notebook_changes and can select a fresh read, but cannot target a mutation. The snapshot and changes_cursor are taken together, so nothing can slip between them. Before readiness the current snapshot is served and marked stale. Read-only, takes no request_id — and the cheapest way to recover next_request_id after losing your counter.',
     input: z.object({
       notebook_id: notebookId,
       view: z.enum(['summary', 'cells', 'outputs']),
-      cell_refs: z.array(z.string()).optional().describe('Explicit observed cell selection for cells or outputs. Mutually exclusive with cursor; ignored for summary.'),
-      cursor: z.string().optional().describe('page_cursor or source cursor from a previous cells read. A source cursor continues the same source before later cells; a changed source, replacement, or structural change gives CURSOR_EXPIRED.'),
+      cell_refs: z.array(z.string()).optional().describe('Observed cell_ref or cell_id from this connection, for cells or outputs. A cell_id reads the current cell; an observed ref rejects replacement or deletion. Supply at most limits.max_cells refs; split longer selections into separate reads. Mutually exclusive with cursor; ignored for summary.'),
+      cursor: z.string().optional().describe('next_cursor from a previous notebook_read page. A source cursor continues the same source before later cells; a changed source, replacement, or structural change gives CURSOR_EXPIRED.'),
       limits
     }),
     output: result(
@@ -543,10 +550,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
         cells: arr(
           obj({
             cell_ref: str(),
+            cell_id: str(),
             index: num(),
             cell_type: str(),
             source: str(),
             source_truncated: bool(),
+            source_offset: num('UTF-8 byte offset of this page in the full source.'),
+            source_complete: bool('True only when this page is the entire source.'),
             source_bytes: num(),
             metadata: anyObject(),
             attachments: anyObject(),
@@ -559,7 +569,10 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
         ),
         notebook_metadata: anyObject(),
         notebook_ref: str('Current notebook-metadata observation, present on every read view.'),
+        output_lifetime: LIFETIME,
         truncated: bool(),
+        cells_truncated: bool('Some cells remain; next_cursor continues them.'),
+        outputs_truncated: bool('At least one output has unread text or non-text data.'),
         next_cursor: str()
       },
       ['notebook_id', 'notebook_ref', 'view', 'connection_state', 'stale', 'structure_revision', 'changes_cursor']
@@ -647,9 +660,10 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'output_read',
     title: 'Read an output',
     description:
-      'Read one part of an immutable output snapshot by output_id — for hosts that do not read MCP resources, and for payloads too large for one answer. Continuing with cursor never resends delivered bytes. An expired snapshot is HANDLE_EXPIRED.',
+      'Read one part of an immutable output snapshot by output_id — for hosts that do not read MCP resources, and for payloads too large for one answer. text/plain is selected by default when available; mime_type selects another advertised representation. A cursor retains its MIME selection and never resends delivered bytes. An expired snapshot is HANDLE_EXPIRED.',
     input: z.object({
       output_id: outputId,
+      mime_type: z.string().min(1).optional().describe('One of the snapshot mime_types; defaults to text/plain when present.'),
       cursor: z.string().optional(),
       limits
     }),
@@ -699,7 +713,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_changes',
     title: 'Observe changes',
     description:
-      'Journal events after cursor — cells added or deleted, source, metadata, outputs, order, kernel and connection changes — including edits made by a person in JupyterLab. Output updates arrive coalesced per cell; published sequence numbers never change. With wait_ms it waits for the next event. CURSOR_EXPIRED means the journal moved past that point: take a new snapshot with notebook_read and observe from its changes_cursor.',
+      'Journal events after cursor — cells added or deleted, source, metadata, outputs, order, kernel and connection changes — including edits made by a person in JupyterLab. Match a cell event to notebook_read by cell_id. After source_changed, re-read that cell before editing or executing; outputs_changed does not invalidate its cell_ref for edits. After cell_deleted, discard its ref. For local events, a mutation response already carries the new ref. Output updates arrive coalesced per cell; published sequence numbers never change. With wait_ms it waits for the next event. CURSOR_EXPIRED means the journal moved past that point: take a new snapshot with notebook_read and observe from its changes_cursor.',
     input: z.object({
       notebook_id: notebookId,
       cursor: z.string().min(1).describe('changes_cursor from an open/create/read answer or from the previous changes answer.'),
@@ -748,6 +762,8 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
         notebook_id: str(),
         save_status: str('success | skipped | timeout'),
         revision_persistence: str('unconfirmed | confirmed | unknown'),
+        external_change_detected: { type: ['boolean', 'null'], description: 'Pre-save Contents diverged from the last paired disk/replica observation; null when comparison was unavailable.' },
+        overwrote_external_change: { type: ['boolean', 'null'], description: 'True only when a divergent pre-save Contents snapshot was replaced and confirmed by readback; null when persistence was not confirmed.' },
         persistence_confirmation: {
           anyOf: [obj({
             method: { const: 'contents-api-readback', type: 'string' },
@@ -829,6 +845,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     output: result(
       {
         notebook_id: str(),
+        notebook_ref: str('Current notebook metadata observation after kernel action.'),
         action: str(),
         previous_kernel_id: nullableStr(),
         kernel_id: nullableStr('null after a shutdown.'),

@@ -87,14 +87,15 @@ describe('tools/list', () => {
     }
   });
 
-  it('publishes observed refs without public cell ids or revision guards', async () => {
+  it('publishes observed refs without public mutation cell ids or revision guards', async () => {
     harness = await connect();
     const tools = (await harness.client.listTools()).tools;
     for (const name of ['notebook_read', 'notebook_apply', 'notebook_execute']) {
       const tool = tools.find((entry) => entry.name === name)!;
       const schema = JSON.stringify({ input: tool.inputSchema, output: tool.outputSchema });
       expect(schema, name).toContain('cell_ref');
-      expect(schema, name).not.toMatch(/"cell_id"|expected_(?:source|cell|outputs|notebook_metadata)_revision/u);
+      if (name !== 'notebook_read') expect(schema, name).not.toContain('"cell_id"');
+      expect(schema, name).not.toMatch(/expected_(?:source|cell|outputs|notebook_metadata)_revision/u);
     }
     expect(JSON.stringify(tools.find((entry) => entry.name === 'notebook_read')?.inputSchema)).toContain('cell_refs');
     expect(JSON.stringify(tools.find((entry) => entry.name === 'notebook_apply')?.inputSchema)).toContain('notebook_ref');
@@ -111,6 +112,7 @@ describe('tools/list', () => {
       const cells = answer.structuredContent?.['cells'] as Array<Record<string, unknown>>;
       expect(cells[0]?.['state'], name).toBe('failed');
       expect(cells[0]?.['cell_ref']).toMatch(/^@/u);
+      expect(cells[0]?.['sent_cell_ref']).toMatch(/^@/u);
       expect(cells[0]).not.toHaveProperty('cell_id');
       expect(cells[0]).not.toHaveProperty('source_revision');
     }
@@ -190,6 +192,38 @@ describe('every tool round-trips', () => {
     expect(read.isError).not.toBe(true);
   });
 
+  it('correlates a journal cell_id with read rows and accepts it for a fresh read', async () => {
+    harness = await connect();
+    const changes = await harness.call('notebook_changes', {
+      notebook_id: 'nb_1', cursor: 'chg_7'
+    });
+    const cellId = String((changes.structuredContent?.['events'] as Record<string, unknown>[])[0]!['cell_id']);
+    const summary = await harness.call('notebook_read', { notebook_id: 'nb_1', view: 'summary' });
+    const row = ((summary.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!;
+    expect(row['cell_id']).toBe(cellId);
+    expect(row['cell_ref']).not.toBe(cellId);
+
+    const read = await harness.call('notebook_read', {
+      notebook_id: 'nb_1', view: 'cells', cell_refs: [cellId]
+    });
+    expect(read.isError ?? false).toBe(false);
+    expect((read.structuredContent?.['cells'] as Record<string, unknown>[])[0]!['cell_id']).toBe(cellId);
+    expect(harness.fake.lastRequest('notebookRead')).toMatchObject({
+      cellIds: ['cell_a'], observedCells: []
+    });
+
+    const invalid = await harness.call('notebook_read', {
+      notebook_id: 'nb_1', view: 'cells', cell_refs: [cellId.replace(/c[0-9]+$/u, 'c999')]
+    });
+    expect(metaError(invalid)).toMatchObject({ code: 'INVALID_ARGUMENT' });
+  });
+
+  it('returns the notebook metadata ref after kernel_control', async () => {
+    harness = await connect();
+    const answer = await harness.call('kernel_control', VALID_ARGS['kernel_control']);
+    expect(answer.structuredContent?.['notebook_ref']).toMatch(/^@/u);
+  });
+
   it('keeps user-chosen metadata keys verbatim in both directions', async () => {
     harness = await connect();
     const applyArgs = await argsFor('notebook_apply', harness);
@@ -228,6 +262,11 @@ describe('every tool round-trips', () => {
     expect(read.structuredContent?.['next_request_id']).toBe('5');
     expect(read.structuredContent?.['request_accepted']).toBeUndefined();
     expect(read.structuredContent?.['notebook_ref']).toMatch(/^@/u);
+    const summary = read.structuredContent?.['summary'] as Record<string, unknown>;
+    for (const duplicate of ['notebook_id', 'changes_cursor', 'structure_revision', 'notebook_ref']) {
+      expect(read.structuredContent?.[duplicate]).toBeDefined();
+      expect(summary).not.toHaveProperty(duplicate);
+    }
   });
 });
 
@@ -1057,6 +1096,9 @@ describe('response size and output content', () => {
     expect(png?.['delivered_as']).toBe('image');
     expect(png?.['output']).toBeUndefined();
     expect((png?.['snapshot'] as { uri: string }).uri).toBe('jupyter-output:out_1');
+    expect(png?.['snapshot']).not.toHaveProperty('lifetime');
+    expect(answer.structuredContent?.['output_lifetime']).toBeDefined();
+    expect(answer.content.some((block) => block.type === 'resource_link')).toBe(false);
   });
 
   it('links a large PNG instead of inlining it', async () => {
@@ -1067,8 +1109,7 @@ describe('response size and output content', () => {
     expect(link?.uri).toBe('jupyter-output:out_1');
     expect(link?.mimeType).toBe('image/png');
     expect(jsonByteSize(answer.structuredContent)).toBeLessThanOrEqual(64 * 1024);
-    expect(answer.structuredContent?.['response_truncated']).toBe(true);
-    expect(String(answer.structuredContent?.['read_more'])).toContain('output_read');
+    expect(answer.structuredContent?.['response_truncated']).toBeUndefined();
   });
 
   it('keeps a bulky summary inside the byte budget and says how to read the rest', async () => {

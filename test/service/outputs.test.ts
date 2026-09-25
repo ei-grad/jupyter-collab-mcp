@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { isCoreError, type NbOutput } from '../../src/core/index.js';
-import { OutputStore, outputUri, parseOutputUri } from '../../src/service/index.js';
+import { OutputStore, outputUri, parseOutputUri, toOutputEntry } from '../../src/service/index.js';
 
 const ADDRESS = { notebookId: 'nb_1', executionId: 'exec_1', cellId: 'c1', index: 0 };
 
@@ -36,14 +36,92 @@ describe('OutputStore', () => {
     expect(b.outputId).not.toBe(a.outputId);
   });
 
-  it('picks the richest MIME type and decodes a base64 image', () => {
+  it('keeps an empty display bundle readable as empty text', () => {
+    const store = new OutputStore('sess_1', 1024 * 1024);
+    const snapshot = store.intern(ADDRESS, {
+      output_type: 'display_data', data: {}, metadata: {}
+    });
+    expect(snapshot.mimeTypes).toEqual(['text/plain']);
+    expect(snapshot.bytes.byteLength).toBe(0);
+  });
+
+  it('defaults to plain text and retains the image representation', () => {
     const store = new OutputStore('sess_1', 1024 * 1024);
     const snapshot = store.intern(ADDRESS, png);
-    expect(snapshot.mimeType).toBe('image/png');
-    expect(snapshot.encoding).toBe('base64');
+    expect(snapshot.mimeType).toBe('text/plain');
+    expect(snapshot.encoding).toBe('text');
     expect(snapshot.inlineImageAdvised).toBe(true);
     expect(snapshot.mimeTypes).toEqual(['image/png', 'text/plain']);
-    expect(snapshot.bytes.toString('base64')).toBe(PNG_BASE64);
+    expect(snapshot.bytes.toString('utf8')).toBe('<Figure>');
+    expect(snapshot.representations.get('image/png')?.bytes.toString('base64')).toBe(PNG_BASE64);
+  });
+
+  it('keeps the default payload when another MIME variant exceeds the store budget', () => {
+    const store = new OutputStore('sess_1', 64);
+    const snapshot = store.intern(ADDRESS, {
+      output_type: 'display_data',
+      data: { 'text/plain': 'plain', 'text/html': 'x'.repeat(80) },
+      metadata: {}
+    });
+    expect(snapshot.mimeTypes).toEqual(['text/plain']);
+    expect(store.require(snapshot.outputId).bytes.toString()).toBe('plain');
+    expect(store.usedBytes).toBe(5);
+  });
+
+  it('keeps each default payload when combined MIME variants exceed the budget', () => {
+    const store = new OutputStore('sess_1', 24);
+    const tx = store.begin();
+    const output = (plain: string): NbOutput => ({
+      output_type: 'display_data',
+      data: { 'text/plain': plain, 'text/html': 'h'.repeat(12) },
+      metadata: {}
+    });
+    const first = tx.intern(ADDRESS, output('first'));
+    const second = tx.intern({ ...ADDRESS, index: 1 }, output('second'));
+    tx.commit();
+    expect(store.require(first.outputId).bytes.toString()).toBe('first');
+    expect(store.require(second.outputId).bytes.toString()).toBe('second');
+    expect(first.mimeTypes).toEqual(['text/plain']);
+    expect(second.mimeTypes).toEqual(['text/plain', 'text/html']);
+    expect(store.usedBytes).toBeLessThanOrEqual(24);
+  });
+
+  it('replaces a reused snapshot when its alternate MIME blocks a response', () => {
+    const store = new OutputStore('sess_1', 24);
+    const firstOutput: NbOutput = {
+      output_type: 'display_data',
+      data: { 'text/plain': 'first', 'text/html': 'h'.repeat(18) },
+      metadata: {}
+    };
+    const original = store.intern(ADDRESS, firstOutput);
+    const tx = store.begin();
+    const first = tx.intern(ADDRESS, firstOutput);
+    const entry = toOutputEntry(firstOutput, 0, { remaining: 0, maxOutputBytes: 0 }, ADDRESS, tx);
+    const second = tx.intern({ ...ADDRESS, index: 1 }, {
+      output_type: 'display_data',
+      data: { 'text/plain': 'second', 'text/html': 'h' },
+      metadata: {}
+    });
+    tx.commit();
+
+    expect(first.outputId).not.toBe(original.outputId);
+    expect(first.mimeTypes).toEqual(['text/plain']);
+    expect(entry.mimeTypes).toEqual(['text/plain']);
+    expect(entry.snapshot?.outputId).toBe(first.outputId);
+    expect(store.peek(original.outputId)).toBeUndefined();
+    expect(store.require(first.outputId).bytes.toString()).toBe('first');
+    expect(store.require(second.outputId).bytes.toString()).toBe('second');
+  });
+
+  it('output entries advertise only retained MIME and image advice after commit', () => {
+    const store = new OutputStore('sess_1', 10);
+    const tx = store.begin();
+    const entry = toOutputEntry(png, 0, { remaining: 0, maxOutputBytes: 0 }, ADDRESS, tx);
+    tx.commit();
+    expect(entry.snapshot?.mimeTypes).toEqual(['text/plain']);
+    expect(entry.snapshot?.inlineImageAdvised).toBe(false);
+    expect(entry.snapshot?.outputId).toBeTypeOf('string');
+    expect(store.require(entry.snapshot!.outputId).bytes.toString()).toBe('<Figure>');
   });
 
   it('a stream snapshot is text and keeps the exact bytes', () => {
@@ -61,11 +139,12 @@ describe('OutputStore', () => {
       output_type: 'error',
       ename: 'ValueError',
       evalue: 'boom',
-      traceback: ['line one', 'line two']
+      traceback: ['\u001b[31mline one\u001b[0m', 'line two']
     });
     const text = snapshot.bytes.toString('utf8');
     expect(text).toContain('ValueError: boom');
     expect(text).toContain('line two');
+    expect(text).not.toContain('\u001b');
   });
 
   it('the URI carries no credential and round-trips', () => {

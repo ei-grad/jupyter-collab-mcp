@@ -121,7 +121,7 @@ describe('implicit MCP working context', () => {
 
     expect(notebookId).toMatch(/^@[A-Za-z0-9_-]+\.[1-9a-z][0-9a-z]*\.n1$/u);
     expect(cellRef).toMatch(/^@/u);
-    expect(cell).not.toHaveProperty('cell_id');
+    expect(cell['cell_id']).toMatch(/^@/u);
     expect(cell).not.toHaveProperty('source_revision');
     expect(cell).not.toHaveProperty('cell_revision');
     expect(cell).not.toHaveProperty('outputs_revision');
@@ -236,7 +236,7 @@ describe('implicit MCP working context', () => {
         notebook_id: notebookId,
         view: 'cells',
         cell_refs: [unissued]
-      }))['code']).toBe('HANDLE_EXPIRED');
+      }))['code']).toBe(unissued === aliasLike ? 'INVALID_ARGUMENT' : 'HANDLE_EXPIRED');
     }
     for (const invalidLiteral of ['raw:YQ', 'raw:_w', 'raw:QP8']) {
       expect(metaError(await connection.call('notebook_read', {
@@ -375,7 +375,7 @@ describe('implicit MCP working context', () => {
     const conflict = metaError(answer);
     expect(conflict).toMatchObject({
       code: 'REVISION_CONFLICT',
-      message: `cell_ref "${observed}" was invalidated by an earlier operation in this batch`,
+      message: `cell_ref "${observed}" is stale because the cell changed since it was read`,
       next_request_id: '1',
       request_accepted: false,
       current_cell_ref: observed,
@@ -384,7 +384,7 @@ describe('implicit MCP working context', () => {
     expect(conflict['details']).not.toHaveProperty('expected');
     expect(conflict['details']).not.toHaveProperty('current');
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
-    expect(text).toContain(`cell_ref "${observed}" was invalidated by an earlier operation in this batch`);
+    expect(text).toContain(`cell_ref "${observed}" is stale because the cell changed since it was read`);
     expect(text).toContain(`current_cell_ref=${observed}`);
     expect(text).toContain(attempted);
     expect(text).not.toMatch(/"(?:expected|current)":/u);
@@ -418,7 +418,8 @@ describe('implicit MCP working context', () => {
       message: `cell_ref "${observed}" is stale because the cell changed since it was read`,
       next_request_id: '2',
       request_accepted: false,
-      current_cell_ref: expect.stringMatching(/^@/u)
+      current_cell_ref: expect.stringMatching(/^@/u),
+      details: { index: 0, preview: 'remote source change' }
     });
     expect(conflict['current_cell_ref']).not.toBe(observed);
     const text = staleSource.content.find((block) => block.type === 'text')?.text ?? '';
@@ -654,8 +655,17 @@ describe('implicit MCP working context', () => {
     expect(fullCells.every((cell) => String(cell['source_revision']).length === 46 && String(cell['cell_revision']).length === 46 && String(cell['outputs_revision']).length === 46)).toBe(true);
     expect(compactCells.every((cell) => String(cell['cell_ref']).startsWith('@'))).toBe(true);
     expect(new Set(compactCells.map((cell) => cell['cell_ref'])).size).toBe(100);
-    expect(compactCells.every((cell) => !('cell_id' in cell) && !('source_revision' in cell) && !('cell_revision' in cell) && !('outputs_revision' in cell))).toBe(true);
+    expect(compactCells.every((cell) => String(cell['cell_id']).startsWith('@') && !('source_revision' in cell) && !('cell_revision' in cell) && !('outputs_revision' in cell))).toBe(true);
     expect(jsonByteSize(compact.structuredContent)).toBeLessThan(jsonByteSize(toWire(full)));
+    for (const view of ['cells', 'outputs']) {
+      const rejected = await connection.call('notebook_read', {
+        notebook_id: notebookId,
+        view,
+        cell_refs: compactCells.slice(0, 2).map((cell) => cell['cell_ref']),
+        limits: { max_cells: 1 }
+      });
+      expect(metaError(rejected)).toMatchObject({ code: 'INVALID_ARGUMENT' });
+    }
   });
 
   it('retries failed initialization without replacing a live context', async () => {

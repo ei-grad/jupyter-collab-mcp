@@ -140,10 +140,11 @@ export function withIdentity(
 /** Byte/count budget of a content read (SPEC.md §9). */
 export interface ReadLimits {
   readonly maxCells?: number;
-  /** UTF-8 budget for the whole answer. Default 64 KiB (SPEC.md §9). */
+  /** UTF-8 budget for source/output data; the response budget is separate. */
   readonly maxBytes?: number;
   /** Per-output UTF-8 inline payload budget; the aggregate maxBytes still applies. */
   readonly maxOutputBytes?: number;
+  readonly previewChars?: number;
 }
 
 /** Which cells to read; exactly one form, like the MCP arguments. */
@@ -161,6 +162,10 @@ export interface CellRead {
   /** Possibly truncated; see {@link sourceTruncated} and {@link sourceBytes}. */
   readonly source: string;
   readonly sourceTruncated: boolean;
+  /** UTF-8 byte offset of this page within the full source. */
+  readonly sourceOffset: number;
+  /** True only when this page contains the full source from byte zero. */
+  readonly sourceComplete: boolean;
   /** Full UTF-8 size of the source, even when truncated. */
   readonly sourceBytes: number;
   readonly metadata: Readonly<Record<string, unknown>>;
@@ -193,11 +198,13 @@ export interface CellsRead {
 export interface OutputRead {
   readonly index: number;
   readonly outputType: string;
-  /** MIME types present in the bundle; empty for `stream` and `error`. */
+  /** MIME types present in the bundle; stream and error use text/plain. */
   readonly mimeTypes: readonly string[];
   /** Full UTF-8 size of the serialised output. */
   readonly byteSize: number;
   readonly truncated: boolean;
+  readonly ename?: string;
+  readonly evalue?: string;
   /** The output itself, only when it fit the budget. */
   readonly output?: NbOutput;
   /** Short text excerpt of a truncated textual output, within the budget. */

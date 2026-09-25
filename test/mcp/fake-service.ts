@@ -133,6 +133,7 @@ const SUMMARY: NotebookSummary = {
       outputsRevision: OUT,
       executionCount: 3,
       executionState: 'idle',
+      hasError: false,
       preview: 'df.head()'
     },
     {
@@ -144,6 +145,7 @@ const SUMMARY: NotebookSummary = {
       cellRevision: CELL,
       outputsRevision: null,
       executionCount: null,
+      hasError: false,
       preview: '# Notes'
     }
   ],
@@ -332,6 +334,7 @@ export class FakeCollabService implements CollabService {
         cellRevision: CELL,
         outputsRevision: OUT,
         executionCount: null,
+        hasError: false,
         preview: index === 0 && this.options.refLikePreview?.value !== undefined
           ? this.options.refLikePreview.value
           : `# a fairly long preview line number ${String(index)} ${'x'.repeat(200)}`
@@ -394,6 +397,8 @@ export class FakeCollabService implements CollabService {
             cellType: 'code',
             source: selectedCellId === 'cell_a' ? 'df.head()' : `source for ${selectedCellId}`,
             sourceTruncated: false,
+            sourceOffset: 0,
+            sourceComplete: true,
             sourceBytes: 9,
             metadata:
               this.options.oversizedMetadata === true || this.options.oversizedMetadataSwitch?.value === true
@@ -433,6 +438,8 @@ export class FakeCollabService implements CollabService {
           }
         ],
         notebookMetadataRevision: NBMETA,
+        cellsTruncated: false,
+        outputsTruncated: false,
         truncated: false
       };
     }
@@ -462,6 +469,7 @@ export class FakeCollabService implements CollabService {
           outputId: 'out_1',
           uri: 'jupyter-output:out_1',
           mimeTypes: ['image/png'],
+          mimeType: 'image/png',
           byteSize: png.length,
           inlineImageAdvised: this.options.bigImage !== true,
           lifetime: LIFETIME_JOB
@@ -508,6 +516,10 @@ export class FakeCollabService implements CollabService {
           cellId: 'cell_a',
           state: failed ? 'failed' : 'succeeded',
           sourceRevision: SRC,
+          sentObservation: {
+            cellId: 'cell_a', identityToken: 'identity-cell-a',
+            sourceRevision: SRC, cellRevision: CELL, outputsRevision: OUT
+          },
           ...(this.options.executionCellUnavailable === true
             ? {}
             : {
@@ -618,6 +630,8 @@ export class FakeCollabService implements CollabService {
       notebookId: request.notebookId,
       saveStatus: confirmed ? 'success' as const : 'skipped' as const,
       revisionPersistence: confirmed ? 'confirmed' as const : 'unknown' as const,
+      externalChangeDetected: false,
+      overwroteExternalChange: false,
       persistenceConfirmation: confirmed
         ? {
             method: 'contents-api-readback' as const,
@@ -670,6 +684,7 @@ export class FakeCollabService implements CollabService {
   async kernelControl(request: KernelControlRequest): Promise<WithEnvelope<KernelControlResult>> {
     return this.record('kernelControl', request, {
       notebookId: request.notebookId,
+      notebookMetadataRevision: NBMETA,
       action: request.action,
       previousKernelId: null,
       kernelId: 'k_1',

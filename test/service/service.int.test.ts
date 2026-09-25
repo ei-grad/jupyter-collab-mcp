@@ -151,6 +151,106 @@ describe('server and session lifecycle', () => {
     await service.sessionClose({ sessionId: session.sessionId });
   });
 
+  it('close detects a real kernel session created before the notebook is opened', async () => {
+    const target = { baseUrl: stand.baseUrl, token: stand.token };
+    const session = await service.sessionOpen({});
+    const created = await service.notebookCreate({
+      sessionId: session.sessionId,
+      requestId: '1',
+      directory: '',
+      name: nb('existing-kernel')
+    });
+    await service.notebookClose({ notebookId: created.notebook.notebookId });
+    const external = await apiFetchOk(target, '/api/sessions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: created.notebook.path, type: 'notebook', name: created.notebook.path, kernel: { name: 'python3' } })
+    }, [201]);
+    const externalId = String(external.json<{ id: string }>().id);
+    try {
+      const reopened = await service.notebookOpen({ sessionId: session.sessionId, path: created.notebook.path });
+      const closed = await service.notebookClose({ notebookId: reopened.notebook.notebookId });
+      expect(closed.kernelLeftRunning).toBe(true);
+      expect((await service.notebookClose({ notebookId: reopened.notebook.notebookId })).kernelLeftRunning).toBe(true);
+    } finally {
+      await apiFetchOk(target, `/api/sessions/${externalId}`, { method: 'DELETE' }, [204, 404]);
+      await service.sessionClose({ sessionId: session.sessionId });
+    }
+  }, 60_000);
+
+  it('close preserves an execution started during its Sessions lookup', async () => {
+    let holdClose = false;
+    let release: (() => void) | undefined;
+    let reached: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = new Promise<void>((resolve) => { reached = resolve; });
+    const raceService = createCollabService({
+      servers: [{
+        id: 'stand', kind: 'standalone', apiBaseUrl: stand.baseUrl,
+        wsBaseUrl: stand.wsUrl, credentialRef: `literal:${stand.token}`
+      }]
+    }, {
+      fetchImpl: async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input.toString());
+        if (holdClose && url.pathname === '/api/sessions' && (init?.method ?? 'GET') === 'GET') {
+          holdClose = false;
+          reached?.();
+          await gate;
+        }
+        return fetch(input, init);
+      }
+    });
+    let notebookId: string | undefined;
+    let kernelId: string | undefined;
+    try {
+      const session = await raceService.sessionOpen({});
+      const created = await raceService.notebookCreate({
+        sessionId: session.sessionId, requestId: '1', directory: '', name: nb('close-race')
+      });
+      notebookId = created.notebook.notebookId;
+      const applied = await raceService.notebookApply({
+        notebookId, requestId: created.nextRequestId!,
+        operations: [{ op: 'add_cell', cellType: 'code', source: 'import time; time.sleep(10)', position: 'end' }]
+      });
+      const target = applied.results[0]!;
+      const started = await raceService.kernelControl({
+        notebookId, requestId: applied.nextRequestId!,
+        action: 'start', expectedKernelId: null, kernelName: 'python3'
+      });
+      kernelId = started.kernelId!;
+      const deadline = Date.now() + 30_000;
+      while ((await raceService.kernelStatus({ notebookId })).executionStatus !== 'idle') {
+        if (Date.now() > deadline) throw new Error('kernel did not become idle');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      holdClose = true;
+      const close = raceService.notebookClose({ notebookId });
+      await waiting;
+      const job = await raceService.notebookExecute({
+        notebookId, requestId: started.nextRequestId!,
+        cells: [{ cellId: target.cellId!, expectedSourceRevision: target.sourceRevision! }],
+        waitMs: 0
+      });
+      expect(job.state).toBe('running');
+      release?.();
+      expect(await codeOf(() => close)).toBe('EXECUTION_ACTIVE');
+      expect((await raceService.notebookRead({ notebookId, view: 'summary' })).notebookId).toBe(notebookId);
+    } finally {
+      release?.();
+      if (notebookId !== undefined) {
+        await raceService.notebookClose({ notebookId, force: true });
+      }
+      await raceService.shutdown('client_request');
+      if (kernelId !== undefined) {
+        await apiFetchOk(
+          { baseUrl: stand.baseUrl, token: stand.token },
+          `/api/kernels/${kernelId}`, { method: 'DELETE' }, [204, 404]
+        );
+      }
+    }
+  }, 90_000);
+
   it('disposes a real ready replica that completes after session_close', async () => {
     const allocated = await apiFetchOk(
       { baseUrl: stand.baseUrl, token: stand.token },
@@ -573,6 +673,23 @@ describe('kernels and execution', () => {
     expect(cell.state).toBe('succeeded');
     expect(cell.sourceChanged).toBe(false);
     expect(cell.cellDeleted).toBe(false);
+
+    const editedAfterRun = await service.notebookApply({
+      notebookId,
+      requestId: counter.value,
+      operations: [{
+        op: 'replace_text',
+        cellId,
+        expectedSourceRevision: revision,
+        oldText: 'hello from the kernel',
+        newText: 'changed after run'
+      }]
+    });
+    counter.take(editedAfterRun.nextRequestId);
+    const later = (await service.executionGet({ executionId: job.executionId })).cells[0]!;
+    expect(later.sourceChanged).toBe(true);
+    expect(later.sentObservation?.sourceRevision).toBe(revision);
+    expect(later.currentObservation?.sourceRevision).not.toBe(revision);
 
     // -- the shared document carries the terminal count and idle ------------
     const readOutputs = await service.notebookRead({

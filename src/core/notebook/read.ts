@@ -13,6 +13,7 @@
 import type { YCellType, YCodeCell, YNotebook } from '@jupyter/ydoc';
 
 import { coreError } from '../errors.js';
+import { stripAnsi } from '../ansi.js';
 import type { JsonValue } from '../revision.js';
 import {
   cellRevision,
@@ -149,6 +150,7 @@ export function summaryRow(
     cellRevision: cellRevision(cellJson(cell)),
     outputsRevision: code ? outputsRevision(outputsOf(cell)) : null,
     executionCount: code ? cell.execution_count : null,
+    hasError: code && outputsOf(cell).some((output) => output.output_type === 'error'),
     ...(state === undefined ? {} : { executionState: state }),
     preview: previewOf(source, previewChars),
     ...(duplicate ? { duplicateId: true } : {})
@@ -312,6 +314,8 @@ export function readCells(
       cellType: type,
       source: cut.text,
       sourceTruncated: cut.text.length !== remainder.length,
+      sourceOffset: position === 0 ? sourceOffset : 0,
+      sourceComplete: (position !== 0 || sourceOffset === 0) && cut.text.length === remainder.length,
       sourceBytes: utf8Length(full),
       metadata: (cell.getMetadata() ?? {}) as Record<string, unknown>,
       ...(attachments === undefined || attachments === null
@@ -348,6 +352,7 @@ export function readCells(
 const MAX_TEXT_PREVIEW_BYTES = 2048;
 
 function mimeTypesOf(output: NbOutput): string[] {
+  if (output.output_type === 'stream' || output.output_type === 'error') return ['text/plain'];
   const data = (output as { data?: Record<string, unknown> }).data;
   return data === undefined || data === null ? [] : Object.keys(data).sort();
 }
@@ -356,7 +361,9 @@ function textOf(output: NbOutput): string | null {
   if (output.output_type === 'stream') {
     return typeof output.text === 'string' ? output.text : output.text.join('');
   }
-  if (output.output_type === 'error') return output.traceback.join('\n');
+  if (output.output_type === 'error') {
+    return stripAnsi([output.ename + ': ' + output.evalue, ...output.traceback].join('\n'));
+  }
   const plain = (output as { data?: Record<string, unknown> }).data?.['text/plain'];
   if (typeof plain === 'string') return plain;
   if (Array.isArray(plain)) return plain.join('');
@@ -397,23 +404,33 @@ export function readOutputs(
           mimeTypes: mimeTypesOf(output),
           byteSize,
           truncated: false,
+          ...(output.output_type === 'error'
+            ? { ename: output.ename, evalue: output.evalue }
+            : {}),
           output
         });
         continue;
       }
-      cellTruncated = true;
-      anyTruncated = true;
       const text = textOf(output);
       const previewBudget = Math.min(remaining, maxOutputBytes, MAX_TEXT_PREVIEW_BYTES);
       const preview =
-        text === null || previewBudget <= 0 ? undefined : truncateUtf8(text, previewBudget).text;
+        text === null || previewBudget <= 0
+          ? undefined
+          : truncateUtf8(text.slice(0, limits.previewChars ?? 512), previewBudget).text;
+      const textTruncated = text === null || preview !== text ||
+        mimeTypesOf(output).some((mime) => mime !== 'text/plain');
+      cellTruncated ||= textTruncated;
+      anyTruncated ||= textTruncated;
       if (preview !== undefined) used += utf8Length(preview);
       reads.push({
         index: position,
         outputType: output.output_type,
         mimeTypes: mimeTypesOf(output),
         byteSize,
-        truncated: true,
+        truncated: textTruncated,
+        ...(output.output_type === 'error'
+          ? { ename: output.ename, evalue: output.evalue }
+          : {}),
         ...(preview === undefined || preview === '' ? {} : { textPreview: preview })
       });
     }

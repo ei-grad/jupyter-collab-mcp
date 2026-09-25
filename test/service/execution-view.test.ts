@@ -184,6 +184,19 @@ describe('buildExecutionView', () => {
     expect(store.size).toBe(1);
   });
 
+  it('honors preview_chars in execution output entries', () => {
+    const store = new OutputStore('sess_1', 1024 * 1024);
+    const view = buildExecutionView(recordFor(store), snapshotOf([
+      { output_type: 'stream', name: 'stdout', text: 'a'.repeat(500) }
+    ]), {
+      limits: DEFAULT_SERVICE_LIMITS,
+      requested: { maxOutputBytes: 32, previewChars: 10 },
+      waitTimedOut: false,
+      outputs: store
+    });
+    expect(view.cells[0]!.outputs[0]!.textPreview).toBe('a'.repeat(10));
+  });
+
   it('the same output read twice reuses one snapshot', () => {
     const store = new OutputStore('sess_1', 1024 * 1024);
     const png: NbOutput = {

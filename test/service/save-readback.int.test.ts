@@ -47,3 +47,20 @@ it('confirms a source edit with metadata, attachments and outputs against the ac
   expect(file.cells[0].metadata['__proto__']).toEqual({ cell_metadata: 'preserved' });
   expect(file.metadata['__proto__']).toEqual({ notebook_metadata: 'preserved' });
 });
+
+it('detects a direct disk edit without claiming an unconfirmed overwrite', async () => {
+  const opened = await service.notebookOpen({ path: name });
+  const target = captureNotebookPersistence(handle.notebook);
+  const disk = JSON.parse(await readFile(join(stand.root, name), 'utf8'));
+  disk.cells[0].source = ['external disk edit'];
+  await writeFile(join(stand.root, name), JSON.stringify(disk));
+
+  const saved = await service.notebookSave({ notebookId: opened.notebook.notebookId, timeoutMs: 10000 });
+  expect(saved).toMatchObject({ saveStatus: 'success', externalChangeDetected: true });
+  if (saved.revisionPersistence === 'confirmed') {
+    expect(saved.overwroteExternalChange).toBe(true);
+    expect(notebookPersistenceDigest(JSON.parse(await readFile(join(stand.root, name), 'utf8')))).toBe(target);
+  } else {
+    expect(saved.overwroteExternalChange).toBeNull();
+  }
+});

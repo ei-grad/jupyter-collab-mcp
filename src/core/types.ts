@@ -210,6 +210,8 @@ export interface CellSummary {
   readonly outputsRevision: OutputsRevision | null;
   /** `null` for a never-run or freshly cleared code cell, and for non-code. */
   readonly executionCount: number | null;
+  /** An error output is currently present in this cell. */
+  readonly hasError: boolean;
   /** Present only when the shared model carries one. */
   readonly executionState?: SharedExecutionState;
   /** Short, length-limited excerpt of the source. Never the whole text. */

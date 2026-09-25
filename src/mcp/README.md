@@ -83,10 +83,12 @@ For every output, the adapter decides as follows (SPEC §9):
    `imageMaxBytes` (128 KiB by default), return MCP `image` content; remove the
    payload from `structuredContent` and mark it `delivered_as: "image"` so the
    base64 is not duplicated;
-2. if a `snapshot` exists, return a `resource_link` to
-   `jupyter-output:<output_id>`;
-3. otherwise retain `mime_types`, `byte_size`, and `output_id`, to be read via
-   `output_read`.
+2. if output bytes remain out of line and a `snapshot` exists, return a
+   `resource_link` to `jupyter-output:<output_id>`;
+3. otherwise keep the inlined output or complete text preview in the result.
+   A snapshot can still be present for an inlined output as a recovery path.
+   `output_read` defaults to `text/plain` and accepts `mime_type` for another
+   representation.
 
 The `resources` capability is declared without subscriptions:
 `resources/list` returns the live snapshots of this connection's working

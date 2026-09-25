@@ -47,6 +47,29 @@ function assertBounded(result: NotebookOutputsReadResult) {
   }
 }
 
+it('distinguishes complete text previews from unread outputs and cell pages', async () => {
+  const { service, notebook, ids } = await rig({ outputTexts: ['x'.repeat(298)] });
+  const completeText = await service.notebookRead({
+    notebookId: notebook.notebookId,
+    view: 'outputs', cellIds: [ids[0]!], limits: { maxBytes: 300 }
+  });
+  expect(completeText).toMatchObject({
+    truncated: false, cellsTruncated: false, outputsTruncated: false
+  });
+  expect(completeText.nextCursor).toBeUndefined();
+  expect(completeText.cells[0]!.outputs[0]).toMatchObject({
+    truncated: false, outputInlined: false, textPreview: 'x'.repeat(298)
+  });
+  expect(completeText.cells[0]!.outputs[0]!.snapshot).toBeUndefined();
+
+  const page = await service.notebookRead({
+    notebookId: notebook.notebookId,
+    view: 'outputs', limits: { maxCells: 1, maxBytes: 300 }
+  });
+  expect(page).toMatchObject({ truncated: true, cellsTruncated: true, outputsTruncated: false });
+  expect(page.nextCursor).toBeDefined();
+});
+
 it.each(['explicit', 'implicit', 'cursor'] as const)('bounds notebook outputs for %s selection and preserves snapshot retrieval', async (selection) => {
   const { service, notebook, ids } = await rig();
   const first = await service.notebookRead({ notebookId: notebook.notebookId, view: 'outputs',

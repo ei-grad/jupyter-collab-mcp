@@ -20,6 +20,7 @@ export {
   redactCredentials,
   toCoreError
 } from './errors.js';
+export { stripAnsi } from './ansi.js';
 export type {
   CoreErrorOverrides,
   ErrorCode,

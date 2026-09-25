@@ -159,9 +159,6 @@ interface ToolErrorContext {
   readonly args: WireValue;
 }
 
-const INTRA_BATCH_REVISION_CONFLICT =
-  'the expected revision predates an earlier operation of this batch';
-
 const CELL_ERROR_CONTENT_KEYS = new Set([
   'attachments',
   'metadata',
@@ -257,9 +254,7 @@ function projectSubmittedCellError(
   }
   return {
     ...wire,
-    message: wire.message === INTRA_BATCH_REVISION_CONFLICT
-      ? `${subject} was invalidated by an earlier operation in this batch`
-      : `${subject} is stale because the cell changed since it was read`,
+    message: `${subject} is stale because the cell changed since it was read`,
     details
   };
 }
@@ -555,16 +550,23 @@ function extractOutputContent(tool: string, payload: WireObject, options: Resolv
       blocks.push({ type: 'image', data: image.data, mimeType: image.mimeType });
       delete next['output'];
       next['delivered_as'] = 'image';
+      next['output_inlined'] = false;
+      next['truncated'] = true;
+    } else if (image !== undefined && snapshot !== undefined) {
+      delete next['output'];
+      next['output_inlined'] = false;
       next['truncated'] = true;
     }
 
-    if (snapshot !== undefined && links < options.maxResourceLinks) {
+    if (snapshot !== undefined && next['output'] === undefined && next['delivered_as'] !== 'image' && links < options.maxResourceLinks) {
       const uri = snapshot['uri'];
       if (typeof uri === 'string' && !seenUris.has(uri)) {
         seenUris.add(uri);
         links++;
         const mimeTypes = snapshot['mime_types'];
-        const mimeType = Array.isArray(mimeTypes) && typeof mimeTypes[0] === 'string' ? mimeTypes[0] : undefined;
+        const mimeType = typeof snapshot['mime_type'] === 'string'
+          ? snapshot['mime_type']
+          : Array.isArray(mimeTypes) && typeof mimeTypes[0] === 'string' ? mimeTypes[0] : undefined;
         blocks.push({
           type: 'resource_link',
           uri,
@@ -625,9 +627,9 @@ function cellLines(cells: WireValue | undefined): string[] {
   return cells.flatMap((cell) => {
     if (!isObject(cell)) return '  -';
     const state = cell['state'] ?? cell['execution_state'];
-    const row = `  index=${s(cell['index'])} cell_ref=${s(cell['cell_ref'])} type=${s(cell['cell_type'] ?? state)} ${s(cell['preview'] ?? cell['state'] ?? '')}`.trimEnd();
+    const row = `  index=${s(cell['index'])}${cell['cell_id'] === undefined ? '' : ` cell_id=${s(cell['cell_id'])}`} cell_ref=${s(cell['cell_ref'])} type=${s(cell['cell_type'] ?? state)}${cell['has_error'] === true ? ' has_error=true' : ''} ${s(cell['preview'] ?? cell['state'] ?? '')}`.trimEnd();
     return typeof cell['source'] === 'string'
-      ? [row, `    source=${JSON.stringify(cell['source'])}`]
+      ? [row, `    source_offset=${s(cell['source_offset'])} source_complete=${s(cell['source_complete'])} source=${JSON.stringify(cell['source'])}`]
       : [row];
   });
 }
@@ -825,7 +827,7 @@ function summarizeOutput(output: WireObject): string {
 function renderOutputReference(output: WireObject): string {
   const snapshot = nested(output, 'snapshot');
   if (typeof snapshot['output_id'] === 'string') {
-    return `output_id=${snapshot['output_id']} — call output_read with this id`;
+    return `${output['output_type'] === 'error' ? `${summarizeOutput(output)} ` : ''}output_id=${snapshot['output_id']} — call output_read with this id`;
   }
   const raw = output['output'];
   return raw === undefined ? summarizeOutput(output) : JSON.stringify(raw);
@@ -1009,7 +1011,7 @@ function buildResult(
     });
   }
   try {
-    const wire = publicResult(tool, staged.value);
+    const wire = hoistOutputLifetime(publicResult(tool, staged.value));
     const base: WireObject = typeof wire === 'object' && wire !== null && !Array.isArray(wire) ? wire : { result: wire };
     const extracted = extractOutputContent(tool, base, options);
     let bounded;
@@ -1080,6 +1082,23 @@ function resultRecoveryDetails(value: WireValue): Record<string, WireValue> {
   return kept;
 }
 
+function hoistOutputLifetime(value: WireValue): WireValue {
+  if (!isObject(value) || !Array.isArray(value['cells'])) return value;
+  let lifetime: WireValue | undefined;
+  const cells = value['cells'].map((cell) => {
+    if (!isObject(cell) || !Array.isArray(cell['outputs'])) return cell;
+    const outputs = cell['outputs'].map((entry) => {
+      if (!isObject(entry) || !isObject(entry['snapshot'])) return entry;
+      const snapshot = entry['snapshot'];
+      if (snapshot['lifetime'] !== undefined) lifetime = snapshot['lifetime'];
+      const { lifetime: _lifetime, ...withoutLifetime } = snapshot;
+      return { ...entry, snapshot: withoutLifetime };
+    });
+    return { ...cell, outputs };
+  });
+  return { ...value, cells, ...(lifetime === undefined ? {} : { output_lifetime: lifetime }) };
+}
+
 /** Expose connection lifetime without rewriting arbitrary notebook values. */
 function publicResult(tool: string, value: WireValue): WireValue {
   const projected = publicCommon(value);
@@ -1090,6 +1109,12 @@ function publicResult(tool: string, value: WireValue): WireValue {
       projected['notebook_ref'] = summary['notebook_ref'];
     }
   }
+  if (tool === 'notebook_read' && isObject(projected['summary'])) {
+    const { notebook_id: _notebookId, changes_cursor: _changesCursor,
+      structure_revision: _structureRevision, notebook_ref: _notebookRef,
+      ...summary } = projected['summary'];
+    projected['summary'] = summary;
+  }
   if (tool === 'notebook_execute' || tool === 'execution_get') {
     const cells = projected['cells'];
     if (!Array.isArray(cells)) return projected;
@@ -1098,10 +1123,14 @@ function publicResult(tool: string, value: WireValue): WireValue {
       cells: cells.map((entry) => {
         if (!isObject(entry)) return entry;
         const observation = entry['current_observation'];
-        const { cell_id: _cellId, source_revision: _sentRevision, current_observation: _observation, ...rest } = entry;
+        const sent = entry['sent_observation'];
+        const { cell_id: _cellId, source_revision: _sentRevision, current_observation: _observation, sent_observation: _sent, ...rest } = entry;
+        const withSent = isObject(sent) && typeof sent['cell_ref'] === 'string'
+          ? { ...rest, sent_cell_ref: sent['cell_ref'] }
+          : rest;
         return isObject(observation) && typeof observation['cell_ref'] === 'string'
-          ? { ...rest, cell_ref: observation['cell_ref'] }
-          : { ...rest, cell_ref_unavailable: true };
+          ? { ...withSent, cell_ref: observation['cell_ref'] }
+          : { ...withSent, cell_ref_unavailable: true };
       })
     };
   }

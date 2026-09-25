@@ -241,12 +241,23 @@ export class ReferenceAliases {
     ) {
       const notebook = String(resolved['notebook_id']);
       const { cell_refs: _refs, ...rest } = resolved;
+      const selectors = resolved['cell_refs'].map((ref) => {
+        const value = String(ref);
+        if (this.#byAlias.get('cell')!.has(value)) {
+          return { cellId: this.resolve('cell', value, notebook) };
+        }
+        if (/^@[^\s]+\.c[0-9]+$/u.test(value)) {
+          throw coreError('INVALID_ARGUMENT', 'cell_id was not issued for this notebook connection');
+        }
+        const observed = this.#observed(value, notebook);
+        return { cellId: observed.cellId, identityToken: observed.identityToken };
+      });
       return {
         ...rest,
-        observed_cells: resolved['cell_refs'].map((ref) => {
-          const observed = this.#observed(String(ref), notebook);
-          return { cell_id: observed.cellId, identity_token: observed.identityToken };
-        })
+        cell_ids: selectors.map((selector) => selector.cellId),
+        observed_cells: selectors
+          .filter((selector) => selector.identityToken !== undefined)
+          .map((selector) => ({ cell_id: selector.cellId, identity_token: selector.identityToken }))
       };
     }
     if (tool === 'notebook_execute' && Array.isArray(resolved['cells'])) {
@@ -363,7 +374,12 @@ export class ReferenceAliases {
         outputsRevision: typeof value['outputs_revision'] === 'string' ? value['outputs_revision'] : null
       });
       mapped['cell_ref'] = ref;
-      for (const key of ['cell_id', 'identity_token', 'source_revision', 'cell_revision', 'outputs_revision']) delete mapped[key];
+      if (typeof value['cell_type'] === 'string' && typeof value['index'] === 'number') {
+        mapped['cell_id'] = transform('cell', value['cell_id'] as string, ownNotebook);
+      } else {
+        delete mapped['cell_id'];
+      }
+      for (const key of ['identity_token', 'source_revision', 'cell_revision', 'outputs_revision']) delete mapped[key];
     } else if (observedNotebook) {
       mapped['notebook_ref'] = this.#presentObservedNotebook({
         notebook: ownNotebook,

@@ -143,7 +143,13 @@ describe('readCells (SPEC.md §9)', () => {
     const read = peer.model.readCells({ cellIds: ['a'] }, { maxBytes: 100 }).cells[0]!;
     expect(read.source).toHaveLength(100);
     expect(read.sourceTruncated).toBe(true);
+    expect(read.sourceOffset).toBe(0);
+    expect(read.sourceComplete).toBe(false);
     expect(read.sourceBytes).toBe(5000);
+    const first = peer.model.readCells(undefined, { maxBytes: 3000 });
+    const second = peer.model.readCells({ cursor: first.nextCursor! }, { maxBytes: 3000 });
+    expect(second.cells[0]).toMatchObject({ sourceOffset: 3000, sourceComplete: false, sourceTruncated: false });
+    expect(first.cells[0]!.source + second.cells[0]!.source).toBe(long);
   });
 
   it('stops at maxCells and hands out a page cursor', () => {
@@ -178,6 +184,23 @@ describe('readCells (SPEC.md §9)', () => {
 });
 
 describe('readOutputs (SPEC.md §9: no full base64 in every answer)', () => {
+  it('keeps error identity outside the preview budget and removes ANSI from the preview', () => {
+    const peer = makePeer(notebookWith([codeCell('a', '1/0', {
+      outputs: [{
+        output_type: 'error',
+        ename: 'ZeroDivisionError',
+        evalue: 'division by zero',
+        traceback: ['\u001b[31mZeroDivisionError\u001b[0m: division by zero']
+      }]
+    })]));
+    cleanups.push(() => peer.dispose());
+    const summary = peer.model.summary().cells[0]!;
+    expect(summary.hasError).toBe(true);
+    const entry = peer.model.readOutputs(['a'], { maxBytes: 20 }).cells[0]!.outputs[0]!;
+    expect(entry).toMatchObject({ ename: 'ZeroDivisionError', evalue: 'division by zero' });
+    expect(entry.textPreview).not.toContain('\u001b');
+  });
+
   it('enforces per-output bytes without replacing the aggregate budget', () => {
     const output = { output_type: 'stream', name: 'stdout', text: 'x'.repeat(75) };
     const peer = makePeer(notebookWith([codeCell('a', 'print()', { outputs: [output, output] })]));

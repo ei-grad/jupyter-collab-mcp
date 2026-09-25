@@ -248,7 +248,7 @@ describe('output snapshots stay inside their working context', () => {
       view: 'summary'
     }));
     expect(summaryText).toContain('index=24 ');
-    const firstCellRef = /^\s*index=0 cell_ref=(\S+)/mu.exec(summaryText)?.[1];
+    const firstCellRef = /^\s*index=0 cell_id=\S+ cell_ref=(\S+)/mu.exec(summaryText)?.[1];
     expect(firstCellRef).toBeDefined();
 
     const recoveredSources: string[] = [];
@@ -259,7 +259,7 @@ describe('output snapshots stay inside their working context', () => {
         view: 'cells',
         ...(sourceCursor === undefined ? {} : { cursor: sourceCursor })
       }));
-      for (const match of text.matchAll(/^\s*source=(".*")$/gmu)) {
+      for (const match of text.matchAll(/^\s*source_offset=\d+ source_complete=(?:true|false) source=(".*")$/gmu)) {
         recoveredSources.push(JSON.parse(match[1]!) as string);
       }
       sourceCursor = textField(text, 'next_cursor');

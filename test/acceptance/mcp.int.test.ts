@@ -450,6 +450,9 @@ describe('Tool coverage / Concurrent edits (SPEC §12)', () => {
         ...(cursor === undefined ? { cell_refs: [cellRef] } : { cursor }),
         limits: { max_bytes: 16_384 }
       });
+      const firstCell = list(page['cells'])[0]!;
+      expect(firstCell['source_offset']).toBe(Buffer.byteLength(chunks.join(''), 'utf8'));
+      expect(firstCell['source_complete']).toBe(false);
       chunks.push(...list(page['cells'])
         .filter((cell) => cell['cell_ref'] !== undefined)
         .map((cell) => str(cell['source'])));
@@ -641,6 +644,13 @@ describe('Bidirectional RTC / Cursors (SPEC §12)', () => {
       expect(list(summary['cells']).some((cell) => str(cell['preview']).includes('written by a person'))).toBe(
         true
       );
+      const addedEvent = remoteEvents.find((event) => event['kind'] === 'cell_added')!;
+      const addedRow = list(summary['cells']).find((cell) => str(cell['preview']).includes('written by a person'))!;
+      expect(addedRow['cell_id']).toBe(addedEvent['cell_id']);
+      const selected = await mcp.call('notebook_read', {
+        notebook_id: docId, view: 'cells', cell_refs: [addedEvent['cell_id']]
+      });
+      expect(list(selected['cells'])[0]?.['source']).toBe('written by a person');
 
       // The other direction: our edit reaches the independent client.
       const applied = await mcp.call('notebook_apply', {
@@ -875,8 +885,11 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     const stopped = await mcp.call('kernel_control', shutdownPayload);
     const shutdownReplay = await mcp.call('kernel_control', { ...shutdownPayload, kernel_name: 'ignored' });
     expect(stopped['kernel_id']).toBeNull();
+    expect(stopped['notebook_ref']).toMatch(/^@/u);
     expect(shutdownReplay['replayed']).toBe(true);
     expect(shutdownReplay['kernel_id']).toBeNull();
+    const closed = await mcp.call('notebook_close', { notebook_id: notebookId });
+    expect(closed['kernel_left_running']).toBe(false);
     await mcp.close();
   }, 120_000);
 
@@ -967,7 +980,10 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     });
     const payload = obj(answer.structuredContent);
     const entries = list(list(payload['cells'])[0]?.['outputs']);
-    const snapshotEntry = entries.find((entry) => obj(entry['snapshot'])['output_id'] !== undefined);
+    const snapshotEntry = entries.find((entry) =>
+      obj(entry['snapshot'])['output_id'] !== undefined &&
+      Array.isArray(entry['mime_types']) && (entry['mime_types'] as string[]).includes('image/png')
+    );
     expect(snapshotEntry, 'a large output keeps only an output_id').toBeDefined();
     const snapshot = obj(snapshotEntry?.['snapshot']);
     snapshotOutputId = str(snapshot['output_id']);
@@ -981,7 +997,7 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     );
   }, 180_000);
 
-  it('output_read pages the PNG snapshot without ever resending a byte', async () => {
+  it('output_read pages its default MIME and can select PNG bytes', async () => {
     const first = await mcp.call('output_read', {
       output_id: snapshotOutputId,
       limits: { max_bytes: 8 }
@@ -1011,6 +1027,14 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     }
     expect(pages).toBeGreaterThan(1);
     expect(assembled.byteLength).toBe(snapshotBytes);
+    const png = await mcp.call('output_read', {
+      output_id: snapshotOutputId,
+      mime_type: 'image/png',
+      limits: { max_bytes: 64 }
+    });
+    expect(png['mime_type']).toBe('image/png');
+    expect(png['encoding']).toBe('base64');
+    expect(Buffer.from(str(png['data']), 'base64').subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
   }, 60_000);
 
   it('serves the same snapshot through resources/list and resources/read', async () => {
@@ -1052,6 +1076,34 @@ describe('External kernel / Outputs / Limits (SPEC §12)', () => {
     expect(text).toContain('hello from the kernel');
     expect(text).toContain('written by a person');
   }, 60_000);
+
+  it('keeps kernel error identity readable outside a cleaned traceback preview', async () => {
+    const added = await mcp.call('notebook_apply', {
+      notebook_id: docId,
+      request_id: main.counter.value,
+      operations: [{ op: 'add_cell', cell_type: 'code', source: '1/0', position: 'end' }]
+    });
+    main.counter.take(added);
+    const cellRef = str(list(added['results'])[0]?.['cell_ref']);
+    const executed = await mcp.call('notebook_execute', {
+      notebook_id: docId,
+      request_id: main.counter.value,
+      cells: [{ cell_ref: cellRef }],
+      wait_ms: 30_000,
+      limits: { max_output_bytes: 80 }
+    });
+    main.counter.take(executed);
+    expect(executed['state']).toBe('failed');
+    const output = list(list(executed['cells'])[0]?.['outputs']).find((entry) => entry['output_type'] === 'error')!;
+    expect(output).toMatchObject({ ename: 'ZeroDivisionError', evalue: 'division by zero' });
+    expect(str(output['text_preview'])).not.toContain('\u001b');
+    const snapshot = obj(output['snapshot']);
+    const read = await mcp.call('output_read', { output_id: snapshot['output_id'] });
+    expect(read['mime_type']).toBe('text/plain');
+    expect(str(read['data'])).not.toContain('\u001b');
+    const summary = obj((await mcp.call('notebook_read', { notebook_id: docId, view: 'summary' }))['summary']);
+    expect(list(summary['cells']).find((cell) => cell['preview'] === '1/0')?.['has_error']).toBe(true);
+  }, 90_000);
 });
 
 describe('Interruption and cancellation (SPEC §12)', () => {

@@ -35,7 +35,7 @@ line numbers or reconstructed identifiers.
 
 `notebook_read {notebook_id, view}` with `view`:
 
-- `summary` - `cell_ref`, types, source previews, and `execution_count`.
+- `summary` - `cell_ref`, `cell_id`, types, source previews, and `execution_count`.
 - `cells` - full source, metadata, attachments (`cell_refs` or a `cursor`).
 - `outputs` - output entries with `mime_types`, `byte_size`, `truncated`,
   `output_id`.
@@ -46,14 +46,18 @@ read also returns a `notebook_ref` for notebook metadata. Pass refs back exactly
 as returned; they are scoped to this connection and notebook handle. A read by
 `cell_refs` refreshes the observation only while the same cell object remains
 live. A deleted or replacement object fails instead of redirecting the ref to a
-new cell with the same internal ID. If a cells read reports a source cursor,
-continue it before acting on the incomplete source. Page cursors and
+new cell with the same internal ID. A source page gives `source_offset` and
+`source_complete`; assemble all pages before using `replace_source`. If a cells
+read reports a source cursor, continue it before acting on the incomplete source. Page cursors and
 `changes_cursor` are different types and are not interchangeable.
 
-Change events do not issue observed refs. Their `cell_id` and revisions identify
-that historical event; they are not a `cell_ref` and cannot target an edit. They
-do not contain the complete atomic identity and guard observation needed to
-issue a ref later.
+Match change events to read rows by `cell_id`. `cell_refs` in a cells or outputs
+read also accepts a `cell_id` from this connection and returns a fresh
+`cell_ref` for the current cell. A `cell_id` cannot target an edit or run.
+After `source_changed`, re-read that cell before editing or executing it;
+`outputs_changed` leaves its `cell_ref` valid for source edits and execution.
+After `cell_deleted`, discard its ref. A local mutation response already gives
+current refs for surviving targets. Change events do not issue observed refs.
 
 ## 3. Edits and visible execution
 
@@ -103,7 +107,9 @@ An explicitly requested unavailable name is an error, not a fallback.
 - If the answer to a mutation was lost, resend the *same* `request_id` with the
   *same* payload to learn what happened. `replayed: true` plus
   `first_accepted_at` means the operation was accepted earlier: do not report
-  it as a fresh insertion or a fresh run.
+  it as a fresh insertion or a fresh run. Only `next_request_id` is current;
+  refs, indices, revisions and cursors in the replayed result may be stale.
+  Re-read before dependent work.
 - Never re-issue an unknown effect under a new number. A genuinely new,
   identical operation needs a fresh number and is a new operation.
 - Errors: `REQUEST_ID_CONFLICT` (same number, different payload),
@@ -237,6 +243,37 @@ Keep Jupyter's standard authentication. The URL and token in the startup log
 are credentials: never copy them into an answer, a commit or a tool argument.
 Tell the user the server is up and let them configure the token themselves.
 
+## Output and save checks
+
+After execution, compare sent_cell_ref with the current cell_ref and check
+source_changed before treating output as the result of current code.
+kernel_control returns a new notebook_ref when its action changes metadata.
+
+Error entries expose ename and evalue even if traceback text is cut.
+Traceback previews and text/plain snapshots omit ANSI escapes; summary rows
+use has_error to flag an error output. output_read selects text/plain by
+default; pass mime_type for another retained representation and keep that
+selection while paging. The output entry's byte_size counts nbformat JSON,
+while snapshot.byte_size counts the default MIME payload. output_lifetime
+applies to every snapshot in the answer.
+
+If the snapshot budget drops alternate MIME data, snapshot.mime_types lists
+only representations still readable with output_read.
+
+For notebook_read outputs, cells_truncated means continue with next_cursor.
+outputs_truncated means some output data remains out of line. A complete
+text_preview can have truncated:false while output_inlined:false. Resource
+links appear only for outputs left out of line.
+
+notebook_changes collapses repeated output updates within an answer; its
+cursor still advances past every underlying event. After notebook_save, inspect
+external_change_detected for pre-save disk divergence, then
+overwrote_external_change for a readback-confirmed replacement of that disk
+content. A null overwrite flag means persistence was not confirmed; do not
+infer a successful overwrite from save_status alone. notebook_close reports
+whether a kernel was still bound through kernel_left_running; null means the
+Jupyter Sessions lookup failed.
+
 ## Example
 
 ```jsonc
@@ -265,6 +302,6 @@ Tell the user the server is up and let them configure the token themselves.
 //    -> state "succeeded" | "failed", outputs, output_id for the plot
 // 8. notebook_changes {"notebook_id":"nb_A","cursor":"c7"} to see what
 //    changed meanwhile. Before an edit that depends on an event, notebook_read
-//    refreshes a cell_ref (and notebook_ref); event cell_id/revisions are only
-//    diagnostics. notebook_save {"notebook_id":"nb_A"} if asked.
+//    refreshes a cell_ref (and notebook_ref); event cell_id can select a fresh
+//    read but cannot target a mutation. notebook_save {"notebook_id":"nb_A"} if asked.
 ```

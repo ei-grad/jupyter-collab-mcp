@@ -175,9 +175,13 @@ function dropInlinedOutputs(value: WireValue): { value: WireValue; dropped: numb
     if (hasSnapshot && (next['output'] !== undefined || next['text_preview'] !== undefined)) {
       delete next['output'];
       delete next['text_preview'];
+      next['output_inlined'] = false;
       next['truncated'] = true;
       dropped++;
     }
+    if (Array.isArray(next['outputs']) && next['outputs'].some((entry) =>
+      isObject(entry) && entry['truncated'] === true && entry['delivered_as'] !== 'image'
+    )) next['outputs_truncated'] = true;
     return next;
   };
   return { value: walk(value), dropped };
@@ -219,6 +223,7 @@ function shortenRecoverableArray(payload: WireObject): boolean {
         payload['cells'] = kept;
         payload[pageCursorKey] = `${cursor.slice(0, dot + 1)}${String(Number(last['index']) + 1)}`;
         payload['truncated'] = true;
+        if (payload['view'] === 'outputs') payload['cells_truncated'] = true;
         return true;
       }
     }
@@ -293,6 +298,10 @@ export function boundPayload(payload: WireObject, maxBytes: number): BoundedPayl
   if (stripped.dropped > 0) {
     current['response_truncated'] = true;
     current['read_more'] = reasons.join('; ');
+    if (current['view'] === 'outputs') {
+      current['truncated'] = true;
+      current['outputs_truncated'] = true;
+    }
   }
 
   let guard = 64;

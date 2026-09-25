@@ -474,8 +474,8 @@ export interface NotebookCloseResult {
   readonly alreadyClosed: boolean;
   /** Jobs of this notebook that were abandoned by a forced close. */
   readonly droppedExecutionIds: readonly ExecutionId[];
-  /** Always `true`: closing a replica never shuts a kernel down. */
-  readonly kernelLeftRunning: boolean;
+  /** Whether a kernel was bound at close; null when Sessions lookup failed. */
+  readonly kernelLeftRunning: boolean | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +538,8 @@ export interface CellContent {
   /** May be cut to the byte budget; see {@link sourceTruncated}. */
   readonly source: string;
   readonly sourceTruncated: boolean;
+  readonly sourceOffset: number;
+  readonly sourceComplete: boolean;
   /** Full UTF-8 size of the source even when truncated. */
   readonly sourceBytes: number;
   readonly metadata: Readonly<Record<string, unknown>>;
@@ -585,11 +587,15 @@ export interface OutputEntry {
   readonly index: number;
   /** nbformat `output_type`: `stream`, `execute_result`, … */
   readonly outputType: string;
-  /** MIME types present in the bundle; empty for `stream` and `error`. */
+  /** MIME types present in the bundle; stream and error use text/plain. */
   readonly mimeTypes: readonly string[];
   /** Full UTF-8 size of the serialised output. */
   readonly byteSize: number;
   readonly truncated: boolean;
+  readonly outputInlined?: boolean;
+  /** Always present for error outputs, even when the traceback is not inlined. */
+  readonly ename?: string;
+  readonly evalue?: string;
   /** The output itself, only when it fit the budget. */
   readonly output?: NbOutput;
   /** Short excerpt of a truncated textual output, within the budget. */
@@ -610,6 +616,7 @@ export interface OutputSnapshotRef {
   /** `jupyter-output:<output_id>`. Contains no credentials (SPEC.md §9, §11). */
   readonly uri: string;
   readonly mimeTypes: readonly string[];
+  readonly mimeType: string;
   readonly byteSize: number;
   /**
    * `true` when the adapter should emit this snapshot as MCP `image` content
@@ -643,6 +650,8 @@ export interface NotebookOutputsReadResult extends NotebookReadCommon {
   /** Captured with the output view so every read returns a notebook_ref. */
   readonly notebookMetadataRevision: NotebookMetadataRevision;
   readonly truncated: boolean;
+  readonly cellsTruncated: boolean;
+  readonly outputsTruncated: boolean;
   readonly nextCursor?: PageCursor;
 }
 
@@ -752,6 +761,8 @@ export interface ExecutionCellView {
   readonly sourceRevision: SourceRevision;
   /** Current live state of the same CRDT object; never the sent-code snapshot. */
   readonly currentObservation?: CellObservation;
+  /** Source observation accepted for this cell, present after it was sent. */
+  readonly sentObservation?: CellObservation;
   /** True when that object was deleted or replaced, so no ref is issued. */
   readonly cellRefUnavailable?: boolean;
   /** `execute_request` header id; absent while the cell is still queued. */
@@ -850,6 +861,8 @@ export interface ExecutionCancelResult {
 /** Arguments of `output_read`. */
 export interface OutputReadRequest {
   readonly outputId: OutputId;
+  /** Select one representation; text/plain is the default when available. */
+  readonly mimeType?: string;
   /**
    * The working context the caller reads from. A library caller names its own
    * session; an MCP connection omits it and addresses its implicit context. A
@@ -945,6 +958,10 @@ export interface NotebookSaveResult {
     readonly snapshotDigest: string;
     readonly observedAt: string;
   } | null;
+  /** Pre-save Contents divergence from the last paired disk/replica observation; null when unchecked. */
+  readonly externalChangeDetected: boolean | null;
+  /** True only when a divergent pre-save disk snapshot was replaced and confirmed by readback. */
+  readonly overwroteExternalChange: boolean | null;
   /** Structural revision at the moment the save was requested. */
   readonly structureRevision: StructureRevision;
   /** RFC 3339 UTC time the immutable target snapshot was captured. */
@@ -1107,6 +1124,8 @@ export interface KernelControlEffects {
 /** Result of `kernel_control`. */
 export interface KernelControlResult {
   readonly notebookId: NotebookId;
+  /** Current notebook metadata observation after kernel action. */
+  readonly notebookMetadataRevision: NotebookMetadataRevision;
   readonly action: KernelAction;
   readonly previousKernelId: string | null;
   /** `null` after a shutdown. */

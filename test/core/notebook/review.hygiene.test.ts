@@ -128,7 +128,7 @@ describe('review: batch revision guards (SPEC.md §7)', () => {
     } catch (error) {
       expect(error).toMatchObject({
         code: 'REVISION_CONFLICT',
-        message: 'the expected revision predates an earlier operation of this batch'
+        message: 'the reference changed since it was observed'
       });
     }
     expect(peer.notebook.getCell(0).getSource()).toBe('original');
@@ -153,7 +153,7 @@ describe('review: batch revision guards (SPEC.md §7)', () => {
     } catch (error) {
       expect(error).toMatchObject({
         code: 'REVISION_CONFLICT',
-        message: 'the expected revision does not match the replica'
+        message: 'the reference changed since it was observed'
       });
     }
     expect(peer.notebook.getCell(0).getSource()).toBe('changed by a collaborator');

@@ -439,9 +439,12 @@ export class ServerClient {
   }
 
   /** `GET /api/sessions` (SPEC.md §8: the kernel binding lives here). */
-  async listSessions(): Promise<readonly JupyterSessionInfo[]> {
+  async listSessions(signal?: AbortSignal): Promise<readonly JupyterSessionInfo[]> {
     const route = '/api/sessions';
-    const response = await this.#request(route, { method: 'GET' });
+    const response = await this.#request(route, {
+      method: 'GET',
+      ...(signal === undefined ? {} : { signal })
+    });
     const raw = parseJsonBody<unknown>(response, route);
     if (!Array.isArray(raw)) return [];
     return raw.map((entry) => sessionInfo(entry as SessionModel));

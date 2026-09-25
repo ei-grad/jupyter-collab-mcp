@@ -35,10 +35,9 @@ Acceptance criteria:
   `expected_kernel_id` remain explicit.
 - Reads refresh a ref only for the same live cell object. Deletion,
   replacement, closure, another connection, or process restart cannot retarget
-  it. Change events are historical diagnostics: their `cell_id` and revisions
-  identify what changed, but are not observed refs and cannot be passed to a
-  mutation. Refresh with `notebook_read` before a dependent edit; events do
-  not mint refs or select the latest cell state.
+  it. Change events retain their historical `cell_id` and revisions, not
+  observed refs. Their `cell_id` can select a fresh `notebook_read`, but cannot
+  target a mutation. Refresh before a dependent edit; events do not mint refs.
 
 The distinct internal guard scopes remain unchanged: source for edit/run, full
 cell for delete and cell metadata, outputs for clearing, notebook metadata for
@@ -59,12 +58,10 @@ The journal deliberately retains only the event's address and relevant
 revisions, not the complete atomic observation required by a `cell_ref`.
 Minting a ref when a historical event is later projected would instead bind the
 then-current object and guards, silently substituting a state the event never
-described. After an event naming a cell, an agent with an earlier `cell_ref`
-reads that same ref to refresh it; otherwise it reads a summary to obtain a
-current ref, then reads the cell content when the decision depends on it. Any
+described. After an event naming a cell, an agent reads the event's `cell_id`
+to obtain the current source and a fresh observed ref. Any
 `notebook_read` also returns a fresh `notebook_ref`, which is required after a
-notebook-metadata event. The event's `cell_id` and revisions remain diagnostic
-only.
+notebook-metadata event. Event revisions remain diagnostic only.
 
 Successful apply results issue refs for final surviving cell states; delete has
 no usable result ref. Execution views issue a current-live same-object ref, not

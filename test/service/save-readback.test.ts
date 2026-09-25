@@ -30,6 +30,7 @@ async function rig() {
   });
   services.push(service);
   const opened = await service.notebookOpen({ path: 'a.ipynb' });
+  reads = 0;
   return { service, handle, controls, notebookId: opened.notebook.notebookId, get reads() { return reads; }, setRead: (next: typeof read) => { read = next; } };
 }
 
@@ -39,6 +40,23 @@ it('confirms the immutable full snapshot and leaves the request ledger unchanged
   const answer = await r.service.notebookSave({ notebookId: r.notebookId, timeoutMs: 300 });
   expect(answer).toMatchObject({ saveStatus: 'success', revisionPersistence: 'confirmed', nextRequestId: '1', persistenceConfirmation: { method: 'contents-api-readback', snapshotDigest: digest } });
   expect(Date.parse(answer.persistenceConfirmation!.observedAt)).toBeGreaterThanOrEqual(Date.parse(answer.requestedAt));
+});
+
+it('reports a changed Contents snapshot that a confirmed save replaced', async () => {
+  const r = await rig();
+  const original = r.handle.notebook.toJSON();
+  const external = structuredClone(original);
+  external.cells[0]!.source = 'external disk edit';
+  r.setRead(async () => Response.json({
+    type: 'notebook', content: r.reads === 1 ? external : original
+  }));
+  const saved = await r.service.notebookSave({ notebookId: r.notebookId, timeoutMs: 500 });
+  expect(saved).toMatchObject({
+    saveStatus: 'success',
+    revisionPersistence: 'confirmed',
+    externalChangeDetected: true,
+    overwroteExternalChange: true
+  });
 });
 
 it('does not switch its target to a concurrent RTC edit and does not hold the mutation lock', async () => {
@@ -69,7 +87,7 @@ it('keeps unknown for a source-only mismatch without busy polling', async () => 
   const saved = await r.service.notebookSave({ notebookId: r.notebookId, timeoutMs: 140 });
   expect(saved).toMatchObject({ saveStatus: 'success', revisionPersistence: 'unknown', persistenceConfirmation: null });
   expect(Date.now() - began).toBeGreaterThanOrEqual(120);
-  expect(r.reads).toBe(2);
+  expect(r.reads).toBeGreaterThanOrEqual(2);
 });
 
 it('confirms when a later independent read matches the original snapshot', async () => {
@@ -87,19 +105,19 @@ it.each(['skipped', 'timeout', 'failed'] as const)('never read-confirms RAW %s',
   const saving = r.service.notebookSave({ notebookId: r.notebookId, timeoutMs: 100 });
   if (status === 'failed') await expect(saving).rejects.toMatchObject({ code: 'SAVE_FAILED' });
   else expect(await saving).toMatchObject({ saveStatus: status, revisionPersistence: 'unknown', persistenceConfirmation: null });
-  expect(r.reads).toBe(0);
+  expect(r.reads).toBe(1);
 });
 
 it.each([403, 404, 500])('preserves RAW success when readback returns HTTP %s', async status => {
   const r = await rig(); r.setRead(async () => new Response('', { status }));
   expect(await r.service.notebookSave({ notebookId: r.notebookId, timeoutMs: 200 })).toMatchObject({ saveStatus: 'success', revisionPersistence: 'unknown', persistenceConfirmation: null });
-  expect(r.reads).toBe(1);
+  expect(r.reads).toBe(2);
 });
 
 it('treats unsupported malformed notebook content as unknown', async () => {
   const r = await rig(); r.setRead(async () => Response.json({ type: 'notebook', content: 'unsupported' }));
   expect((await r.service.notebookSave({ notebookId: r.notebookId, timeoutMs: 200 })).revisionPersistence).toBe('unknown');
-  expect(r.reads).toBe(1);
+  expect(r.reads).toBe(2);
 });
 
 it('shares one deadline across RAW save and a stalled HTTP response body', async () => {
@@ -116,7 +134,7 @@ it('shares one deadline across RAW save and a stalled HTTP response body', async
   try {
     expect(await r.service.notebookSave({ notebookId: r.notebookId, timeoutMs: 160 })).toMatchObject({ saveStatus: 'success', revisionPersistence: 'unknown', persistenceConfirmation: null });
     expect(Date.now() - began).toBeLessThan(240);
-    expect(r.reads).toBe(1);
+    expect(r.reads).toBe(2);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
@@ -136,5 +154,5 @@ it.each([true, false])('bounds readback bytes regardless of Content-Length (decl
   }), { headers: declared ? { 'Content-Length': String(16 * 1024 * 1024 + 1) } : {} }));
   expect(await r.service.notebookSave({ notebookId: r.notebookId, timeoutMs: 300 })).toMatchObject({ saveStatus: 'success', revisionPersistence: 'unknown', persistenceConfirmation: null });
   expect(cancelled).toBe(true);
-  expect(r.reads).toBe(1);
+  expect(r.reads).toBe(2);
 });

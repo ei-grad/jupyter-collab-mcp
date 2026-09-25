@@ -281,7 +281,7 @@ describe('notebook handles', () => {
     ).toBe('RESOURCE_LIMIT');
   });
 
-  it('notebook_close is idempotent, leaves the kernel and expires the handle', async () => {
+  it('notebook_close is idempotent and reports no bound kernel', async () => {
     const rig = rigFor();
     const session = await rig.service.sessionOpen({});
     const opened = await rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
@@ -289,14 +289,92 @@ describe('notebook handles', () => {
 
     const closed = await rig.service.notebookClose({ notebookId: id });
     expect(closed.alreadyClosed).toBe(false);
-    expect(closed.kernelLeftRunning).toBe(true);
+    expect(closed.kernelLeftRunning).toBe(false);
     expect(rig.handles[0]?.closed).toBe(true);
 
     const again = await rig.service.notebookClose({ notebookId: id });
     expect(again.alreadyClosed).toBe(true);
+    expect(again.kernelLeftRunning).toBe(false);
     expect(await codeOf(() => rig.service.notebookRead({ notebookId: id, view: 'summary' }))).toBe(
       'HANDLE_EXPIRED'
     );
+  });
+
+  it('notebook_close sees a Jupyter binding without a local kernel lease', async () => {
+    const rig = rigFor();
+    const session = await rig.service.sessionOpen({});
+    const opened = await rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
+    rig.server.sessions.set('external', {
+      id: 'external', path: 'a.ipynb', kernelId: 'kernel_external', kernelName: 'python3'
+    });
+
+    const closed = await rig.service.notebookClose({ notebookId: opened.notebook.notebookId });
+    expect(closed.kernelLeftRunning).toBe(true);
+    expect((await rig.service.notebookClose({ notebookId: opened.notebook.notebookId })).kernelLeftRunning).toBe(true);
+  });
+
+  it('notebook_close reports unknown when Sessions lookup fails', async () => {
+    const rig = rigFor();
+    const session = await rig.service.sessionOpen({});
+    const opened = await rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
+    const original = rig.server.fetchImpl;
+    const failing = rig.server as { fetchImpl: typeof fetch };
+    failing.fetchImpl = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input.toString());
+      if (url.pathname === '/api/sessions') return new Response(null, { status: 503 });
+      return original(input, init);
+    };
+
+    const closed = await rig.service.notebookClose({ notebookId: opened.notebook.notebookId });
+    expect(closed.kernelLeftRunning).toBeNull();
+  });
+
+  it('notebook_close releases the replica when Sessions lookup stalls', async () => {
+    const rig = rigFor();
+    const session = await rig.service.sessionOpen({});
+    const opened = await rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
+    const original = rig.server.fetchImpl;
+    const failing = rig.server as { fetchImpl: typeof fetch };
+    failing.fetchImpl = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input.toString());
+      if (url.pathname === '/api/sessions') return new Promise<Response>(() => undefined);
+      return original(input, init);
+    };
+
+    const started = Date.now();
+    const closed = await rig.service.notebookClose({ notebookId: opened.notebook.notebookId });
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(closed.kernelLeftRunning).toBeNull();
+    expect(rig.handles[0]?.closed).toBe(true);
+  }, 5_000);
+
+  it('two closes waiting on Sessions report one first close', async () => {
+    const rig = rigFor();
+    const session = await rig.service.sessionOpen({});
+    const opened = await rig.service.notebookOpen({ sessionId: session.sessionId, path: 'a.ipynb' });
+    const original = rig.server.fetchImpl;
+    const intercepted = rig.server as { fetchImpl: typeof fetch };
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached = 0;
+    let bothReached: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => { bothReached = resolve; });
+    intercepted.fetchImpl = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input.toString());
+      if (url.pathname === '/api/sessions') {
+        reached++;
+        if (reached === 2) bothReached?.();
+        await gate;
+      }
+      return original(input, init);
+    };
+
+    const first = rig.service.notebookClose({ notebookId: opened.notebook.notebookId });
+    const second = rig.service.notebookClose({ notebookId: opened.notebook.notebookId });
+    await ready;
+    release?.();
+    const results = await Promise.all([first, second]);
+    expect(results.map((result) => result.alreadyClosed).sort()).toEqual([false, true]);
   });
 
   it('an unknown notebook handle is HANDLE_EXPIRED, not a crash', async () => {
@@ -319,6 +397,33 @@ describe('notebook handles', () => {
 });
 
 describe('output snapshots', () => {
+  it('defaults to text/plain and lets callers select the HTML representation', async () => {
+    const rig = rigFor();
+    const opened = await rig.service.notebookOpen({ path: 'a.ipynb' });
+    const cellId = opened.summary.cells[0]!.cellId;
+    const cell = rig.handles[0]!.notebook.getCell(0) as unknown as {
+      setOutputs(outputs: unknown[]): void;
+    };
+    cell.setOutputs([{
+      output_type: 'display_data',
+      data: { 'text/html': '<style>table</style><table>rows</table>', 'text/plain': 'plain rows' },
+      metadata: {}
+    }]);
+    const read = await rig.service.notebookRead({
+      notebookId: opened.notebook.notebookId, view: 'outputs', cellIds: [cellId], limits: { maxBytes: 1 }
+    });
+    const outputId = read.cells[0]!.outputs[0]!.snapshot!.outputId;
+    const plain = await rig.service.outputRead({ outputId });
+    expect(plain).toMatchObject({ mimeType: 'text/plain', data: 'plain rows' });
+    const html = await rig.service.outputRead({ outputId, mimeType: 'text/html' });
+    expect(html).toMatchObject({ mimeType: 'text/html', data: '<style>table</style><table>rows</table>' });
+    const first = await rig.service.outputRead({ outputId, limits: { maxBytes: 5 } });
+    expect(first.nextCursor).toBeDefined();
+    expect(await codeOf(() => rig.service.outputRead({
+      outputId, cursor: first.nextCursor!, mimeType: 'text/html'
+    }))).toBe('INVALID_ARGUMENT');
+  });
+
   it('pages text only on UTF-8 boundaries and rejects an insufficient budget without advancing', async () => {
     const rig = rigFor();
     const session = await rig.service.sessionOpen({});
@@ -390,6 +495,32 @@ describe('output snapshots', () => {
     expect(chunks.join('')).toBe(text);
     expect(deliveredBytes).toBe(Buffer.byteLength(text, 'utf8'));
   });
+});
+
+it('coalesces output events within a changes answer without crossing source edits', async () => {
+  const rig = rigFor();
+  const opened = await rig.service.notebookOpen({ path: 'a.ipynb' });
+  const cellId = opened.summary.cells[0]!.cellId;
+  const journal = rig.handles[0]!.model.journal;
+  const output = (revision: string) => journal.publish({
+    kind: 'outputs_changed', cellId, revisions: { outputsRevision: revision as never }, origin: 'remote'
+  });
+  output('o1');
+  output('o2');
+  output('o3');
+  journal.publish({ kind: 'source_changed', cellId, revisions: {}, origin: 'remote' });
+  output('o4');
+  output('o5');
+  const changes = await rig.service.notebookChanges({
+    notebookId: opened.notebook.notebookId, cursor: opened.changesCursor
+  });
+  expect(changes.events.map((event) => event.kind)).toEqual([
+    'outputs_changed', 'source_changed', 'outputs_changed'
+  ]);
+  expect(changes.events.map((event) => event.sequence)).toEqual([
+    journal.lastSequence - 3, journal.lastSequence - 2, journal.lastSequence
+  ]);
+  expect(changes.truncated).toBe(false);
 });
 
 describe('reads and the session envelope', () => {

@@ -505,10 +505,15 @@ persistence of a particular revision.
 
 A cell has a persistent internal `cell_id`, but the public MCP mutation and
 execution interface addresses the version an agent actually observed. Every
-cell row of `notebook_read` returns one `cell_ref`, plus its current index, type,
+cell row of `notebook_read` returns one `cell_ref` and one stable `cell_id`, plus its current index, type,
 execution state and requested content. Every read view also returns one
 top-level `notebook_ref` for notebook metadata. Public results do not expose the
 cell identity token or its source/cell/outputs revision tuple.
+`cell_id` is the same address reported in `notebook_changes`. It may select a
+fresh `notebook_read(view: cells|outputs)` through `cell_refs`, but only a
+`cell_ref` may target a mutation or execution. Reading by `cell_id` observes
+the current cell; reading by `cell_ref` rejects deletion or replacement of the
+observed object.
 
 Internally, a `cell_ref` stores the notebook handle, durable ID, immutable Y.Map
 identity, source revision, full-cell revision, and outputs revision captured in
@@ -959,7 +964,9 @@ digest, result/execution reference, established effects, and
 pre-acceptance rejection or no receipt, replay and time fields are absent;
 `REQUEST_ID_EXPIRED` remains an explicit distinct outcome. Even replay returns
 current `next_request_id = H + 1`, replacing the number stored in the old
-response. The useful result and replay metadata are separate: the agent must
+response. Other result fields, including cell refs, indices, revisions and
+change cursors, describe the state at first acceptance and may be stale. The
+agent re-reads before dependent work. The useful result and replay metadata are separate: the agent must
 not report a new cell addition or launch from an old receipt. An intentionally
 repeated identical operation uses a fresh session number. The service cannot
 infer new intent from an already-used ID and payload.
@@ -1047,6 +1054,9 @@ to continue. PNG/JPEG may be MCP image content; large objects may be resource
 links with tool-based fallback reads. HTML/SVG are returned as data, and the
 MCP process does not execute active content. Full base64 plots are not included
 in every text response.
+Every source page states `source_offset` in UTF-8 bytes and `source_complete`.
+A continuation that reaches the end still has `source_complete:false` when it
+starts after byte zero; callers must assemble all pages before replacing source.
 
 For its own `jupyter-output:` URIs, the server declares `resources: {}` and
 implements `resources/read` and `resources/list` (the list may be empty; tool
@@ -1129,6 +1139,10 @@ source/metadata/output edits, reorder, kernel changes, and connection state.
 Each event includes sequence, cell ID, new revisions, and change type. Source
 and base64 are not copied into the log automatically. When a cursor expires,
 the agent requests a new snapshot and observes from its new cursor.
+After `source_changed`, the agent re-reads that cell before editing or executing
+it. `outputs_changed` does not invalidate a `cell_ref` for source edits or
+execution. After `cell_deleted`, the old ref is unusable. A local mutation
+response already contains current refs for its surviving targets.
 
 The log reports state changes, not a full IOPub transcript. Frequent output
 updates are coalesced per cell: a mutable pending record accumulates the current
@@ -1434,3 +1448,58 @@ expired credentials cannot authorize requests or downstream traffic. Explicit
 close and idle expiry prevent late in-flight work from resurrecting the session,
 without retaining permanent revocation records. When an absolute deadline is
 configured it still applies; expired handles require initialization and reopen.
+
+## Agent-facing observation invariants
+
+An execution view distinguishes the accepted source from the current live
+cell. After a cell is sent, sent_cell_ref identifies its accepted source
+observation. cell_ref identifies the current live observation, if the same
+cell object survives. source_changed compares the current source with the
+accepted source whenever the view is read, including after completion.
+
+Error output entries always expose ename and evalue, independent of the text
+budget. Traceback previews and text/plain snapshots omit ANSI control
+sequences. Summary rows report has_error when an error output is present.
+
+The max_bytes argument budgets source or output data, while the configured
+response limit separately bounds the complete MCP result. preview_chars
+constrains execution output previews as well as summary previews. An outputs
+read reports cells_truncated separately from outputs_truncated. Only the former
+has a next_cursor for another cell page. For an output entry, truncated means
+that readable text or another MIME representation remains out of line;
+output_inlined says whether its nbformat object is present. A complete plain
+text preview can have truncated:false while output_inlined:false.
+
+output_read defaults to text/plain when available and accepts mime_type to
+select another retained representation. When alternate MIME representations
+exceed the snapshot budget, the default representation remains readable and
+only retained MIME types are advertised by the snapshot and non-inline output
+entry. Its continuation cursor binds the MIME selection. An output entry's
+byte_size measures its serialized nbformat JSON; snapshot.byte_size measures
+the default MIME payload. Stream and error
+outputs advertise text/plain. The output_lifetime block applies to every
+snapshot in one answer. MCP resource links accompany outputs left out of line,
+not inlined text or images.
+
+If an existing snapshot's alternate representation prevents a response from
+retaining all selected default payloads, the store expires that snapshot and
+issues a new output_id for its retained default payload.
+
+Within one notebook_changes response, output events for the same cell are
+collapsed to the newest event between non-output event boundaries. The cursor
+advances over every underlying journal sequence, including collapsed events.
+
+Before notebook_save, a bounded Contents read compares disk content with the
+last observed disk state and its paired replica state. The result reports
+external_change_detected:true when the pre-save disk content differs from
+the save target and either changed since the previous disk observation or was
+already divergent at open. This flag records divergence, not the origin of
+the disk write. overwrote_external_change:true requires both that divergence
+and a Contents readback confirming the save target. An unconfirmed save
+returns null rather than claiming the disk was overwritten. False means the
+checked condition did not occur.
+
+kernel_control returns a current notebook_ref after any action that may update
+notebook metadata. notebook_close checks the Jupyter Sessions binding at close
+and reports kernel_left_running even without a local kernel lease. It returns
+null when that binding cannot be checked; it never shuts the kernel down.

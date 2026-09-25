@@ -20,7 +20,9 @@
 
 import {
   coreError,
+  stripAnsi,
   type CellRunState,
+  type CellObservation,
   type ExecutionCellView,
   type ExecutionCursor,
   type ExecutionView,
@@ -69,6 +71,8 @@ export interface ExecutionRecord {
   readonly registry: ExecutionRegistry;
   readonly handle: NotebookHandle;
   readonly createdAt: string;
+  /** Cell versions captured at acceptance; a sent cell keeps this reference. */
+  readonly submittedObservations?: readonly CellObservation[];
   /** `cellId -> generation` already closed with `finishExecution`. */
   readonly finished: Map<string, number>;
   /** Set once an observed kernel change invalidated the job (SPEC.md §8). */
@@ -236,7 +240,7 @@ function previewOf(output: NbOutput, budget: number): string | undefined {
   if (budget <= 0) return undefined;
   let text: string | null = null;
   if (output.output_type === 'stream') text = nbText(output.text);
-  else if (output.output_type === 'error') text = `${output.ename}: ${output.evalue}`;
+  else if (output.output_type === 'error') text = stripAnsi(output.ename + ': ' + output.evalue);
   else {
     const plain = (output.data as Record<string, unknown> | undefined)?.['text/plain'];
     if (plain !== undefined) text = nbText(plain);
@@ -256,13 +260,25 @@ function previewOf(output: NbOutput, budget: number): string | undefined {
 export function toOutputEntry(
   output: NbOutput,
   index: number,
-  budget: { remaining: number; maxOutputBytes: number },
+  budget: { remaining: number; maxOutputBytes: number; previewChars?: number },
   address: { notebookId: string; executionId: string; cellId: string },
   store: OutputSnapshotWriter
 ): OutputEntry {
   const byteSize = outputByteSize(output);
   const mimeTypes = mimeTypesOf(output);
+  const errorFields = output.output_type === 'error'
+    ? { ename: output.ename, evalue: output.evalue }
+    : {};
   const snapshot = store.intern({ ...address, index }, output);
+  const snapshotRef = {
+    get outputId() { return snapshot.outputId; },
+    get uri() { return snapshot.uri; },
+    get mimeTypes() { return snapshot.mimeTypes; },
+    get mimeType() { return snapshot.mimeType; },
+    get byteSize() { return snapshot.byteSize; },
+    get inlineImageAdvised() { return snapshot.inlineImageAdvised; },
+    lifetime: SNAPSHOT_LIFETIME
+  };
   const fits = byteSize <= Math.min(budget.remaining, budget.maxOutputBytes);
   if (fits) {
     budget.remaining -= byteSize;
@@ -272,34 +288,24 @@ export function toOutputEntry(
       mimeTypes,
       byteSize,
       truncated: false,
+      outputInlined: true,
+      ...errorFields,
       output,
-      snapshot: {
-        outputId: snapshot.outputId,
-        uri: snapshot.uri,
-        mimeTypes: snapshot.mimeTypes,
-        byteSize: snapshot.byteSize,
-        inlineImageAdvised: snapshot.inlineImageAdvised,
-        lifetime: SNAPSHOT_LIFETIME
-      }
+      snapshot: snapshotRef
     };
   }
-  const preview = previewOf(output, Math.min(budget.remaining, 512));
+  const preview = previewOf(output, Math.min(budget.remaining, budget.previewChars ?? 512));
   if (preview !== undefined) budget.remaining = Math.max(0, budget.remaining - preview.length);
   return {
     index,
     outputType: output.output_type,
-    mimeTypes: mimeTypes.length > 0 ? mimeTypes : snapshot.mimeTypes,
+    get mimeTypes() { return snapshot.mimeTypes; },
     byteSize,
     truncated: true,
+    outputInlined: false,
+    ...errorFields,
     ...(preview === undefined ? {} : { textPreview: preview }),
-    snapshot: {
-      outputId: snapshot.outputId,
-      uri: snapshot.uri,
-      mimeTypes: snapshot.mimeTypes,
-      byteSize: snapshot.byteSize,
-      inlineImageAdvised: snapshot.inlineImageAdvised,
-      lifetime: SNAPSHOT_LIFETIME
-    }
+    snapshot: snapshotRef
   };
 }
 
@@ -352,7 +358,7 @@ export function buildExecutionView(
   options: ExecutionViewOptions
 ): ExecutionView {
   const limits = effectiveLimits(options.limits, options.requested);
-  const budget = { remaining: limits.maxBytes, maxOutputBytes: limits.maxOutputBytes };
+  const budget = { remaining: limits.maxBytes, maxOutputBytes: limits.maxOutputBytes, previewChars: limits.previewChars };
   const address = { notebookId: record.notebookId, executionId: record.executionId };
   const cells: ExecutionCellView[] = [];
   const positions: ExecutionOutputPosition[] = [];

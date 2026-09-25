@@ -102,6 +102,9 @@ export class NotebookHandle {
   readonly path: string;
   /** Jobs of this notebook, by `execution_id`; the session owns their records. */
   readonly executionIds = new Set<string>();
+  /** Last Contents snapshot paired with a known replica snapshot. */
+  observedDiskDigest: string | null = null;
+  observedReplicaDigest: string | null = null;
 
   #closed = false;
   #offState: (() => void) | null = null;

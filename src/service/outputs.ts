@@ -6,8 +6,8 @@
  * is *interned* here once - "an unchanged snapshot is not recreated on every
  * read" - and the answer carries an `output_id`, its MIME types, its full
  * size and the URI that reads it. The same output read twice returns the same
- * id, because interning is keyed by the content digest and the address of the
- * output, not by the call.
+ * id while retained, because interning is keyed by the content digest and the
+ * address of the output, not by the call. Budget eviction may issue a new id.
  *
  * The store belongs to a working session: `session_close` drops every snapshot
  * with it, and a dropped or evicted snapshot answers `HANDLE_EXPIRED`
@@ -20,7 +20,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 
-import { coreError, type HandleLifetime, type NbOutput } from '../core/index.js';
+import { coreError, stripAnsi, type HandleLifetime, type NbOutput } from '../core/index.js';
 
 /** URI scheme of our own snapshots. */
 export const OUTPUT_URI_SCHEME = 'jupyter-output';
@@ -45,17 +45,26 @@ export interface OutputSnapshot {
   readonly cellId: string;
   readonly index: number;
   readonly outputType: string;
-  /** Every MIME type the original bundle carried. */
+  /** Every MIME type retained for reading from this snapshot. */
   readonly mimeTypes: readonly string[];
   /** The MIME type {@link bytes} holds. */
   readonly mimeType: string;
   readonly encoding: 'text' | 'base64';
   readonly bytes: Buffer;
   readonly byteSize: number;
+  readonly representations: ReadonlyMap<string, OutputRepresentation>;
+  readonly retainedBytes: number;
   /** Short human-readable name, e.g. `cell 3 (image/png)`. */
   readonly name: string;
   /** `true` when the adapter should emit MCP `image` content for it. */
   readonly inlineImageAdvised: boolean;
+}
+
+export interface OutputRepresentation {
+  readonly mimeType: string;
+  readonly encoding: 'text' | 'base64';
+  readonly bytes: Buffer;
+  readonly byteSize: number;
 }
 
 /** Where an output sits, so re-reading it returns the same snapshot. */
@@ -76,18 +85,25 @@ export interface OutputSnapshotTransaction extends OutputSnapshotWriter {
   commit(): void;
 }
 
+interface PendingSnapshot {
+  readonly ref: OutputSnapshot;
+  readonly replacement: OutputSnapshot;
+  readonly current: OutputSnapshot;
+  replace(): void;
+}
+
 /** MIME types a host can render as image content (SPEC.md §9). */
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg']);
 
 /** Preference order when one bundle carries several representations. */
 const MIME_PREFERENCE = [
+  'text/plain',
   'image/png',
   'image/jpeg',
   'image/svg+xml',
   'text/html',
   'application/json',
-  'text/markdown',
-  'text/plain'
+  'text/markdown'
 ];
 
 /** nbformat stores multi-line text either as a string or as a list of lines. */
@@ -99,12 +115,12 @@ export function nbText(value: unknown): string {
   return '';
 }
 
-/** MIME types present in one output; empty for `stream` and `error`. */
+/** MIME types present in one output; `stream` and `error` use text/plain. */
 export function mimeTypesOf(output: NbOutput): readonly string[] {
   if (output.output_type === 'execute_result' || output.output_type === 'display_data') {
     return Object.keys(output.data ?? {});
   }
-  return [];
+  return ['text/plain'];
 }
 
 /** UTF-8 size of the serialised output - what a text answer would cost. */
@@ -125,8 +141,8 @@ function pickMime(types: readonly string[]): string {
   return types[0] ?? 'text/plain';
 }
 
-/** The payload one snapshot serves, chosen from the output's richest part. */
-function payloadOf(output: NbOutput): {
+/** One immutable MIME representation of an output snapshot. */
+function payloadOf(output: NbOutput, selectedMime?: string): {
   mimeType: string;
   encoding: 'text' | 'base64';
   bytes: Buffer;
@@ -139,11 +155,11 @@ function payloadOf(output: NbOutput): {
     };
   }
   if (output.output_type === 'error') {
-    const text = [`${output.ename}: ${output.evalue}`, ...output.traceback].join('\n');
+    const text = stripAnsi([output.ename + ': ' + output.evalue, ...output.traceback].join('\n'));
     return { mimeType: 'text/plain', encoding: 'text', bytes: Buffer.from(text, 'utf8') };
   }
   const bundle = (output.data ?? {}) as Record<string, unknown>;
-  const mimeType = pickMime(Object.keys(bundle));
+  const mimeType = selectedMime ?? pickMime(Object.keys(bundle));
   const raw = bundle[mimeType];
   if (isBinary(mimeType)) {
     // nbformat keeps binary bundles base64-encoded already.
@@ -211,18 +227,26 @@ export class OutputStore {
 
   /** Build a response's snapshots before publishing any of their IDs. */
   begin(): OutputSnapshotTransaction {
-    const candidates = new Map<string, OutputSnapshot>();
+    const candidates = new Map<string, PendingSnapshot>();
     let committed = false;
     return {
       intern: (address, output) => {
         if (committed) throw new Error('an output snapshot transaction is already committed');
         const candidate = this.#candidate(address, output);
         const known = candidates.get(candidate.key);
-        if (known !== undefined) return known;
+        if (known !== undefined) return known.ref;
         const existing = this.#snapshotForKey(candidate.key);
-        const snapshot = existing ?? candidate.snapshot;
-        candidates.set(candidate.key, snapshot);
-        return snapshot;
+        let current = existing ?? candidate.snapshot;
+        const pending: PendingSnapshot = {
+          ref: new Proxy(candidate.snapshot, {
+            get: (_target, property) => Reflect.get(current, property)
+          }),
+          replacement: candidate.snapshot,
+          get current() { return current; },
+          replace: () => { current = candidate.snapshot; }
+        };
+        candidates.set(candidate.key, pending);
+        return pending.ref;
       },
       commit: () => {
         if (committed) return;
@@ -233,8 +257,15 @@ export class OutputStore {
   }
 
   #candidate(address: OutputAddress, output: NbOutput): { key: string; snapshot: OutputSnapshot } {
-    const payload = payloadOf(output);
-    const digest = createHash('sha256').update(payload.bytes).digest('hex').slice(0, 32);
+    const mimeTypes = mimeTypesOf(output);
+    const availableMimeTypes = mimeTypes.length > 0 ? mimeTypes : ['text/plain'];
+    const representations = new Map<string, OutputRepresentation>();
+    for (const mimeType of availableMimeTypes) {
+      const payload = payloadOf(output, mimeType);
+      representations.set(mimeType, { ...payload, byteSize: payload.bytes.byteLength });
+    }
+    const payload = representations.get(pickMime(availableMimeTypes))!;
+    const digest = createHash('sha256').update(JSON.stringify(output)).digest('hex').slice(0, 32);
     const key = [
       address.notebookId,
       address.cellId,
@@ -243,7 +274,7 @@ export class OutputStore {
       digest
     ].join(' ');
     const outputId = `out_${randomUUID()}`;
-    const mimeTypes = mimeTypesOf(output);
+    const retainedMimeTypes = [...availableMimeTypes];
     const snapshot: OutputSnapshot = {
       outputId,
       uri: outputUri(this.#sessionId, outputId),
@@ -253,13 +284,19 @@ export class OutputStore {
       cellId: address.cellId,
       index: address.index,
       outputType: output.output_type,
-      mimeTypes: mimeTypes.length > 0 ? mimeTypes : [payload.mimeType],
+      mimeTypes: retainedMimeTypes,
       mimeType: payload.mimeType,
       encoding: payload.encoding,
       bytes: payload.bytes,
       byteSize: payload.bytes.byteLength,
+      representations,
+      get retainedBytes() {
+        return [...representations.values()].reduce((total, entry) => total + entry.byteSize, 0);
+      },
       name: `cell ${address.cellId} (${payload.mimeType})`,
-      inlineImageAdvised: IMAGE_TYPES.has(payload.mimeType)
+      get inlineImageAdvised() {
+        return retainedMimeTypes.some((mime) => IMAGE_TYPES.has(mime));
+      }
     };
     return { key, snapshot };
   }
@@ -306,9 +343,36 @@ export class OutputStore {
     return undefined;
   }
 
-  #commit(candidates: ReadonlyMap<string, OutputSnapshot>): void {
-    const snapshots = [...candidates.values()];
-    const retainedBytes = snapshots.reduce((total, snapshot) => total + snapshot.byteSize, 0);
+  #commit(candidates: ReadonlyMap<string, PendingSnapshot>): void {
+    let snapshots = [...candidates.values()].map((pending) => pending.current);
+    let retainedBytes = snapshots.reduce((total, snapshot) => total + snapshot.retainedBytes, 0);
+    const trimNewAlternates = (): void => {
+      for (const snapshot of snapshots) {
+        if (this.#byId.has(snapshot.outputId)) continue;
+        const representations = snapshot.representations as Map<string, OutputRepresentation>;
+        const mimeTypes = snapshot.mimeTypes as string[];
+        for (const mimeType of [...mimeTypes]) {
+          if (mimeType === snapshot.mimeType || retainedBytes <= this.#maxBytes) continue;
+          const representation = representations.get(mimeType);
+          if (representation === undefined) continue;
+          representations.delete(mimeType);
+          mimeTypes.splice(mimeTypes.indexOf(mimeType), 1);
+          retainedBytes -= representation.byteSize;
+        }
+        if (retainedBytes <= this.#maxBytes) break;
+      }
+    };
+    if (retainedBytes > this.#maxBytes) trimNewAlternates();
+    if (retainedBytes > this.#maxBytes) {
+      for (const pending of candidates.values()) {
+        if (pending.current === pending.replacement || pending.current.mimeTypes.length <= 1) continue;
+        pending.replace();
+        snapshots = [...candidates.values()].map((entry) => entry.current);
+        retainedBytes = snapshots.reduce((total, snapshot) => total + snapshot.retainedBytes, 0);
+        trimNewAlternates();
+        if (retainedBytes <= this.#maxBytes) break;
+      }
+    }
     if (retainedBytes > this.#maxBytes) {
       throw coreError('RESOURCE_LIMIT', 'output snapshots for one response exceed the retained-output budget', {
         details: { output_bytes: retainedBytes, output_store_max_bytes: this.#maxBytes }
@@ -318,13 +382,14 @@ export class OutputStore {
       .filter((snapshot) => this.#byId.get(snapshot.outputId) === snapshot)
       .map((snapshot) => snapshot.outputId));
     const additions = snapshots.filter((snapshot) => !retainedIds.has(snapshot.outputId));
-    const additionalBytes = additions.reduce((total, snapshot) => total + snapshot.byteSize, 0);
+    const additionalBytes = additions.reduce((total, snapshot) => total + snapshot.retainedBytes, 0);
     this.#evictFor(additionalBytes, retainedIds);
-    for (const [key, snapshot] of candidates) {
+    for (const [key, pending] of candidates) {
+      const snapshot = pending.current;
       if (retainedIds.has(snapshot.outputId)) continue;
       this.#byId.set(snapshot.outputId, snapshot);
       this.#byKey.set(key, snapshot.outputId);
-      this.#used += snapshot.byteSize;
+      this.#used += snapshot.retainedBytes;
     }
   }
 
@@ -344,7 +409,7 @@ export class OutputStore {
 
   #drop(id: string, snapshot: OutputSnapshot): void {
     this.#byId.delete(id);
-    this.#used -= snapshot.byteSize;
+    this.#used -= snapshot.retainedBytes;
     for (const [key, value] of this.#byKey) {
       if (value === id) this.#byKey.delete(key);
     }
