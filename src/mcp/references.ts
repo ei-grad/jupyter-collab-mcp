@@ -444,11 +444,7 @@ export class ReferenceAliases {
     if (op === 'set_notebook_metadata' || op === 'delete_notebook_metadata') {
       const observed = this.#observedNotebook(String(operation['notebook_ref']), notebook);
       const { notebook_ref: _ref, ...rest } = operation;
-      return {
-        ...rest,
-        expected_notebook_metadata_revision: observed.metadataRevision,
-        expected_notebook_observed: true
-      };
+      return { ...rest, expected_notebook_metadata_revision: observed.metadataRevision };
     }
     if (typeof operation['cell_ref'] !== 'string') return operation;
     const observed = this.#observed(operation['cell_ref'], notebook);

@@ -299,12 +299,12 @@ const OPERATION = z.discriminatedUnion('op', [
   z.object({
     op: z.literal('replace_source'),
     cell_ref: z.string(),
-    source: z.string()
+    source: z.string().describe('Full new source. Your change relative to the source you read is merged line by line with edits made since; overlapping lines are REVISION_CONFLICT.')
   }),
   z.object({
     op: z.literal('replace_text'),
     cell_ref: z.string(),
-    old_text: z.string().min(1).describe('Must occur exactly once, otherwise MATCH_NOT_FOUND / MATCH_NOT_UNIQUE.'),
+    old_text: z.string().min(1).describe('Must occur exactly once in the current text, including edits by others and earlier operations of this batch; otherwise MATCH_NOT_FOUND / MATCH_NOT_UNIQUE.'),
     new_text: z.string()
   }),
   z.object({
@@ -584,7 +584,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     name: 'notebook_apply',
     title: 'Edit cells',
     description:
-      `Apply an ordered batch of edits to the shared document. The whole batch is validated against the current replica first, then applied in one transaction, so an expected error (REVISION_CONFLICT, CELL_NOT_FOUND, MATCH_NOT_UNIQUE, …) happens before the first mutation. partial:true means an unexpected failure hit mid-batch — re-read the affected cells. ${SEQUENTIAL} applied_locally, delivery and persistence are three separate facts: only notebook_save can confirm anything on disk.`,
+      `Apply an ordered batch of edits to the shared document. Several operations may use the same cell_ref; edits merge with concurrent changes by others. The whole batch is validated against the current replica first, then applied in one transaction, so an expected error (REVISION_CONFLICT, CELL_NOT_FOUND, MATCH_NOT_UNIQUE, …) happens before the first mutation. partial:true means an unexpected failure hit mid-batch — re-read the affected cells. ${SEQUENTIAL} applied_locally, delivery and persistence are three separate facts: only notebook_save can confirm anything on disk.`,
     input: z.object({
       notebook_id: notebookId,
       request_id: requestId,

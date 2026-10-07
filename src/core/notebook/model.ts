@@ -27,7 +27,7 @@ import type * as Y from 'yjs';
 
 import { coreError, toCoreError } from '../errors.js';
 import type { CoreError } from '../errors.js';
-import type { StructureRevision } from '../revision.js';
+import type { NotebookMetadataRevision, StructureRevision } from '../revision.js';
 import { cellRevision, outputsRevision, sourceRevision } from '../revision.js';
 import type {
   CellObservation,
@@ -40,7 +40,10 @@ import type {
 } from '../types.js';
 import { makePageCursor } from '../types.js';
 import { CellIndex } from './cell-index.js';
-import type { IdentifiedCellRef } from './cell-index.js';
+import type { CellEntry, IdentifiedCellRef } from './cell-index.js';
+import type { MetadataObject } from './metadata.js';
+import { createObservationHistory } from './observation-history.js';
+import type { ObservationHistory, RevisionHistoryLimits } from './observation-history.js';
 import { ChangeJournal } from './journal.js';
 import type { ChangesPage } from './journal.js';
 import { GenerationRegistry } from './generations.js';
@@ -91,6 +94,8 @@ export interface NotebookModelOptions {
   readonly previewChars?: number;
   /** Injectable clock for tests. */
   readonly now?: () => number;
+  /** Bounds of each observation history (SPEC.md §7 merge bases). */
+  readonly observationHistory?: RevisionHistoryLimits;
 }
 
 /** The live replica of one notebook (SPEC.md §4). */
@@ -103,6 +108,13 @@ export class NotebookModel {
   readonly index: CellIndex;
   readonly journal: ChangeJournal;
   readonly generations: GenerationRegistry;
+  /**
+   * Content behind every source, cell and notebook-metadata revision this
+   * model handed out, so a later batch can tell the caller's changes from
+   * everybody else's (SPEC.md §7). Recorded synchronously with the revision
+   * computation, so the two always describe the same state.
+   */
+  readonly history: ObservationHistory;
 
   readonly #observer: NotebookObserver;
   readonly #previewChars: number;
@@ -130,6 +142,7 @@ export class NotebookModel {
       ...(options.now === undefined ? {} : { now: options.now })
     });
     this.generations = new GenerationRegistry(this);
+    this.history = createObservationHistory(options.observationHistory);
     this.#observer = new NotebookObserver(this);
     this.#observer.attach();
   }
@@ -197,13 +210,67 @@ export class NotebookModel {
     }
     const cell = resolveCell(this.notebook, entry);
     const type = cellTypeOf(cell);
-    return {
+    const observation: CellObservation = {
       cellId: entry.cellId,
       identityToken: entry.identityToken,
       sourceRevision: sourceRevision(type, cell.getSource()),
       cellRevision: cellRevision(cellJson(cell)),
       outputsRevision: isCodeCell(cell) ? outputsRevision(outputsOf(cell)) : null
     };
+    this.#remember(entry, observation);
+    return observation;
+  }
+
+  /** Current notebook metadata revision, remembered as a later merge base. */
+  notebookMetadataRevision(): NotebookMetadataRevision {
+    this.#assertLive();
+    const revision = metadataRevisionOf(this.notebook);
+    this.history.notebookMetadata.remember(revision, () =>
+      structuredClone((this.notebook.getMetadata() ?? {}) as MetadataObject)
+    );
+    return revision;
+  }
+
+  /**
+   * Record what stands behind the revisions of one row being handed out. Runs
+   * in the same synchronous step that computed them, so the live cell still
+   * has exactly those revisions.
+   */
+  #remember(
+    entry: CellEntry,
+    row: { readonly sourceRevision?: string; readonly cellRevision?: string }
+  ): void {
+    const cell = resolveCell(this.notebook, entry);
+    if (row.sourceRevision !== undefined) {
+      this.history.sources.remember(row.sourceRevision, () => ({
+        type: cellTypeOf(cell),
+        source: cell.getSource()
+      }));
+    }
+    if (row.cellRevision !== undefined) {
+      this.history.cellMetadata.remember(row.cellRevision, () => {
+        const metadata = (cellJson(cell) as MetadataObject)['metadata'];
+        return typeof metadata === 'object' && metadata !== null && !Array.isArray(metadata)
+          ? structuredClone(metadata as MetadataObject)
+          : {};
+      });
+    }
+  }
+
+  /** {@link #remember} for read rows, matched to live cells by identity. */
+  #rememberRows(
+    rows: readonly {
+      readonly identityToken?: string;
+      readonly sourceRevision?: string;
+      readonly cellRevision?: string;
+    }[]
+  ): void {
+    if (rows.length === 0) return;
+    const byIdentity = new Map(this.index.entries.map((entry) => [entry.identityToken, entry]));
+    for (const row of rows) {
+      const entry = row.identityToken === undefined ? undefined : byIdentity.get(row.identityToken);
+      if (entry !== undefined) this.#remember(entry, row);
+    }
   }
 
   /** Ids that currently address more than one cell (SPEC.md §7). */
@@ -249,10 +316,14 @@ export class NotebookModel {
       nbformat: typeof nbformat === 'number' ? nbformat : null,
       nbformatMinor: typeof nbformatMinor === 'number' ? nbformatMinor : null,
       cellCount: this.index.size,
-      cells: slice.map((entry) => summaryRow(this.notebook, entry, this.index, previewChars)),
+      cells: slice.map((entry) => {
+        const row = summaryRow(this.notebook, entry, this.index, previewChars);
+        this.#remember(entry, row);
+        return row;
+      }),
       truncated: more,
       structureRevision: structure,
-      notebookMetadataRevision: metadataRevisionOf(this.notebook),
+      notebookMetadataRevision: this.notebookMetadataRevision(),
       duplicateCellIds: this.index.duplicateIds,
       changesCursor: this.journal.cursor,
       ...(more ? { pageCursor: makePageCursor(binding, end) } : {})
@@ -274,13 +345,17 @@ export class NotebookModel {
   /** `notebook_read(view: 'cells')` (SPEC.md §9). */
   readCells(selector?: CellSelector, limits?: ReadLimits): CellsRead {
     this.#assertLive();
-    return readCells(this.notebook, this.index, selector, limits);
+    const read = readCells(this.notebook, this.index, selector, limits);
+    this.#rememberRows(read.cells);
+    return read;
   }
 
   /** `notebook_read(view: 'outputs')` (SPEC.md §9). */
   readOutputs(cellIds: readonly string[], limits?: ReadLimits): OutputsRead {
     this.#assertLive();
-    return readOutputs(this.notebook, this.index, cellIds, limits);
+    const read = readOutputs(this.notebook, this.index, cellIds, limits);
+    this.#rememberRows(read.cells);
+    return read;
   }
 
   // -------------------------------------------------------------------------
@@ -302,7 +377,7 @@ export class NotebookModel {
    */
   apply(operations: readonly ModelOperation[]): ModelApplyResult {
     this.#assertLive();
-    const plan = planOperations(this.notebook, this.index, operations);
+    const plan = planOperations(this.notebook, this.index, operations, this.history);
     const created: CreatedCells = new Map();
     const failure: { at: number | null; error: CoreError | null } = { at: null, error: null };
 
@@ -405,14 +480,14 @@ export class NotebookModel {
 
   #resultOf(op: OperationResult['op'], cellId: string | null): OperationResult {
     if (op === 'set_notebook_metadata' || op === 'delete_notebook_metadata') {
-      return { op, notebookMetadataRevision: metadataRevisionOf(this.notebook) };
+      return { op, notebookMetadataRevision: this.notebookMetadataRevision() };
     }
     if (cellId === null) return { op };
     if (op === 'delete_cell' || !this.index.isUnique(cellId)) return { op };
     const entry = this.index.require(cellId);
     const cell = resolveCell(this.notebook, entry);
     const type = cellTypeOf(cell);
-    return {
+    const result = {
       op,
       cellId,
       identityToken: entry.identityToken,
@@ -421,6 +496,8 @@ export class NotebookModel {
       cellRevision: cellRevision(cellJson(cell)),
       outputsRevision: isCodeCell(cell) ? outputsRevision(outputsOf(cell)) : null
     };
+    this.#remember(entry, result);
+    return result;
   }
 
   // -------------------------------------------------------------------------

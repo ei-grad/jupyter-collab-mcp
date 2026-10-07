@@ -324,6 +324,7 @@ describe('implicit MCP working context', () => {
     const observed = String((((opened.structuredContent?.['summary'] as Record<string, unknown>)['cells'] as Record<string, unknown>[])[0]!)['cell_ref']);
     const cell = handles[0]!.notebook.getCell(0) as unknown as {
       setOutputs(outputs: unknown[]): void;
+      setMetadata(metadata: Record<string, unknown>): void;
     };
     cell.setOutputs([{ output_type: 'stream', name: 'stdout', text: 'remote output' }]);
 
@@ -336,27 +337,38 @@ describe('implicit MCP working context', () => {
     const currentRef = String(((sourceEdit.structuredContent?.['results'] as Record<string, unknown>[])[0]!)['cell_ref']);
     expect(currentRef).not.toBe(observed);
 
-    const staleFullCell = await connection.call('notebook_apply', {
+    const otherKey = await connection.call('notebook_apply', {
       notebook_id: notebookId,
       request_id: '2',
+      operations: [{ op: 'set_cell_metadata', cell_ref: observed, key: 'other', value: true }]
+    });
+    expect(otherKey.isError).not.toBe(true);
+
+    cell.setMetadata({ probe: 'remote' });
+    const staleKey = await connection.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '3',
       operations: [{ op: 'set_cell_metadata', cell_ref: observed, key: 'probe', value: true }]
     });
-    const conflict = metaError(staleFullCell);
+    const conflict = metaError(staleKey);
     expect(conflict).toMatchObject({
       code: 'REVISION_CONFLICT',
-      next_request_id: '2',
+      next_request_id: '3',
       request_accepted: false,
-      current_cell_ref: currentRef
+      current_cell_ref: expect.stringMatching(/^@/u),
+      details: { reason: 'changed', metadata_key: 'probe' }
     });
+    expect(conflict['current_cell_ref']).not.toBe(observed);
     expect((conflict['details'] as Record<string, unknown>)['preview']).toBeTypeOf('string');
     expect(conflict['details']).not.toHaveProperty('expected');
     expect(conflict['details']).not.toHaveProperty('current');
-    const text = staleFullCell.content.find((block) => block.type === 'text')?.text ?? '';
-    expect(text).toContain(`current_cell_ref=${currentRef}`);
+    const text = staleKey.content.find((block) => block.type === 'text')?.text ?? '';
+    expect(text).toContain(`current_cell_ref=${String(conflict['current_cell_ref'])}`);
+    expect(text).toContain('metadata key "probe" changed since it was read');
     expect(text).not.toMatch(/"(?:expected|current)":/u);
   });
 
-  it('keeps strict same-ref batch conflicts recoverable without exposing revision hashes', async () => {
+  it('keeps overlapping same-ref batch conflicts recoverable without exposing revision hashes', async () => {
     const { connection, handles } = await rig();
     const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
     const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
@@ -373,22 +385,77 @@ describe('implicit MCP working context', () => {
       ]
     });
     const conflict = metaError(answer);
+    const message =
+      `cell_ref "${observed}": the requested source overlaps an earlier operation of this batch on the same lines`;
     expect(conflict).toMatchObject({
       code: 'REVISION_CONFLICT',
-      message: `cell_ref "${observed}" is stale because the cell changed since it was read`,
+      message,
       next_request_id: '1',
       request_accepted: false,
       current_cell_ref: observed,
-      details: { preview: attempted }
+      details: { reason: 'overlapping_edits', in_batch: true, preview: original }
     });
     expect(conflict['details']).not.toHaveProperty('expected');
     expect(conflict['details']).not.toHaveProperty('current');
     const text = answer.content.find((block) => block.type === 'text')?.text ?? '';
-    expect(text).toContain(`cell_ref "${observed}" is stale because the cell changed since it was read`);
+    expect(text).toContain(message);
     expect(text).toContain(`current_cell_ref=${observed}`);
-    expect(text).toContain(attempted);
+    expect(text).not.toContain(attempted);
     expect(text).not.toMatch(/"(?:expected|current)":/u);
     expect(handles[0]!.notebook.getCell(0).getSource()).toBe(original);
+  });
+
+  it('applies several replace_text operations through one cell_ref after a remote edit', async () => {
+    const { connection, handles } = await rig();
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const cell = handles[0]!.notebook.getCell(0) as unknown as {
+      setSource(source: string): void;
+      getSource(): string;
+    };
+    cell.setSource('def dups(table, plat):\n    return f(table, plat)\n');
+    const read = await connection.call('notebook_read', { notebook_id: notebookId, view: 'cells' });
+    const observed = String(((read.structuredContent?.['cells'] as Record<string, unknown>[])[0]!)['cell_ref']);
+    cell.setSource(`# edited in the browser\n${cell.getSource()}`);
+
+    const answer = await connection.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '1',
+      operations: [
+        { op: 'replace_text', cell_ref: observed, old_text: 'def dups(table, plat):', new_text: 'def dups(table, plat, params):' },
+        { op: 'replace_text', cell_ref: observed, old_text: 'f(table, plat)', new_text: 'f(table, plat, params)' },
+        { op: 'replace_text', cell_ref: observed, old_text: '# edited in the browser', new_text: '# edited together' }
+      ]
+    });
+    expect(answer.isError).not.toBe(true);
+    expect(cell.getSource()).toBe('# edited together\ndef dups(table, plat, params):\n    return f(table, plat, params)\n');
+  });
+
+  it('merges replace_source from an add_cell ref with a remote edit of another line', async () => {
+    const { connection, handles } = await rig();
+    const opened = await connection.call('notebook_open', { path: 'a.ipynb' });
+    const notebookId = String((opened.structuredContent?.['notebook'] as Record<string, unknown>)['notebook_id']);
+    const added = await connection.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '1',
+      operations: [{ op: 'add_cell', cell_type: 'code', source: 'a = 1\nb = 2\n', position: 'end' }]
+    });
+    const result = (added.structuredContent?.['results'] as Record<string, unknown>[])[0]!;
+    const observed = String(result['cell_ref']);
+    const index = Number(result['index']);
+    const cell = handles[0]!.notebook.getCell(index) as unknown as {
+      setSource(source: string): void;
+      getSource(): string;
+    };
+    cell.setSource('a = 100\nb = 2\n');
+
+    const merged = await connection.call('notebook_apply', {
+      notebook_id: notebookId,
+      request_id: '2',
+      operations: [{ op: 'replace_source', cell_ref: observed, source: 'a = 1\nb = 20\n' }]
+    });
+    expect(merged.isError).not.toBe(true);
+    expect(cell.getSource()).toBe('a = 100\nb = 20\n');
   });
 
   it('lets a source-only change keep the observed outputs guard usable', async () => {
@@ -435,7 +502,7 @@ describe('implicit MCP working context', () => {
     const notebookRef = String(initial.structuredContent?.['notebook_ref']);
     const cell = handles[0]!.notebook.getCell(0) as unknown as { setSource(source: string): void };
     cell.setSource('changed after observation');
-    handles[0]!.notebook.setMetadata('remote', true);
+    handles[0]!.notebook.setMetadata('agent', 'set remotely');
 
     const refreshed = await connection.call('notebook_read', {
       notebook_id: notebookId,

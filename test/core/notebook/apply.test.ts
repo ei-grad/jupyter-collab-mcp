@@ -355,13 +355,13 @@ describe('apply: metadata operations (SPEC.md §7, §12 "Tool coverage")', () =>
     });
   });
 
-  it('guards notebook metadata and keeps unrelated keys', () => {
+  it('guards only the written notebook metadata key and keeps unrelated keys', () => {
     const peer = peerWith([codeCell('a', 'x')], {
       kernelspec: { name: 'python3' },
       language_info: { name: 'python' }
     });
     const stale = peer.model.summary().notebookMetadataRevision;
-    peer.notebook.setMetadata('touched_elsewhere', true);
+    peer.notebook.setMetadata('authors', [{ name: 'collaborator' }]);
     expectThrows(
       () =>
         peer.model.apply([
@@ -374,11 +374,14 @@ describe('apply: metadata operations (SPEC.md §7, §12 "Tool coverage")', () =>
         ]),
       'REVISION_CONFLICT'
     );
+    expect(peer.notebook.getMetadata()).toMatchObject({ authors: [{ name: 'collaborator' }] });
 
+    const observed = peer.model.summary().notebookMetadataRevision;
+    peer.notebook.setMetadata('touched_elsewhere', true);
     const result = peer.model.apply([
       {
         op: 'set_notebook_metadata',
-        expectedNotebookMetadataRevision: peer.model.summary().notebookMetadataRevision,
+        expectedNotebookMetadataRevision: observed,
         key: 'authors',
         value: [{ name: 'agent' }]
       }

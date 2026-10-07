@@ -418,8 +418,6 @@ export interface DeleteCellMetadataOperation {
 /** Set one notebook metadata key (SPEC.md §7). */
 export interface SetNotebookMetadataOperation {
   readonly op: 'set_notebook_metadata';
-  /** Internal marker that the guard came from an immutable `notebook_ref`. */
-  readonly expectedNotebookObserved?: boolean;
   readonly expectedNotebookMetadataRevision: NotebookMetadataRevision;
   readonly key: string;
   readonly value: unknown;
@@ -428,7 +426,6 @@ export interface SetNotebookMetadataOperation {
 /** Delete one notebook metadata key (SPEC.md §7). */
 export interface DeleteNotebookMetadataOperation {
   readonly op: 'delete_notebook_metadata';
-  readonly expectedNotebookObserved?: boolean;
   readonly expectedNotebookMetadataRevision: NotebookMetadataRevision;
   readonly key: string;
 }

@@ -670,6 +670,82 @@ describe('Bidirectional RTC / Cursors (SPEC §12)', () => {
     }
   }, 120_000);
 
+  it('merges the agent\'s edits through one observed ref with a person\'s edit of another line', async () => {
+    const added = await mcp.call('notebook_apply', {
+      notebook_id: docId,
+      request_id: main.counter.value,
+      operations: [{
+        op: 'add_cell',
+        cell_type: 'code',
+        source: `# merge-${RUN}\na = 1\nb = 2\nc = 3\n`,
+        position: 'end'
+      }]
+    });
+    main.counter.take(added);
+    const observed = str(list(added['results'])[0]?.['cell_ref']);
+    const remote = await openRemote(stand, docPath);
+    try {
+      await until('the second client sees the cell', () => {
+        for (let index = 0; index < remote.notebook.cells.length; index += 1) {
+          if (remote.notebook.getCell(index).getSource().startsWith(`# merge-${RUN}`)) return true;
+        }
+        return false;
+      });
+      const remoteCell = (): ReturnType<typeof remote.notebook.getCell> => {
+        for (let index = 0; index < remote.notebook.cells.length; index += 1) {
+          const cell = remote.notebook.getCell(index);
+          if (cell.getSource().startsWith(`# merge-${RUN}`)) return cell;
+        }
+        throw new Error('merge cell disappeared');
+      };
+      const person = `# merge-${RUN}\na = 100  # typed by a person\nb = 2\nc = 3\n`;
+      remoteCell().setSource(person);
+      let replicaSource = '';
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline) {
+        const read = await mcp.call('notebook_read', { notebook_id: docId, view: 'cells', cell_refs: [observed] });
+        replicaSource = str(list(read['cells'])[0]?.['source']);
+        if (replicaSource === person) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(replicaSource).toBe(person);
+
+      const texts = await mcp.call('notebook_apply', {
+        notebook_id: docId,
+        request_id: main.counter.value,
+        operations: [
+          { op: 'replace_text', cell_ref: observed, old_text: 'b = 2', new_text: 'b = 20' },
+          { op: 'replace_text', cell_ref: observed, old_text: 'b = 20\n', new_text: 'b = 20\nb2 = b\n' }
+        ]
+      });
+      main.counter.take(texts);
+      const full = await mcp.call('notebook_apply', {
+        notebook_id: docId,
+        request_id: main.counter.value,
+        operations: [{ op: 'replace_source', cell_ref: observed, source: `# merge-${RUN}\na = 1\nb = 2\nc = 30\n` }]
+      });
+      main.counter.take(full);
+
+      const expected = `# merge-${RUN}\na = 100  # typed by a person\nb = 20\nb2 = b\nc = 30\n`;
+      await until('the person sees both sides merged', () => remoteCell().getSource() === expected);
+
+      const overlap = await mcp.fail('notebook_apply', {
+        notebook_id: docId,
+        request_id: main.counter.value,
+        operations: [{ op: 'replace_source', cell_ref: observed, source: `# merge-${RUN}\na = 2\nb = 2\nc = 3\n` }]
+      });
+      expect(overlap).toMatchObject({
+        code: 'REVISION_CONFLICT',
+        side_effects: 'none',
+        request_accepted: false,
+        details: { reason: 'overlapping_edits', in_batch: false }
+      });
+      expect(remoteCell().getSource()).toBe(expected);
+    } finally {
+      remote.dispose();
+    }
+  }, 120_000);
+
   it('a changes cursor the journal moved past is CURSOR_EXPIRED, not silently skipped', async () => {
     // The journal ring is a configured limit (§9 default 10 000), so this
     // needs its own process with a tiny one - which also exercises --config.

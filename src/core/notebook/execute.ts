@@ -66,12 +66,13 @@ export function executeOne(notebook: YNotebook, planned: PlannedOp, created: Cre
     }
     case 'text': {
       const cell = cellOf(notebook, planned.target, created);
-      const { index, deleteCount, insert } = planned.edit;
       const ysource = cell.ysource;
-      // Insert first, then delete: this is what `YBaseCell.updateSource` does,
-      // and it keeps a remote cursor sitting after the edited range in place.
-      if (insert.length > 0) ysource.insert(index, insert);
-      if (deleteCount > 0) ysource.delete(index + insert.length, deleteCount);
+      for (const { index, deleteCount, insert } of planned.edits) {
+        // Insert first, then delete: this is what `YBaseCell.updateSource` does,
+        // and it keeps a remote cursor sitting after the edited range in place.
+        if (insert.length > 0) ysource.insert(index, insert);
+        if (deleteCount > 0) ysource.delete(index + insert.length, deleteCount);
+      }
       return;
     }
     case 'delete': {

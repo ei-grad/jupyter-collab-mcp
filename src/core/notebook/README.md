@@ -91,11 +91,20 @@ synchronous `ydoc.transact` by `execute.ts`. Operations come from
 `delete_cell`, `clear_outputs`, `set/delete_cell_metadata`, and
 `set/delete_notebook_metadata`.
 
-- `replace_source` applies the smallest edit to the existing `Y.Text` (shared
-  prefix/suffix), preserving the cell object; an idempotent replacement emits
-  no update at all.
-- `replace_text` requires exactly one match (`MATCH_NOT_FOUND` /
+- `replace_source` merges the caller's change into the current text
+  (`merge.ts`: line-level three-way merge over a Myers diff, base taken from
+  the pre-batch source or `model.history`) and writes one minimal edit per
+  changed region, preserving the cell object and the CRDT identity of the text
+  between regions; an idempotent replacement emits no update at all.
+  Overlapping line changes are `REVISION_CONFLICT` (`reason:
+  overlapping_edits`, `in_batch`, base line ranges).
+- `replace_text` checks only identity and requires exactly one match in the
+  simulated text at that point of the batch (`MATCH_NOT_FOUND` /
   `MATCH_NOT_UNIQUE`).
+- `observation-history.ts` keeps, per model, the content behind every source,
+  full-cell and notebook-metadata revision the model hands out (`observeCell`,
+  reads, summaries, apply results), bounded LRU by size and count. It is
+  recorded in the same synchronous step that computed the revision.
 - A metadata key may be a string or an array path such as
   `['jupyter','x']`. All other keys are preserved—literally: writes go
   **directly to the metadata `Y.Map`** (`execute.ts`, `writeMetadataKey`), not
@@ -109,16 +118,14 @@ synchronous `ydoc.transact` by `execute.ts`. Operations come from
   deletes `collapsed`, and `setMetadata('collapsed', v)` writes
   `jupyter.outputs_hidden`. Direct per-key writes match the batch simulation,
   so a revision cited by the next operation in the same batch remains valid.
-- A revision check accepts the value from before the batch or from after
-  earlier operations in that batch; otherwise a batch could not touch one cell
-  twice. The exception is a **repeated full replacement**: a second
-  `replace_source` for the same cell that cites the pre-batch revision is
-  rejected with `REVISION_CONFLICT` before the first mutation. Otherwise the
-  first operation's text would disappear with neither an error nor an
-  indication in the response. A `replace_text` chain remains allowed because
-  it is bound to a substring that must exist.
-- `REVISION_CONFLICT` contains `expected`, `current`, and a bounded `preview`
-  (SPEC.md §7). The preview is a single line of at most 120 characters and
+- Keyed metadata writes compare only the written top-level key with the
+  observed metadata; delete and clear-output accept the revision from before
+  the batch or from after earlier operations in that batch. A second
+  `replace_source` of the same observation is merged with the first one like
+  any other change, so rewriting the same lines twice is a conflict rather than
+  a silent loss of the first text.
+- `REVISION_CONFLICT` contains `reason`, `expected`, `current`, and a bounded
+  `preview` of the live pre-batch content (SPEC.md §7). The preview is a single line of at most 120 characters and
   passes through `redactCredentials` (SPEC.md §11). For outputs it describes
   the output area ("2 output(s): stream, error"); for metadata it lists keys
   without values.

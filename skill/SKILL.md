@@ -54,7 +54,8 @@ read reports a source cursor, continue it before acting on the incomplete source
 Match change events to read rows by `cell_id`. `cell_refs` in a cells or outputs
 read also accepts a `cell_id` from this connection and returns a fresh
 `cell_ref` for the current cell. A `cell_id` cannot target an edit or run.
-After `source_changed`, re-read that cell before editing or executing it;
+After `source_changed`, re-read that cell before executing it or before an edit
+that depends on its content;
 `outputs_changed` leaves its `cell_ref` valid for source edits and execution.
 After `cell_deleted`, discard its ref. A local mutation response already gives
 current refs for surviving targets. Change events do not issue observed refs.
@@ -69,6 +70,16 @@ operations use `notebook_ref`; add-cell anchors are `before_cell_ref` or
 `after_cell_ref`. Prefer `replace_text` (exact, unique substring) over rewriting
 a whole cell. The answer gives final refs for surviving targets,
 `delivery` and `persistence`: an applied edit is not a saved file.
+
+The notebook is shared and edits merge; a `cell_ref` says which cell and what
+you saw, it is not a lock. One batch may carry several operations on the same
+`cell_ref`: each `replace_text` matches its `old_text` exactly once in the
+cell's text *at that point* - after the user's edits and the earlier
+operations of the batch - so keep anchors distinctive. `replace_source` merges
+your change (from the source you read to the one you send) with whatever
+changed since, line by line; only changes to the same lines conflict.
+Keyed metadata writes only conflict when someone changed that same key.
+`delete_cell` and `clear_outputs` still refuse a cell someone else changed.
 
 `notebook_execute {notebook_id, request_id, cells[{cell_ref}], wait_ms?}` runs
 the cells in the notebook, so the
@@ -157,12 +168,18 @@ An explicitly requested unavailable name is an error, not a fallback.
   `cell_ref "<ref>" does not identify a unique live cell` (or `a supplied cell
   reference ...`) means re-read the summary and select a uniquely addressable
   cell; do not guess among duplicates.
-  `cell_ref "<ref>" is stale because the cell changed since it was read` means
-  inspect the current content and decide again. `cell_ref "<ref>" was
-  invalidated by an earlier operation in this batch` means the batch reused one
-  observed ref after changing its guarded scope; split the work or re-read
-  between operations. Apply the same recovery to `before_cell_ref` and
-  `after_cell_ref`; do not force the old text back.
+  `REVISION_CONFLICT` changes nothing; its `details.preview` is the live text.
+  `... overlaps edits made to the same lines since it was read` means someone
+  else rewrote lines you rewrote: read the cell, reconcile, and send again with
+  the fresh ref. `... overlaps an earlier operation of this batch` means two of
+  your own operations rewrote the same lines from one observation: combine them
+  into one operation. `... was read too long ago to merge` means the observation
+  is no longer known: read the cell again. `... is stale because the cell
+  changed since it was read` (delete, clear-output, execution) means inspect the
+  current content and decide again. Apply the same recovery to
+  `before_cell_ref` and `after_cell_ref`; do not force the old text back.
+  `MATCH_NOT_FOUND` / `MATCH_NOT_UNIQUE` on `replace_text` refer to the text at
+  that point of the batch.
 - `NOT_READY` is retryable; `RTC_SESSION_REJECTED`, `RTC_CONFLICT`,
   `FILE_ID_CHANGED` mean this replica is dead. Do not call `notebook_open`
   immediately: the same session would reuse the terminal handle. First let

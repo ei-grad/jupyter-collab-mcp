@@ -103,7 +103,7 @@ import {
 import type { NotebookReadResultFor } from '../core/service.js';
 import { cellTypeOf, isCodeCell, previewOf } from '../core/notebook/index.js';
 import { planOperations } from '../core/notebook/plan.js';
-import { metadataRevisionOf, resolveCell } from '../core/notebook/read.js';
+import { resolveCell } from '../core/notebook/read.js';
 import { withIdentity } from '../core/notebook/types.js';
 import { normalizeContentsPath, validateNotebookName } from '../jupyter/paths.js';
 import { installStdoutGuard, isStdoutGuardInstalled } from '../jupyter/stdout-guard.js';
@@ -764,7 +764,7 @@ class CollabServiceImpl implements CollabService {
             truncated: read.truncated,
             ...(read.nextCursor === undefined ? {} : { nextCursor: read.nextCursor }),
             ...(metadata === null ? {} : { notebookMetadata: metadata }),
-            notebookMetadataRevision: metadataRevisionOf(handle.notebook)
+            notebookMetadataRevision: handle.model.notebookMetadataRevision()
           };
           const envelope = session.envelope();
           const response = { ...(result as NotebookReadResultFor<R>), ...envelope };
@@ -821,7 +821,7 @@ class CollabServiceImpl implements CollabService {
         structureRevision: structure,
         changesCursor,
         cells,
-        notebookMetadataRevision: metadataRevisionOf(handle.notebook),
+        notebookMetadataRevision: handle.model.notebookMetadataRevision(),
         truncated: read.truncated || nextCursor !== undefined,
         cellsTruncated: nextCursor !== undefined || read.cells.length < cellIds.length,
         outputsTruncated: read.cells.some((cell) => cell.truncated),
@@ -855,7 +855,7 @@ class CollabServiceImpl implements CollabService {
         // expected error to be raised before the first mutation, and SPEC.md §9
         // requires such a rejection to leave the request number unused. The
         // planner is pure, so running it twice costs a walk of the batch.
-        planOperations(handle.notebook, handle.model.index, request.operations);
+        planOperations(handle.notebook, handle.model.index, request.operations, handle.model.history);
       } catch (error) {
         throw withEnvelopeDetails(
           withNotebookDetails(error, handle.notebookId),
@@ -2455,7 +2455,7 @@ class CollabServiceImpl implements CollabService {
       kernelName: after?.kernelName ?? null,
       jupyterSessionId: after?.id ?? null,
       effects: controlEffects,
-      notebookMetadataRevision: metadataRevisionOf(handle.notebook),
+      notebookMetadataRevision: handle.model.notebookMetadataRevision(),
       status
     };
   }

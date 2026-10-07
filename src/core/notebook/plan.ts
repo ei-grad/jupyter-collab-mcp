@@ -22,6 +22,7 @@ import type { YNotebook } from '@jupyter/ydoc';
 import { coreError, redactCredentials } from '../errors.js';
 import type { JsonValue } from '../revision.js';
 import {
+  canonicalJson,
   cellRevision,
   isRevisionOfKind,
   notebookMetadataRevision,
@@ -34,7 +35,9 @@ import { cellJson, resolveCell } from './read.js';
 import { deleteAtPath, normalizePath, setAtPath } from './metadata.js';
 import type { MetadataObject } from './metadata.js';
 import type { ModelOperation } from './types.js';
-import { findSingleOccurrence, minimalReplace, previewOf } from './text.js';
+import { mergeSources, regionEdits } from './merge.js';
+import type { ObservationHistory } from './observation-history.js';
+import { findSingleOccurrence, previewOf } from './text.js';
 import type { TextEdit } from './text.js';
 
 /** Mutable nbformat cell JSON used by the simulation. */
@@ -54,15 +57,6 @@ export interface SimCell {
    * cannot possibly quote a revision this batch has not produced yet.
    */
   readonly original: CellJsonObject;
-  /**
-   * How many operations of this batch already changed the source.
-   *
-   * The leniency above exists for *chained* edits; it must not extend to a
-   * whole-source overwrite of a value the same batch already replaced, which
-   * would drop the earlier text with no error and no way for the caller to
-   * notice - see {@link Simulation.guard}.
-   */
-  sourceEdits: number;
 }
 
 /** Bound and redact a conflict preview (SPEC.md §7, §11). */
@@ -89,7 +83,13 @@ function metadataPreview(metadata: MetadataObject): string {
 /** A concrete instruction for the executor; all addressing already resolved. */
 export type PlannedOp =
   | { readonly kind: 'insert'; readonly op: OperationKind; readonly at: number; readonly cell: SimCell }
-  | { readonly kind: 'text'; readonly op: OperationKind; readonly target: SimCell; readonly edit: TextEdit }
+  | {
+      readonly kind: 'text';
+      readonly op: OperationKind;
+      readonly target: SimCell;
+      /** Disjoint edits in descending index order, applied one after another. */
+      readonly edits: readonly TextEdit[];
+    }
   | { readonly kind: 'delete'; readonly op: OperationKind; readonly at: number; readonly target: SimCell }
   | { readonly kind: 'clear'; readonly op: OperationKind; readonly target: SimCell }
   | {
@@ -173,7 +173,7 @@ class Simulation {
       const json = cellJson(resolveCell(notebook, entry)) as CellJsonObject;
       // A shallow copy is enough: every mutation below replaces a top-level
       // property with a freshly built value and never edits one in place.
-      return { id: entry.cellId, entry, json, original: { ...json }, sourceEdits: 0 };
+      return { id: entry.cellId, entry, json, original: { ...json } };
     });
     this.#metadata = asObject(notebook.getMetadata());
     this.#originalMetadata = this.#metadata;
@@ -214,18 +214,12 @@ class Simulation {
   }
 
   /**
-   * Check one `expected_*` revision (SPEC.md §7).
+   * Check one `expected_*` revision of a destructive operation (SPEC.md §7).
    *
    * Accepts the value the replica had when the batch started as well as the
-   * simulated value after the earlier operations of the same batch, so a batch
-   * may touch one cell twice while still refusing a genuinely stale revision.
-   *
-   * `strict` switches that leniency off for a *destructive* repeat: a second
-   * full `replace_source` of one cell quoting the pre-batch revision would
-   * silently discard what the first one wrote, and the caller could not tell -
-   * `applied_locally` would be `true` and both results would report the final
-   * revision. A chained `replace_text` is anchored on text that must still be
-   * there, so it stays lenient.
+   * simulated value after the earlier operations of the same batch: the guard
+   * protects against changes the caller has not seen from *other* writers,
+   * and the caller's own batch is not one of them.
    *
    * The error carries the current revision **and** a bounded preview, which is
    * what SPEC.md §7 asks for: "return `REVISION_CONFLICT` with the current
@@ -237,16 +231,124 @@ class Simulation {
     current: string,
     original: string,
     details: Record<string, unknown>,
-    preview: () => string,
-    strict = false
+    preview: () => string
   ): void {
-    if (expected === current) return;
-    if (!strict && expected === original) return;
-    throw coreError(
-      'REVISION_CONFLICT',
-      'the reference changed since it was observed',
-      { details: { ...details, expected, current, preview: preview() } }
-    );
+    if (expected === current || expected === original) return;
+    throw coreError('REVISION_CONFLICT', 'the reference changed since it was observed', {
+      details: { ...details, reason: 'changed', expected, current, preview: preview() }
+    });
+  }
+}
+
+/**
+ * The source a `replace_source` was derived from: the pre-batch text when the
+ * caller observed that, otherwise whatever {@link SourceHistory} still holds.
+ */
+function mergeBase(
+  cell: SimCell,
+  expected: string,
+  history: ObservationHistory | undefined
+): { readonly type: CellType; readonly source: string } | undefined {
+  const type = cellTypeOfJson(cell.original);
+  const source = sourceOfJson(cell.original);
+  if (sourceRevision(type, source) === expected) return { type, source };
+  return history?.sources.get(expected);
+}
+
+/**
+ * Guard of a keyed metadata write (SPEC.md §7).
+ *
+ * The executor rewrites only the top-level key the path starts with, so that
+ * key is the whole scope: changes elsewhere in the cell or notebook since the
+ * observation do not matter. With the observed metadata unknown, the write
+ * falls back to requiring the observed revision itself.
+ */
+function guardMetadataKey(
+  topKey: string,
+  expected: string,
+  observed: MetadataObject | undefined,
+  original: MetadataObject,
+  originalRevision: string,
+  details: Record<string, unknown>
+): void {
+  if (expected === originalRevision) return;
+  if (observed !== undefined && sameJson(observed[topKey], original[topKey])) return;
+  throw coreError('REVISION_CONFLICT', conflictMessage('changed'), {
+    details: {
+      ...details,
+      reason: observed === undefined ? 'base_unavailable' : 'changed',
+      metadata_key: topKey,
+      expected,
+      current: originalRevision,
+      preview: metadataPreview(original)
+    }
+  });
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return canonicalJson(left as JsonValue) === canonicalJson(right as JsonValue);
+}
+
+/**
+ * The text a `replace_source` leaves in the cell (SPEC.md §7).
+ *
+ * The caller's change - from the source it observed to `requested` - is merged
+ * into the current text, which may since have been edited by a collaborator or
+ * by an earlier operation of this batch. Overlapping changes, an unknown base,
+ * or a cell type that changed under the caller are a `REVISION_CONFLICT`.
+ */
+function mergedSource(
+  cell: SimCell,
+  type: CellType,
+  current: string,
+  expected: string,
+  requested: string,
+  history: ObservationHistory | undefined
+): string {
+  if (sourceRevision(type, current) === expected) return requested;
+  // A rejected batch applies nothing, so the conflict describes the live
+  // pre-batch text - what a fresh read returns - never a simulated state.
+  const live = sourceOfJson(cell.original);
+  const fail = (reason: string, extra: Record<string, unknown> = {}): never => {
+    throw coreError('REVISION_CONFLICT', conflictMessage(reason), {
+      details: {
+        ...observationDetails(cell),
+        reason,
+        ...extra,
+        expected,
+        current: sourceRevision(cellTypeOfJson(cell.original), live),
+        preview: boundedPreview(live)
+      }
+    });
+  };
+  const base = mergeBase(cell, expected, history);
+  if (base === undefined) return fail('base_unavailable');
+  if (base.type !== type) return fail('cell_type_changed');
+  const merged = mergeSources(base.source, current, requested);
+  if (merged.kind === 'merged') return merged.text;
+  const originalRevision = sourceRevision(cellTypeOfJson(cell.original), sourceOfJson(cell.original));
+  return fail('overlapping_edits', {
+    // The cell was unchanged when the batch started, so the competing edit is
+    // one of this batch's own earlier operations.
+    in_batch: originalRevision === expected,
+    conflicts: merged.conflicts.slice(0, 8).map((conflict) => ({
+      base_line: conflict.baseLine + 1,
+      base_lines: conflict.baseLines
+    }))
+  });
+}
+
+function conflictMessage(reason: string): string {
+  switch (reason) {
+    case 'overlapping_edits':
+      return 'the requested source overlaps changes made since it was observed';
+    case 'base_unavailable':
+      return 'the observed source is no longer known, so changes made since cannot be merged';
+    case 'cell_type_changed':
+      return 'the cell type changed since it was observed';
+    default:
+      return 'the reference changed since it was observed';
   }
 }
 
@@ -322,7 +424,8 @@ function requireAnchorIdentity(entry: CellEntry | null, expected: unknown, cellI
 export function planOperations(
   notebook: YNotebook,
   index: CellIndex,
-  operations: readonly ModelOperation[]
+  operations: readonly ModelOperation[],
+  history: ObservationHistory
 ): Plan {
   const sim = new Simulation(notebook, index);
   const ops: PlannedOp[] = [];
@@ -350,7 +453,7 @@ export function planOperations(
           metadata,
           ...(operation.cellType === 'code' ? { outputs: [], execution_count: null } : {})
         };
-        const cell: SimCell = { id, entry: null, json, original: { ...json }, sourceEdits: 0 };
+        const cell: SimCell = { id, entry: null, json, original: { ...json } };
         sim.order.splice(at, 0, cell);
         ops.push({ kind: 'insert', op: 'add_cell', at, cell });
         targets.push(id);
@@ -362,23 +465,13 @@ export function planOperations(
         requireTargetIdentity(cell, operation.expectedCellIdentityToken);
         const type = cellTypeOfJson(cell.json);
         const current = sourceOfJson(cell.json);
-        sim.guard(
-          operation.expectedSourceRevision,
-          sourceRevision(type, current),
-          sourceRevision(cellTypeOfJson(cell.original), sourceOfJson(cell.original)),
-          observationDetails(cell),
-          () => boundedPreview(current),
-          // A full overwrite of a source this batch already rewrote must quote
-          // the value it is overwriting, not the pre-batch one.
-          operation.expectedCellIdentityToken !== undefined || cell.sourceEdits > 0
-        );
-        const edit = minimalReplace(current, operation.source);
-        cell.json['source'] = operation.source;
-        cell.sourceEdits++;
+        const next = mergedSource(cell, type, current, operation.expectedSourceRevision, operation.source, history);
+        const edits = regionEdits(current, next);
+        cell.json['source'] = next;
         ops.push(
-          edit === null
+          edits.length === 0
             ? { kind: 'noop', op: 'replace_source', target: cell }
-            : { kind: 'text', op: 'replace_source', target: cell, edit }
+            : { kind: 'text', op: 'replace_source', target: cell, edits }
         );
         targets.push(cell.id);
         break;
@@ -387,16 +480,9 @@ export function planOperations(
         requireKind(operation.expectedSourceRevision, 'source', 'expected_source_revision');
         const { cell } = sim.find(operation.cellId);
         requireTargetIdentity(cell, operation.expectedCellIdentityToken);
-        const type = cellTypeOfJson(cell.json);
+        // Anchored on text that must occur exactly once *now*: whatever else
+        // changed in the cell since the observation does not matter.
         const current = sourceOfJson(cell.json);
-        sim.guard(
-          operation.expectedSourceRevision,
-          sourceRevision(type, current),
-          sourceRevision(cellTypeOfJson(cell.original), sourceOfJson(cell.original)),
-          observationDetails(cell),
-          () => boundedPreview(current),
-          operation.expectedCellIdentityToken !== undefined
-        );
         const found = findSingleOccurrence(current, operation.oldText);
         if (found.kind === 'not_found') {
           throw coreError('MATCH_NOT_FOUND', 'old_text does not occur in the cell source', {
@@ -417,11 +503,10 @@ export function planOperations(
           current.slice(0, found.index) +
           operation.newText +
           current.slice(found.index + operation.oldText.length);
-        cell.sourceEdits++;
         ops.push(
-          edit.deleteCount === 0 && edit.insert.length === 0
+          operation.oldText === operation.newText
             ? { kind: 'noop', op: 'replace_text', target: cell }
-            : { kind: 'text', op: 'replace_text', target: cell, edit }
+            : { kind: 'text', op: 'replace_text', target: cell, edits: [edit] }
         );
         targets.push(cell.id);
         break;
@@ -435,8 +520,7 @@ export function planOperations(
           cellRevision(cell.json as JsonValue),
           cellRevision(cell.original as JsonValue),
           observationDetails(cell),
-          () => boundedPreview(sourceOfJson(cell.json)),
-          operation.expectedCellIdentityToken !== undefined
+          () => boundedPreview(sourceOfJson(cell.json))
         );
         sim.order.splice(at, 1);
         ops.push({ kind: 'delete', op: 'delete_cell', at, target: cell });
@@ -458,8 +542,7 @@ export function planOperations(
           outputsRevision(outputs),
           outputsRevision(outputsOfJson(cell.original)),
           observationDetails(cell),
-          () => outputsPreview(outputs),
-          operation.expectedCellIdentityToken !== undefined
+          () => outputsPreview(outputs)
         );
         cell.json['outputs'] = [];
         ops.push(
@@ -480,13 +563,13 @@ export function planOperations(
         const path = normalizePath(operation.key);
         const { cell } = sim.find(operation.cellId);
         requireTargetIdentity(cell, operation.expectedCellIdentityToken);
-        sim.guard(
+        guardMetadataKey(
+          path[0]!,
           operation.expectedCellRevision,
-          cellRevision(cell.json as JsonValue),
+          history?.cellMetadata.get(operation.expectedCellRevision),
+          asObject(cell.original['metadata']),
           cellRevision(cell.original as JsonValue),
-          observationDetails(cell),
-          () => metadataPreview(asObject(cell.json['metadata'])),
-          operation.expectedCellIdentityToken !== undefined
+          observationDetails(cell)
         );
         const before = asObject(cell.json['metadata']);
         const after = remove ? deleteAtPath(before, path) : setAtPath(before, path, operation.value);
@@ -515,19 +598,16 @@ export function planOperations(
           throw coreError('INVALID_ARGUMENT', 'set_notebook_metadata value must not be undefined');
         }
         const path = normalizePath(operation.key);
-        const currentMetadataRevision = notebookMetadataRevision(
-          sim.metadata as Record<string, JsonValue | undefined>
-        );
-        const liveMetadataRevision = notebookMetadataRevision(
+        const originalRevision = notebookMetadataRevision(
           sim.originalMetadata as Record<string, JsonValue | undefined>
         );
-        sim.guard(
+        guardMetadataKey(
+          path[0]!,
           operation.expectedNotebookMetadataRevision,
-          currentMetadataRevision,
-          liveMetadataRevision,
-          { notebook_metadata_revision: liveMetadataRevision },
-          () => metadataPreview(sim.metadata),
-          operation.expectedNotebookObserved === true
+          history?.notebookMetadata.get(operation.expectedNotebookMetadataRevision),
+          sim.originalMetadata,
+          originalRevision,
+          { notebook_metadata_revision: originalRevision }
         );
         const after = remove
           ? deleteAtPath(sim.metadata, path)

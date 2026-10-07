@@ -252,11 +252,24 @@ function projectSubmittedCellError(
   if (wire.code === 'INVALID_ARGUMENT') {
     return { ...wire, message: `${subject} is not a code cell`, details };
   }
-  return {
-    ...wire,
-    message: `${subject} is stale because the cell changed since it was read`,
-    details
-  };
+  return { ...wire, message: revisionConflictMessage(subject, wire.details!), details };
+}
+
+function revisionConflictMessage(subject: string, details: Record<string, unknown>): string {
+  switch (details['reason']) {
+    case 'overlapping_edits':
+      return details['in_batch'] === true
+        ? `${subject}: the requested source overlaps an earlier operation of this batch on the same lines`
+        : `${subject}: the requested source overlaps edits made to the same lines since it was read`;
+    case 'base_unavailable':
+      return `${subject} was read too long ago to merge with the edits made since; read the cell again`;
+    case 'cell_type_changed':
+      return `${subject}: the cell type changed since it was read`;
+    default:
+      return typeof details['metadata_key'] === 'string'
+        ? `${subject}: metadata key ${JSON.stringify(details['metadata_key'])} changed since it was read`
+        : `${subject} is stale because the cell changed since it was read`;
+  }
 }
 
 function redactDeep(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {

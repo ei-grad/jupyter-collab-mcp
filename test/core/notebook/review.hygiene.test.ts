@@ -103,16 +103,14 @@ describe('review: REVISION_CONFLICT payload (SPEC.md §7)', () => {
 });
 
 describe('review: batch revision guards (SPEC.md §7)', () => {
-  it('refuses the second full replacement of one cell that quotes the pre-batch revision', () => {
+  it('refuses a second full replacement that rewrites what the first one wrote', () => {
     const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'original')]));
     const cell = peer.model.summary().cells[0]!;
     const identity = peer.model.cellRef('c1').identityToken;
     const rev = cell.sourceRevision;
-    // Both operations quote the same, now-stale revision. Accepting both would
-    // make the first one's text disappear with no error - a lost update the
-    // caller cannot notice, because `appliedLocally` would be true and both
-    // results would report the final revision. The whole batch is refused
-    // before the first mutation instead (SPEC.md §7).
+    // Both derive from the same observation and rewrite the same line: keeping
+    // either silently loses the other, so the batch is refused before the
+    // first mutation (SPEC.md §7).
     try {
       peer.model.apply([
         { op: 'replace_source', cellId: 'c1', expectedSourceRevision: rev, source: 'FIRST' },
@@ -128,14 +126,26 @@ describe('review: batch revision guards (SPEC.md §7)', () => {
     } catch (error) {
       expect(error).toMatchObject({
         code: 'REVISION_CONFLICT',
-        message: 'the reference changed since it was observed'
+        details: { reason: 'overlapping_edits', in_batch: true }
       });
     }
     expect(peer.notebook.getCell(0).getSource()).toBe('original');
     peer.dispose();
   });
 
-  it('classifies a changed live observed cell as stale rather than intra-batch', () => {
+  it('merges two full replacements of one observation that change different lines', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'a = 1\nb = 2\nc = 3\n')]));
+    const identity = peer.model.cellRef('c1').identityToken;
+    const rev = peer.model.summary().cells[0]!.sourceRevision;
+    peer.model.apply([
+      { op: 'replace_source', cellId: 'c1', expectedCellIdentityToken: identity, expectedSourceRevision: rev, source: 'a = 10\nb = 2\nc = 3\n' },
+      { op: 'replace_source', cellId: 'c1', expectedCellIdentityToken: identity, expectedSourceRevision: rev, source: 'a = 1\nb = 2\nc = 30\n' }
+    ]);
+    expect(peer.notebook.getCell(0).getSource()).toBe('a = 10\nb = 2\nc = 30\n');
+    peer.dispose();
+  });
+
+  it('reports an overlap with a collaborator as not caused by the batch', () => {
     const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'original')]));
     const cell = peer.model.summary().cells[0]!;
     const identity = peer.model.cellRef('c1').identityToken;
@@ -153,10 +163,73 @@ describe('review: batch revision guards (SPEC.md §7)', () => {
     } catch (error) {
       expect(error).toMatchObject({
         code: 'REVISION_CONFLICT',
-        message: 'the reference changed since it was observed'
+        details: { reason: 'overlapping_edits', in_batch: false, conflicts: [{ base_line: 1, base_lines: 1 }] }
       });
     }
     expect(peer.notebook.getCell(0).getSource()).toBe('changed by a collaborator');
+    peer.dispose();
+  });
+
+  it('merges a full replacement with a collaborator edit on another line', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'import os\n\nx = 1\n')]));
+    const identity = peer.model.cellRef('c1').identityToken;
+    const rev = peer.model.summary().cells[0]!.sourceRevision;
+    typeInto(peer.notebook, 0, 'import os\nimport sys\n\nx = 1\n');
+    peer.model.apply([{
+      op: 'replace_source',
+      cellId: 'c1',
+      expectedCellIdentityToken: identity,
+      expectedSourceRevision: rev,
+      source: 'import os\n\nx = 2\nprint(x)\n'
+    }]);
+    expect(peer.notebook.getCell(0).getSource()).toBe('import os\nimport sys\n\nx = 2\nprint(x)\n');
+    peer.dispose();
+  });
+
+  it('cannot merge against an observation this replica never handed out', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'original')]));
+    const real = peer.model.summary().cells[0]!.sourceRevision;
+    typeInto(peer.notebook, 0, 'changed');
+    const unknown = (real.slice(0, -1) + (real.endsWith('A') ? 'B' : 'A')) as typeof real;
+    try {
+      peer.model.apply([{ op: 'replace_source', cellId: 'c1', expectedSourceRevision: unknown, source: 'x' }]);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'REVISION_CONFLICT', details: { reason: 'base_unavailable' } });
+    }
+    expect(peer.notebook.getCell(0).getSource()).toBe('changed');
+    peer.dispose();
+  });
+
+  it('falls back to an exact revision match once the observed source was evicted', () => {
+    const peer = reviewPeer(
+      11,
+      reviewBook([reviewCode('c1', 'one\n'), reviewCode('c2', 'two\n')]),
+      { observationHistory: { maxEntries: 1 } }
+    );
+    const first = peer.model.observeCell({ cellId: 'c1' });
+    peer.model.observeCell({ cellId: 'c2' });
+    typeInto(peer.notebook, 0, 'zero\none\n');
+    try {
+      peer.model.apply([{ op: 'replace_source', cellId: 'c1', expectedSourceRevision: first.sourceRevision, source: 'one!\n' }]);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'REVISION_CONFLICT', details: { reason: 'base_unavailable' } });
+    }
+    expect(peer.notebook.getCell(0).getSource()).toBe('zero\none\n');
+    peer.dispose();
+  });
+
+  it('replace_text applies on a cell a collaborator changed elsewhere', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'def f(table, plat):\n    return 1\n')]));
+    const identity = peer.model.cellRef('c1').identityToken;
+    const rev = peer.model.summary().cells[0]!.sourceRevision;
+    typeInto(peer.notebook, 0, '# helper\ndef f(table, plat):\n    return 1\n');
+    peer.model.apply([
+      { op: 'replace_text', cellId: 'c1', expectedCellIdentityToken: identity, expectedSourceRevision: rev, oldText: 'def f(table, plat):', newText: 'def f(table, plat, params):' },
+      { op: 'replace_text', cellId: 'c1', expectedCellIdentityToken: identity, expectedSourceRevision: rev, oldText: 'return 1', newText: 'return params' }
+    ]);
+    expect(peer.notebook.getCell(0).getSource()).toBe('# helper\ndef f(table, plat, params):\n    return params\n');
     peer.dispose();
   });
 

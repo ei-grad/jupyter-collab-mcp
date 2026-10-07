@@ -517,9 +517,11 @@ observed object.
 
 Internally, a `cell_ref` stores the notebook handle, durable ID, immutable Y.Map
 identity, source revision, full-cell revision, and outputs revision captured in
-one synchronous observation. Source edits/runs use its source guard; delete and
-cell-metadata operations use its full-cell guard; clear-output uses its output
-guard. A `notebook_ref` stores the notebook handle and metadata revision. Source
+one synchronous observation. Full source replacement uses its source revision
+as the merge base and runs use it as an exact guard; delete uses its full-cell
+guard and cell-metadata operations the observed metadata behind it;
+clear-output uses its output guard; substring replacement uses only its
+identity. A `notebook_ref` stores the notebook handle and metadata revision. Source
 revision covers exact source plus cell type, full-cell revision covers the
 entire cell, outputs revision covers only outputs, and notebook metadata
 revision excludes internal state and awareness. These distinct scopes remain
@@ -533,15 +535,44 @@ binding, and byte offset; a source edit, replacement, reorder, add, or delete
 expires it with `CURSOR_EXPIRED`. A response never issues a source cursor that
 cannot advance because the next UTF-8 code point exceeds its byte budget.
 
-Source replacement requires `cell_ref`. Full replacement is
-applied as minimal changes to the existing Y.Text, preserving the cell object.
-Exact substring replacement requires exactly one match, otherwise
-`MATCH_NOT_UNIQUE`/`MATCH_NOT_FOUND`. Delete, clear-output, and cell metadata
+Source replacement requires `cell_ref`. Delete, clear-output, and cell metadata
 operations also accept only `cell_ref`; notebook metadata operations accept
 `notebook_ref`. The adapter expands the saved immutable precondition before
-request receipt comparison. On mismatch, `REVISION_CONFLICT` returns a fresh
-`current_cell_ref` or `current_notebook_ref` when the same object remains live,
-plus a bounded preview, without changing anything.
+request receipt comparison.
+
+The notebook is shared, so an observed ref identifies the object and the state
+the caller derived its edit from; it is not a lock. Each operation's guard is
+scoped to what that operation overwrites:
+
+- Exact substring replacement is anchored on the cell's text at that point of
+  the batch, including edits by other participants and by earlier operations of
+  the same batch, and checks only object identity. The anchor must occur
+  exactly once, otherwise `MATCH_NOT_UNIQUE`/`MATCH_NOT_FOUND`.
+- Full replacement merges the caller's change - from the observed source to the
+  requested one - into the current text line by line. Changes to different
+  lines combine; different changes to the same base lines, different insertions
+  at one point, or an insertion inside a range the other side replaced are
+  `REVISION_CONFLICT` with `reason: overlapping_edits`, the conflicting base
+  line ranges, and `in_batch: true` when the competing change is an earlier
+  operation of the same batch. An unchanged cell takes the requested source.
+  The result is written as minimal per-region changes to the existing Y.Text,
+  so text between changed regions keeps its CRDT identity and a concurrent edit
+  there still merges.
+- A keyed metadata write rewrites one top-level key and conflicts only when
+  that key's value differs from the observed one.
+- Delete and clear-output conflict when their scope (full cell, outputs)
+  changed since the observation by anything other than earlier operations of
+  the same batch. Execution keeps its exact source guard (§8).
+
+The client remembers the content behind every source, full-cell and notebook
+metadata revision it hands out, bounded by size and count. A merge or keyed
+comparison whose observed content is no longer known falls back to an exact
+revision match and reports `reason: base_unavailable` on mismatch.
+
+`REVISION_CONFLICT` returns a fresh `current_cell_ref` or `current_notebook_ref`
+when the same object remains live, plus a bounded preview of the live pre-batch
+content, without changing anything. A preview never shows simulated state of
+the rejected batch.
 When `CELL_NOT_FOUND`, `CELL_REPLACED`, `CELL_ID_AMBIGUOUS`,
 `REVISION_CONFLICT`, or a non-code execution error follows expansion of a public
 cell reference, the MCP error names the submitted ref only when its value and
@@ -552,9 +583,10 @@ and arrays, while preserving user-content fields such as previews and metadata;
 no diagnostic identity field exposes the internal durable cell ID. An identical
 string remains only when it is notebook content rather than identity metadata.
 Other error families retain their own diagnostics unchanged.
-Revision-conflict wording distinguishes an observation that was already stale
-when the request began from one invalidated by an earlier operation in the same
-batch; recovery fields and request-receipt state remain unchanged.
+Revision-conflict wording distinguishes an overlap with another participant's
+edit, an overlap with an earlier operation of the same batch, an unknown
+observation, and a changed guarded scope; recovery fields and request-receipt
+state remain unchanged.
 
 Metadata changes use keyed `set_cell_metadata`/`delete_cell_metadata` with
 `cell_ref`, or `set_notebook_metadata`/`delete_notebook_metadata` with
@@ -589,19 +621,21 @@ first mutation. If an unexpected error occurs after writing begins, the response
 explicitly reports a possible partial result and requires rereading affected
 cells.
 
-An observed ref never advances implicitly within a batch. Reusing one ref after
-an earlier operation in that batch changed its guarded scope conflicts, while
-legacy internal library callers that supply explicit revisions retain their
-existing batch semantics. A successful apply result returns refs for the final
+An observed ref never advances implicitly within a batch: later operations that
+reuse it are judged by the rules above against the observed state and the
+simulated result of the earlier operations, so a batch may edit one cell
+through one ref several times. A successful apply result returns refs for the final
 state of every surviving target; delete returns no usable cell ref. Replaying
 the exact accepted payload returns its stored result semantics after later
 edits, deletion, or replacement. A fresh request checks the current live object.
 
-Revision checks protect against changes already visible to the local client.
-They are not distributed compare-and-swap: a remote edit not yet received may
-merge with ours after validation. Yjs guarantees convergence but does not
-define the meaning of concurrently rewritten code. The agent must reread
-conflicting cells; the service does not promise an exclusive editor lock.
+These checks protect against overlapping changes already visible to the local
+client. They are not distributed compare-and-swap: a remote edit not yet
+received may merge with ours after validation. Yjs guarantees convergence but
+does not define the meaning of concurrently rewritten code, which is why
+overlapping line changes are refused rather than interleaved. The agent must
+reread conflicting cells; the service does not promise an exclusive editor
+lock.
 
 Moving cells is deliberately deferred: in the examined version,
 `YNotebook.moveCells` clones and deletes the CRDT object. Preserving the string
@@ -1247,7 +1281,7 @@ browser test. Checking only a local `Y.Doc` or tool-response text is insufficien
 | Repeated open | Sequential and concurrent opens of one document in a session return one handle |
 | Separate conversations | Two session IDs in one stdio process do not mix handles, cursors, or execution results |
 | Bidirectional RTC | A second client sees add/edit/delete/metadata/outputs without reload; MCP sees user changes |
-| Concurrent edits | A known stale revision changes nothing; concurrent edits converge without promising distributed CAS |
+| Concurrent edits | Edits of different lines or keys by the agent and a browser both survive; overlapping changes are refused and change nothing; concurrent edits converge without promising distributed CAS |
 | Observed refs | Read → `cell_ref` → apply/execute uses the captured guard scope; same-object reread refreshes it, replacement/deletion/close rejects it, exact accepted replay preserves its receipt, and bounded issuance is all-or-nothing |
 | Identity and ranges | Browser insertion/reorder does not redirect planned execution to another cell; deleting the target stops the queue |
 | Outputs | stdout/stderr, traceback exactly once, MIME metadata, PNG, `clear_output(wait)`, and update display match for an independent observer |
