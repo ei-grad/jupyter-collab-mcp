@@ -35,6 +35,12 @@
 
 import type { CoreError } from './errors.js';
 import type {
+  PresenceClientInfo,
+  PresenceDeclaration,
+  PresenceOwnerSource,
+  PresenceUser
+} from './presence.js';
+import type {
   AbortedReason,
   CellRunState,
   CellObservation,
@@ -339,6 +345,44 @@ export interface SessionCloseResult {
    * Jupyter server (SPEC.md §4).
    */
   readonly kernelsLeftRunning: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// session_identify (SPEC.md §10 "Presence")
+// ---------------------------------------------------------------------------
+
+/**
+ * Self-declared display identity of the agent. Raw values; the service
+ * sanitizes them. Never an authorization or ownership claim.
+ */
+export interface SessionIdentifyRequest {
+  /** Library callers name their session; MCP addresses its implicit context. */
+  readonly sessionId?: SessionId;
+  readonly name: string;
+  readonly model?: string;
+  readonly task?: string;
+  /** `#rrggbb`; anything else keeps the default colour. */
+  readonly color?: string;
+}
+
+/** Presence published on one server binding of the context. */
+export interface PresenceServerView {
+  readonly serverId: string;
+  readonly user: PresenceUser;
+  readonly ownerSource: PresenceOwnerSource;
+  readonly openDocuments: number;
+  /** Global awareness room: `inactive` while no notebook is open there. */
+  readonly globalPresence: 'inactive' | 'connecting' | 'connected' | 'reconnecting' | 'closed';
+  readonly lastCloseCode: number | null;
+}
+
+export interface SessionIdentifyResult {
+  /** The declaration as applied after sanitization. */
+  readonly declared: PresenceDeclaration;
+  /** `false` when `color` was not `#rrggbb` and the default was kept. */
+  readonly colorApplied: boolean;
+  /** Bindings of this context; empty before the first server is used. */
+  readonly servers: readonly PresenceServerView[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,6 +1317,25 @@ export interface CollabService {
    * @throws {CoreError} `INTERNAL_ERROR`.
    */
   sessionClose(request: SessionCloseRequest): Promise<WithEnvelope<SessionCloseResult>>;
+
+  /**
+   * Set the agent's self-declared presence for its connection context and
+   * republish it at once in every document and global awareness room of
+   * that context (SPEC.md §10 "Presence"). Idempotent replacement: omitted
+   * optional fields are cleared. Not deduplicated and takes no request
+   * number; it changes no document, file or kernel.
+   *
+   * @throws {CoreError} `INVALID_ARGUMENT` - `name` is empty after
+   * sanitization.
+   * @throws {CoreError} `HANDLE_EXPIRED` - unknown or closed library session.
+   */
+  sessionIdentify(request: SessionIdentifyRequest): Promise<WithEnvelope<SessionIdentifyResult>>;
+
+  /**
+   * MCP `clientInfo` of the connection, the default display name until
+   * {@link sessionIdentify} declares one. Display only, never an identity.
+   */
+  observeClientInfo?(info: PresenceClientInfo): void;
 
   // -- documents ------------------------------------------------------------
 

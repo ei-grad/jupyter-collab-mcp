@@ -6,7 +6,7 @@
  * concerns below `src/core/`, so the core remains usable independently
  * (SPEC.md §1).
  *
- * - `schemas.ts` - the snake_case input/output schemas of the 18 tools;
+ * - `schemas.ts` - the snake_case input/output schemas of the 19 tools;
  * - `wire.ts`    - camelCase <-> snake_case and the response-size budget;
  * - `server.ts`  - `createMcpServer(service, options)`;
  * - `cli.ts`     - the `jupyter-collab-mcp` stdio entry point.

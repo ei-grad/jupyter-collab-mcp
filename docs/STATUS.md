@@ -50,7 +50,7 @@ timings are intentionally omitted because they become stale as coverage grows.
 | Headless and save | done | `pnpm smoke`, steps 1–10 |
 | Save uncertainty, Autosave | partial | `timeout`/`skipped`/`OPERATION_UNCERTAIN` and `{autosave:true}` exist; update/save race and debounce do not |
 | Document data | done | `roundtrip.test.ts` |
-| Tool coverage | done | all 18 tools have schemas, dispatch, and adapter tests |
+| Tool coverage | done | all 19 tools have schemas, dispatch, and adapter tests |
 | Create name | done | rename, `ALREADY_EXISTS`, and retained untitled result are covered |
 | Cursors and outputs | done | change/page/execution/output cursors, `output_read`, and resources |
 | Limits, cleanup, and credentials | done | service budgets, bounded receipts/snapshots, stdout isolation, redaction, and disposal tests |

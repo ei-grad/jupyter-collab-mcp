@@ -126,6 +126,8 @@ export async function startNodeWorker(
   const assertionFile = join(directory, 'assertion');
   const profileFile = join(directory, 'profile.json');
   const profile = {
+    // The worker's MCP client is this gateway, so its clientInfo names no agent.
+    presence: { owner: identity.username, clientInfo: false },
     servers: [
       {
         id: 'jupyter',

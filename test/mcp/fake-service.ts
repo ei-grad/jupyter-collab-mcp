@@ -57,7 +57,10 @@ import type {
   OutputResourceContents,
   OutputsRevision,
   PageCursor,
+  PresenceClientInfo,
   ServerListResult,
+  SessionIdentifyRequest,
+  SessionIdentifyResult,
   ServerStatusRequest,
   ServerStatusResult,
   ServerStartRequest,
@@ -266,6 +269,37 @@ export class FakeCollabService implements CollabService {
       kernelsLeftRunning: true,
       nextRequestId: null
     });
+  }
+
+  async sessionIdentify(request: SessionIdentifyRequest): Promise<WithEnvelope<SessionIdentifyResult>> {
+    return this.record('sessionIdentify', request, {
+      declared: { name: request.name, ...(request.task === undefined ? {} : { task: request.task }) },
+      colorApplied: true,
+      servers: [
+        {
+          serverId: 'default',
+          user: {
+            username: 'alice~agent-0a1b2c3d',
+            name: `${request.name} (agent of alice)`,
+            display_name: `${request.name} (agent of alice)`,
+            initials: 'AI',
+            color: '#0f766e',
+            avatar_url: null
+          },
+          ownerSource: 'configured' as const,
+          openDocuments: 1,
+          globalPresence: 'connected' as const,
+          lastCloseCode: null
+        }
+      ],
+      ...envelope
+    });
+  }
+
+  clientInfos: PresenceClientInfo[] = [];
+
+  observeClientInfo(info: PresenceClientInfo): void {
+    this.clientInfos.push(info);
   }
 
   async notebookList(request: NotebookListRequest): Promise<WithEnvelope<NotebookListResult>> {

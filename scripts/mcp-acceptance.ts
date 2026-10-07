@@ -22,7 +22,7 @@ const TOKEN = `acc-tok-${Math.random().toString(36).slice(2, 10)}`;
 const RUN = Date.now().toString(36);
 const NOTEBOOK = `acceptance-${RUN}.ipynb`;
 const EXPECTED_TOOLS = [
-  'server_list', 'server_status', 'server_start',
+  'server_list', 'server_status', 'server_start', 'session_identify',
   'notebook_list', 'notebook_create', 'notebook_open', 'notebook_close',
   'notebook_read', 'notebook_apply', 'notebook_execute',
   'execution_get', 'output_read', 'execution_cancel',

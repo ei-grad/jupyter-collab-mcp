@@ -110,16 +110,17 @@ async function openContext(client?: McpChild): Promise<Context> {
 // ---------------------------------------------------------------------------
 
 describe('protocol surface', () => {
-  it('initialize pins 2026-07-28 and tools/list publishes all 18 tools with schemas', async () => {
+  it('initialize pins 2026-07-28 and tools/list publishes all 19 tools with schemas', async () => {
     // `client.connect` already completed the pinned handshake in beforeAll.
     expect(mcp.client.getServerVersion()?.name).toBe('jupyter-collab-mcp');
     expect(mcp.client.getServerCapabilities()?.tools).toBeDefined();
     expect(mcp.client.getServerCapabilities()?.resources).toBeDefined();
 
     const tools = (await mcp.client.listTools()).tools;
-    expect(tools).toHaveLength(18);
+    expect(tools).toHaveLength(19);
     expect(tools.map((tool) => tool.name).sort()).toEqual(
       [
+        'session_identify',
         'execution_cancel',
         'execution_get',
         'kernel_control',

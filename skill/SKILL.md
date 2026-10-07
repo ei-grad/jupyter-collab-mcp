@@ -12,6 +12,17 @@ line numbers or reconstructed identifiers.
 
 ## 1. Server and notebook
 
+0. Call `session_identify {name, model?, task}` once at the start, with your
+   product name and a short phrase for the user's request as `task`
+   (`{"name":"Claude Code","model":"opus","task":"fix the revenue plot"}`).
+   Call it again when the task changes. While a notebook is open, JupyterLab's
+   collaborators panel lists you with the notebook you last opened, read,
+   edited or ran, and notebook cursors carry the same label. The server always
+   appends `(agent of <owner>)` for the account you act for; you cannot change
+   it. Each call replaces the whole declaration (omitted `model`/`task` are
+   cleared). It takes no `request_id`. The label is display text only: not
+   authentication, authorship proof or a lock, and presence problems never
+   block notebook work.
 1. `server_list` returns safe server descriptors and `next_request_id`.
    If selection is ambiguous, choose the intended configured `server_id`.
    `server_status {server_id?}` reads readiness and start profiles. If a Hub
@@ -294,6 +305,7 @@ Jupyter Sessions lookup failed.
 ## Example
 
 ```jsonc
+// 0. session_identify {"name":"Claude Code","task":"tune df.head output"}
 // 1. server_list {} -> servers, next_request_id "1"
 // 2. notebook_open {"path":"analysis.ipynb"}
 //    -> notebook_id "nb_A", summary, changes_cursor "c7"

@@ -219,6 +219,22 @@ export class ServerClient {
     return parseJsonBody<ServerStatus>(response, route);
   }
 
+  /**
+   * `GET /api/me`: the identity the server authenticated this client as.
+   * Used only as the presence owner (SPEC.md §10), never for authorization.
+   */
+  async currentUser(signal?: AbortSignal): Promise<{ username: string; name: string | null }> {
+    const route = '/api/me';
+    const response = await this.#request(route, { method: 'GET', ...(signal === undefined ? {} : { signal }) });
+    const model = parseJsonBody<{ identity?: { username?: unknown; name?: unknown } }>(response, route);
+    const username = model.identity?.username;
+    if (typeof username !== 'string' || username === '') {
+      throw coreError('INTERNAL_ERROR', `${route} returned no username`);
+    }
+    const name = model.identity?.name;
+    return { username, name: typeof name === 'string' ? name : null };
+  }
+
   /** Read the storage provider's notebook representation independently of RTC. */
   async readNotebookContents(path: string, signal: AbortSignal, maxResponseBytes: number): Promise<unknown> {
     const route = `/api/contents/${encodeContentsPath(normalizeContentsPath(path))}?content=1&type=notebook`;

@@ -276,6 +276,9 @@ export function makeFakeHandle(init: NotebookHandleInit): {
     delivery(): 'sent' | 'pending' | 'unknown' {
       return handle.connectionState === 'ready' ? 'sent' : 'unknown';
     },
+    setAwarenessUser(): void {
+      // No room behind a fake replica.
+    },
     recordKernelChange(kernelId: string | null): void {
       controls.kernelChanges.push(kernelId);
       if (!controls.disposed) model.recordKernelChange(kernelId);
