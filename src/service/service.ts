@@ -34,12 +34,19 @@ import { captureNotebookPersistence, notebookPersistenceDigest, SAVE_CONFIRMATIO
 
 import {
   coreError,
+  isAnonymousJupyterIdentity,
   isCoreError,
   parseChangesCursor,
   redactCredentials,
+  sanitizeDeclaration,
+  sanitizeOwner,
   sourceRevision,
   toCoreError,
   withDefaults,
+  type PresenceClientInfo,
+  type PresenceOwner,
+  type SessionIdentifyRequest,
+  type SessionIdentifyResult,
   type CellContent,
   type CellObservation,
   type ChangeEvent,
@@ -107,6 +114,7 @@ import { metadataRevisionOf, resolveCell } from '../core/notebook/read.js';
 import { withIdentity } from '../core/notebook/types.js';
 import { normalizeContentsPath, validateNotebookName } from '../jupyter/paths.js';
 import { installStdoutGuard, isStdoutGuardInstalled } from '../jupyter/stdout-guard.js';
+import { AwarenessRoom } from '../jupyter/awareness-room.js';
 import type {
   JupyterSessionInfo,
   KernelSpecEntry,
@@ -140,6 +148,12 @@ import { RequestLedger, type DedupTool, type Receipt } from './ledger.js';
 import { ServerRegistry, type ServerEntry, type ServerRegistryOptions } from './server-registry.js';
 import { SessionRegistry, type WorkingSession } from './session.js';
 import { Mutex } from './mutex.js';
+import {
+  ContextPresence,
+  PROCESS_PRESENCE_OWNER,
+  ServerPresence,
+  type PresenceRoom
+} from './presence.js';
 
 /**
  * Snapshot memory of one working session.
@@ -171,6 +185,42 @@ export interface CollabServiceOptions extends ServerRegistryOptions {
    * WebSocket. Production never passes it.
    */
   readonly openHandle?: (init: NotebookHandleInit) => Promise<NotebookHandle>;
+  /**
+   * Replaces the global awareness room of one server binding (SPEC.md §10
+   * "Presence"); production joins `JupyterLab:globalAwareness`. When
+   * {@link openHandle} is supplied without this seam, no global room is
+   * opened: faked replicas have no server whose presence they could join.
+   */
+  readonly openPresenceRoom?: (serverId: string, localState: Readonly<Record<string, unknown>>) => PresenceRoom;
+}
+
+const INERT_PRESENCE_ROOM: PresenceRoom = Object.freeze({
+  state: 'closed' as const,
+  lastCloseCode: null,
+  connect: (): void => undefined,
+  setLocalState: (): void => undefined,
+  dispose: (): void => undefined
+});
+
+/** Budget of the `/api/me` owner lookup; presence never waits longer. */
+const OWNER_LOOKUP_MS = 2000;
+
+/**
+ * Owner from the server's authenticated identity (SPEC.md §10). The random
+ * anonymous identity of a shared-token server names nobody and is ignored.
+ */
+async function jupyterOwner(client: ServerClient): Promise<PresenceOwner | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OWNER_LOOKUP_MS);
+  timer.unref?.();
+  try {
+    const identity = await client.currentUser(controller.signal);
+    if (isAnonymousJupyterIdentity(identity)) return null;
+    const name = sanitizeOwner(identity.username);
+    return name === undefined ? null : { name, source: 'jupyter' };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const DIRECTORY_CURSOR_PREFIX = 'dir_';
@@ -254,6 +304,9 @@ class CollabServiceImpl implements CollabService {
   readonly #kernels = new KernelHub();
   readonly #openTimeoutMs: number;
   readonly #openReplica: (init: NotebookHandleInit) => Promise<NotebookHandle>;
+  readonly #presenceRoomSeam: CollabServiceOptions['openPresenceRoom'];
+  /** Declared presence of the implicit connection context (SPEC.md §10). */
+  readonly #implicitPresence: ContextPresence;
   readonly #now: () => Date;
   readonly #restoreConsole: (() => void) | null;
   /** `notebook_id` -> owning session; handles address their session alone. */
@@ -287,6 +340,57 @@ class CollabServiceImpl implements CollabService {
     );
     this.#openTimeoutMs = options.openTimeoutMs ?? 30_000;
     this.#openReplica = options.openHandle ?? ((init) => NotebookHandle.open(init));
+    this.#presenceRoomSeam = options.openPresenceRoom ??
+      (options.openHandle === undefined ? undefined : () => INERT_PRESENCE_ROOM);
+    this.#implicitPresence = new ContextPresence({
+      fallback: this.#config.awarenessUser,
+      useClientInfo: this.#config.presence?.clientInfo !== false
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // presence (SPEC.md §10)
+  // -------------------------------------------------------------------------
+
+  async sessionIdentify(request: SessionIdentifyRequest): Promise<WithEnvelope<SessionIdentifyResult>> {
+    this.#assertRunning();
+    let context: ContextPresence;
+    let envelope: SessionEnvelope;
+    if (request.sessionId !== undefined) {
+      const session = this.#sessions.require(request.sessionId);
+      context = this.#presenceFor(session).context;
+      envelope = session.envelope();
+    } else {
+      context = this.#implicitPresence;
+      envelope = { nextRequestId: this.#implicitLedger.nextRequestId };
+    }
+    const { declaration, colorApplied } = sanitizeDeclaration(request);
+    if (declaration === null) {
+      throw withEnvelopeDetails(
+        coreError('INVALID_ARGUMENT', 'name is empty after removing control and formatting characters'),
+        envelope
+      );
+    }
+    context.identify(declaration);
+    return {
+      declared: declaration,
+      colorApplied,
+      servers: context.servers().map((server) => server.status()),
+      ...envelope
+    };
+  }
+
+  observeClientInfo(info: PresenceClientInfo): void {
+    this.#implicitPresence.observeClientInfo(info);
+  }
+
+  #openPresenceRoom(
+    serverId: string,
+    client: ServerClient,
+    localState: Readonly<Record<string, unknown>>
+  ): PresenceRoom {
+    if (this.#presenceRoomSeam !== undefined) return this.#presenceRoomSeam(serverId, localState);
+    return new AwarenessRoom({ wsBaseUrl: client.wsBaseUrl, ...client.connectionAuth() }, localState);
   }
 
   // -------------------------------------------------------------------------
@@ -702,6 +806,7 @@ class CollabServiceImpl implements CollabService {
   ): Promise<WithEnvelope<NotebookReadResultFor<R>>> {
     this.#assertRunning();
     const { session, handle } = this.#locate(request.notebookId);
+    session.presence?.touched(handle.path);
     try {
       const limits = effectiveLimits(this.#config.limits, request.limits);
       const common = {
@@ -836,6 +941,7 @@ class CollabServiceImpl implements CollabService {
   async notebookApply(request: NotebookApplyRequest): Promise<WithEnvelope<NotebookApplyResult>> {
     this.#assertRunning();
     const { session, handle } = this.#locate(request.notebookId);
+    session.presence?.touched(handle.path);
     return session.lock.run(async () => {
       const payload = { operations: request.operations };
       const replay = this.#preflight(
@@ -905,6 +1011,7 @@ class CollabServiceImpl implements CollabService {
   async notebookExecute(request: NotebookExecuteRequest): Promise<WithEnvelope<ExecutionView>> {
     this.#assertRunning();
     const { session, handle } = this.#locate(request.notebookId);
+    session.presence?.touched(handle.path);
     const submitted = await session.lock.run(async () => {
       const payload = {
         cells: request.cells,
@@ -1833,6 +1940,7 @@ class CollabServiceImpl implements CollabService {
     const alreadyOpen = session.findByFileId(document.fileId);
     if (alreadyOpen !== null) return { handle: alreadyOpen, reused: true };
 
+    const presence = this.#presenceFor(session);
     const handle = await this.#openReplica({
       notebookId: `nb_${randomUUID()}`,
       sessionId: session.id,
@@ -1841,7 +1949,7 @@ class CollabServiceImpl implements CollabService {
       collaborationSessionId: document.sessionId,
       wsBaseUrl: client.wsBaseUrl,
       ...client.connectionAuth(),
-      awarenessUser: this.#config.awarenessUser,
+      awarenessUser: presence.user,
       journalLimit: this.#config.limits.journalMaxEvents,
       revalidateFileId: async () =>
         (await this.#servers.collaborationSession(server, path)).fileId,
@@ -1870,6 +1978,9 @@ class CollabServiceImpl implements CollabService {
     }
     session.notebooks.set(handle.notebookId, handle);
     this.#notebookOwner.set(handle.notebookId, session);
+    // The user may have changed while the room was syncing.
+    handle.setAwarenessUser(presence.user);
+    presence.opened(handle.path);
     return { handle, reused: false };
   }
 
@@ -1915,6 +2026,7 @@ class CollabServiceImpl implements CollabService {
     handle.dispose();
     session.notebooks.delete(handle.notebookId);
     this.#notebookOwner.delete(handle.notebookId);
+    session.presence?.closed(handle.path);
     this.#closedNotebooks.set(handle.notebookId, kernelLeftRunning);
     if (this.#closedNotebooks.size > 256) {
       const oldest = this.#closedNotebooks.keys().next();
@@ -1931,8 +2043,37 @@ class CollabServiceImpl implements CollabService {
     }
     session.executions.clear();
     session.outputs.clear();
+    session.presence?.dispose();
     if (session.ledger !== this.#implicitLedger) session.ledger.clear();
     this.#sessions.forget(session.id);
+  }
+
+  /**
+   * The presence of one server binding (SPEC.md §10 "Presence"). Implicit
+   * bindings share the connection context's declaration; a library session
+   * is its own context.
+   */
+  #presenceFor(session: WorkingSession): ServerPresence {
+    if (session.presence !== null) return session.presence;
+    const context = session.ledger === this.#implicitLedger
+      ? this.#implicitPresence
+      : new ContextPresence({ fallback: this.#config.awarenessUser, useClientInfo: false });
+    const configured = sanitizeOwner(this.#config.presence?.owner) ?? sanitizeOwner(session.server.profile.hubUser);
+    const client = this.#servers.clientFor(session.server);
+    const presence = new ServerPresence({
+      serverId: session.server.id,
+      context,
+      owner: configured === undefined
+        ? { name: PROCESS_PRESENCE_OWNER, source: 'unknown' }
+        : { name: configured, source: 'configured' },
+      ...(configured === undefined ? { resolveOwner: () => jupyterOwner(client) } : {}),
+      openRoom: (state) => this.#openPresenceRoom(session.server.id, client, state),
+      onUserChanged: (user) => {
+        for (const handle of session.notebooks.values()) handle.setAwarenessUser(user);
+      }
+    });
+    session.presence = presence;
+    return presence;
   }
 
   #assertSessionOpen(session: WorkingSession): void {

@@ -127,10 +127,34 @@ export {
 export type {
   AwarenessUser,
   DiscoveryMode,
+  PresenceConfig,
   ServiceConfig,
   ServiceConfigInput,
   ServiceLimits
 } from './config.js';
+
+export {
+  AGENT_INITIALS,
+  DEFAULT_PRESENCE_COLOR,
+  PRESENCE_LIMITS,
+  agentUsername,
+  clientInfoDisplayName,
+  isAnonymousJupyterIdentity,
+  normalizePresenceColor,
+  ownerMarker,
+  presenceUser,
+  sanitizeDeclaration,
+  sanitizeOwner,
+  sanitizePresenceText
+} from './presence.js';
+export type {
+  PresenceClientInfo,
+  PresenceDeclaration,
+  PresenceOwner,
+  PresenceOwnerSource,
+  PresenceUser,
+  PresenceUserInput
+} from './presence.js';
 
 export type {
   CellContent,
@@ -212,6 +236,9 @@ export type {
   SessionCloseResult,
   SessionEnvelope,
   SessionId,
+  PresenceServerView,
+  SessionIdentifyRequest,
+  SessionIdentifyResult,
   SessionOpenRequest,
   SessionOpenResult,
   ShutdownReason,

@@ -21,8 +21,8 @@
  * @module
  */
 
-import { McpServer, ResourceTemplate, fromJsonSchema } from '@modelcontextprotocol/server';
-import type { CallToolResult, ContentBlock, StandardSchemaWithJSON } from '@modelcontextprotocol/server';
+import { CLIENT_INFO_META_KEY, McpServer, ResourceTemplate, fromJsonSchema } from '@modelcontextprotocol/server';
+import type { CallToolResult, ContentBlock, ServerContext, StandardSchemaWithJSON } from '@modelcontextprotocol/server';
 import type { z } from 'zod';
 
 import { coreError, redactCredentials, toCoreError } from '../core/index.js';
@@ -46,6 +46,8 @@ import type {
   NotebookReadRequest,
   NotebookSaveRequest,
   OutputReadRequest,
+  PresenceClientInfo,
+  SessionIdentifyRequest,
 } from '../core/index.js';
 import { TOOL_SPECS, TOOL_SPECS_BY_NAME } from './schemas.js';
 import type { ToolSpec } from './schemas.js';
@@ -666,6 +668,18 @@ export function renderText(tool: string, payload: WireObject): string {
       }
       break;
     }
+    case 'session_identify': {
+      const servers = payload['servers'];
+      lines.push(`presence declared; color_applied=${s(payload['color_applied'])}; ${Array.isArray(servers) ? servers.length : 0} server(s)`);
+      if (Array.isArray(servers)) {
+        for (const entry of servers) {
+          if (!isObject(entry)) continue;
+          const user = nested(entry, 'user');
+          lines.push(`  ${s(entry['server_id'])}: ${JSON.stringify(user['display_name'] ?? '')} username=${s(user['username'])} owner_source=${s(entry['owner_source'])} global_presence=${s(entry['global_presence'])}`);
+        }
+      }
+      break;
+    }
     case 'notebook_create':
     case 'notebook_open': {
       const nb = nested(payload, 'notebook');
@@ -865,6 +879,8 @@ async function dispatch(service: CollabService, tool: string, request: unknown):
       return service.serverStart(request as ServerStartRequest);
     case 'server_list':
       return service.serverList();
+    case 'session_identify':
+      return service.sessionIdentify(request as SessionIdentifyRequest);
     case 'notebook_list':
       return service.notebookList(request as NotebookListRequest);
     case 'notebook_create':
@@ -964,7 +980,9 @@ function registerTool(
         openWorldHint: true
       }
     },
-    async (rawArgs: unknown): Promise<CallToolResult> => {
+    async (rawArgs: unknown, context: ServerContext): Promise<CallToolResult> => {
+      const clientInfo = requestClientInfo(context) ?? server.server.getClientVersion();
+      if (clientInfo !== undefined) service.observeClientInfo?.(clientInfo);
       const parsed = spec.input.safeParse(rawArgs ?? {});
       if (!parsed.success) {
         options.log('debug', `${spec.name}: invalid arguments`);
@@ -983,6 +1001,23 @@ function registerTool(
       }
     }
   );
+}
+
+/**
+ * MCP `clientInfo` of this request: the 2026-07-28 per-request envelope, or
+ * nothing on a legacy connection, where `initialize` supplied it instead.
+ * Display input for presence only (SPEC.md §10), never an identity.
+ */
+function requestClientInfo(context: ServerContext | undefined): PresenceClientInfo | undefined {
+  const envelope = context?.mcpReq.envelope as Record<string, unknown> | undefined;
+  const info = envelope?.[CLIENT_INFO_META_KEY];
+  if (!isObject(info as WireValue)) return undefined;
+  const record = info as Record<string, unknown>;
+  return {
+    ...(typeof record['name'] === 'string' ? { name: record['name'] } : {}),
+    ...(typeof record['title'] === 'string' ? { title: record['title'] } : {}),
+    ...(typeof record['version'] === 'string' ? { version: record['version'] } : {})
+  };
 }
 
 /** Assemble content blocks and `structuredContent` from a service result. */

@@ -22,8 +22,9 @@
  *     (`2^n * 100` capped by `maxBackoffTime`), and SPEC.md §6 requires jitter,
  *     so its timer is neutralised and this class schedules the retry itself.
  *     That is also where the optional `fileId` re-check lives;
- *   - the awareness state `{user: {name, color}, autosave: true}` that keeps
- *     server-side autosave enabled (SPEC.md §6 "Delivery and persistence").
+ *   - the awareness state `{user, autosave: true}`: `user` is the agent's
+ *     presence (SPEC.md §10) and `autosave` keeps server-side autosave enabled
+ *     (SPEC.md §6 "Delivery and persistence").
  *
  * What it does *not* own: readiness of the notebook structure (`nbformat`
  * defined - SPEC.md §6 item 5), the change journal, and obtaining a fresh
@@ -77,10 +78,17 @@ export function reconnectDelayMs(
   return ceiling / 2 + random() * (ceiling / 2);
 }
 
-/** Presence published in Yjs awareness (SPEC.md §10). */
+/**
+ * Awareness `user` published in the room (SPEC.md §10). The service passes the
+ * full JupyterLab `IUser`; the optional fields are copied through unchanged.
+ */
 export interface AwarenessUser {
   readonly name: string;
   readonly color: string;
+  readonly username?: string;
+  readonly display_name?: string;
+  readonly initials?: string;
+  readonly avatar_url?: string | null;
 }
 
 /**
@@ -225,7 +233,7 @@ export class RtcConnection {
     // SPEC.md §6: publishing `autosave: true` keeps the server's debounced save
     // enabled even when a browser in the same room published `false`.
     this.#provider.awareness.setLocalState({
-      user: { name: options.awarenessUser.name, color: options.awarenessUser.color },
+      user: { ...options.awarenessUser },
       autosave: true
     });
 
@@ -313,6 +321,12 @@ export class RtcConnection {
   /** Unsubscribe a listener registered with {@link on}. */
   off<K extends keyof RtcConnectionEvents>(event: K, listener: RtcConnectionEvents[K]): void {
     this.#events.off(event, listener);
+  }
+
+  /** Replace the published awareness `user`, keeping `autosave: true`. */
+  setAwarenessUser(user: AwarenessUser): void {
+    if (this.#disposed) return;
+    this.#provider.awareness.setLocalStateField('user', { ...user });
   }
 
   /**

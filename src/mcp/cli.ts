@@ -38,10 +38,10 @@ Usage: jupyter-collab-mcp [options]
 
 Options:
   --http                 Serve authenticated MCP HTTP instead of stdio.
-  --config <file.json>   Full configuration: {servers, discovery, limits, awarenessUser}.
+  --config <file.json>   Full configuration: {servers, discovery, limits, awarenessUser, presence}.
   --discover             Allow servers found in the local Jupyter runtime directory.
-  --user-name <name>     Awareness display name shown in JupyterLab.
-  --user-color <#rrggbb> Awareness colour.
+  --user-name <name>     Default agent display name in JupyterLab presence.
+  --user-color <#rrggbb> Default presence colour.
   --log-level <level>    silent | error | warn | info | debug (default: warn). stderr only.
   --version              Print the version and exit.
   --help                 Print this text and exit.

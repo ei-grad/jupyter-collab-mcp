@@ -30,6 +30,7 @@ import type { KernelLease } from './kernel-hub.js';
 import { Mutex } from './mutex.js';
 import type { NotebookHandle } from './notebook-handle.js';
 import { OutputStore } from './outputs.js';
+import type { ServerPresence } from './presence.js';
 import { RequestLedger } from './ledger.js';
 import type { ServerEntry } from './server-registry.js';
 
@@ -72,6 +73,8 @@ export class WorkingSession {
   readonly bindings = new Map<NotebookId, KernelBinding>();
   /** Recently closed notebook handles, so a second close stays idempotent. */
   readonly closedNotebooks = new Set<NotebookId>();
+  /** Agent presence on this server binding, created with the first use. */
+  presence: ServerPresence | null = null;
   closed = false;
 
   constructor(init: WorkingSessionInit) {

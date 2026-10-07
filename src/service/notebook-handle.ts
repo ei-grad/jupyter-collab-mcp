@@ -39,7 +39,7 @@ import {
   type NotebookHandleInfo
 } from '../core/index.js';
 import { NotebookModel } from '../core/notebook/index.js';
-import { RtcConnection } from '../jupyter/rtc-connection.js';
+import { RtcConnection, type AwarenessUser } from '../jupyter/rtc-connection.js';
 import { roomName } from '../jupyter/paths.js';
 
 /** Handles of sessions and notebooks live until an explicit close (SPEC.md §4). */
@@ -77,7 +77,7 @@ export interface NotebookHandleInit {
   readonly resolveAuthHeaders?: () => Readonly<Record<string, string>>;
   readonly credentialExpiry?: 'jwt';
   readonly credentialExpiresAt?: number;
-  readonly awarenessUser: { readonly name: string; readonly color: string };
+  readonly awarenessUser: AwarenessUser;
   readonly journalLimit: number;
   readonly previewChars?: number;
   /** SPEC.md §6: the identity re-check the transport runs before a reconnect. */
@@ -252,6 +252,12 @@ export class NotebookHandle {
     const socket = this.connection.provider.ws;
     if (socket === null || socket.readyState !== WS_OPEN) return 'unknown';
     return socket.bufferedAmount === 0 ? 'sent' : 'pending';
+  }
+
+  /** Republish the agent's presence in this document room (SPEC.md §10). */
+  setAwarenessUser(user: AwarenessUser): void {
+    if (this.#closed) return;
+    this.connection.setAwarenessUser(user);
   }
 
   /** Journal an observed kernel binding change (SPEC.md §10). */

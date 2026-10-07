@@ -1,5 +1,5 @@
 /**
- * Tool schemas of SPEC.md §9: the wire contract of the 18 MCP tools.
+ * Tool schemas of SPEC.md §9: the wire contract of the 19 MCP tools.
  *
  * Input schemas are zod (`z.object`), because the adapter validates arguments
  * itself and turns a failure into an `INVALID_ARGUMENT` error with the same
@@ -362,8 +362,55 @@ const SEQUENTIAL =
 const NOT_A_TOOL_ERROR =
   'A Python error, an aborted or interrupted run and a lost kernel are job results (state failed / aborted / interrupted / unknown), never tool errors.';
 
-/** The 18 tools of SPEC.md §9. */
+const PRESENCE_USER = obj(
+  {
+    username: str('<owner>~agent-<context tag>; the key JupyterLab groups presence by.'),
+    name: str(),
+    display_name: str('What the collaborators panel shows; always ends with the owner marker.'),
+    initials: str(),
+    color: str(),
+    avatar_url: { type: 'null' }
+  },
+  ['username', 'name', 'display_name', 'initials', 'color']
+);
+
+/** The 19 tools of SPEC.md §9. */
 export const TOOL_SPECS: readonly ToolSpec[] = [
+  {
+    name: 'session_identify',
+    title: 'Declare agent presence',
+    description:
+      'Say who you are and what you are doing, as shown to humans in JupyterLab: the collaborators panel and notebook cursors. Call once at the start with a meaningful task, and again when the task changes. Updates every room of this connection immediately. Idempotent replacement: omitted model/task are cleared; an invalid color keeps the default. The display always ends with an "(agent of <owner>)" marker the server derives from the authenticated account; you cannot change the owner. Self-declared display text only — not authentication, authorship proof or a lock. Takes no request_id.',
+    input: z.strictObject({
+      name: z.string().min(1).max(256).describe('Your agent or product name, e.g. "Claude Code".'),
+      model: z.string().max(256).optional().describe('Model name, shown after the name.'),
+      task: z.string().max(512).optional().describe('One short phrase describing the current task.'),
+      color: z.string().max(32).optional().describe('#rrggbb presence colour.')
+    }),
+    output: result(
+      {
+        declared: obj({ name: str(), model: str(), task: str(), color: str() }, ['name']),
+        color_applied: bool('false when color was not #rrggbb and the default colour was kept.'),
+        servers: arr(
+          obj(
+            {
+              server_id: str(),
+              user: PRESENCE_USER,
+              owner_source: str('configured | jupyter | unknown'),
+              open_documents: num(),
+              global_presence: str('inactive | connecting | connected | reconnecting | closed. Presence is best-effort and never blocks notebook work.'),
+              last_close_code: nullableNum()
+            },
+            ['server_id', 'user', 'owner_source', 'open_documents', 'global_presence']
+          ),
+          'One entry per server this connection has used.'
+        )
+      },
+      ['declared', 'color_applied', 'servers']
+    ),
+    readOnly: true,
+    deduplicated: false
+  },
   {
     name: 'server_status', title: 'Inspect Jupyter server lifecycle',
     description: 'Read server readiness, lifecycle support and available start profiles. Does not start a server or kernel. Use server_start explicitly for a stopped Hub server; use kernel_control separately to start a notebook kernel.',

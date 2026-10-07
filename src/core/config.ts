@@ -109,16 +109,17 @@ export const DEFAULT_SERVICE_LIMITS: ServiceLimits = Object.freeze({
 // ---------------------------------------------------------------------------
 
 /**
- * The Yjs awareness state this client publishes on every room it joins.
+ * Operator default of the display name and colour in the agent's awareness
+ * `user` (SPEC.md §10 "Presence"); an agent's own declaration takes precedence.
  *
- * SPEC.md §10: presence shows the assistant's name and colour and disappears
- * on disconnect; it is never an authorship proof or a lock. SPEC.md §6: the
- * same awareness state carries `autosave: true`, which keeps the server's
- * debounced autosave enabled even when a browser publishes `autosave: false`.
- * The `autosave` flag is not configurable and therefore not a field here.
+ * SPEC.md §10: presence disappears on disconnect and is never an authorship
+ * proof or a lock. SPEC.md §6: document-room awareness also carries
+ * `autosave: true`, which keeps the server's debounced autosave enabled even
+ * when a browser publishes `autosave: false`. That flag is not configurable
+ * and therefore not a field here.
  */
 export interface AwarenessUser {
-  /** Display name shown to humans in JupyterLab. Never a credential. */
+  /** Default display name shown to humans in JupyterLab. Never a credential. */
   readonly name: string;
   /** `#rrggbb`. JupyterLab renders the cursor/presence badge with it. */
   readonly color: string;
@@ -129,6 +130,19 @@ export const DEFAULT_AWARENESS_USER: AwarenessUser = Object.freeze({
   name: 'Assistant (MCP)',
   color: '#0f766e'
 });
+
+/**
+ * Operator-controlled presence settings (SPEC.md §10 "Presence").
+ *
+ * `owner` names the human the agent acts for; a hosted transport sets it to
+ * the authenticated Hub user. It is never taken from a tool argument.
+ * `clientInfo: false` stops MCP `clientInfo` from supplying the default
+ * display name, for a host whose MCP client is a proxy rather than the agent.
+ */
+export interface PresenceConfig {
+  readonly owner?: string;
+  readonly clientInfo?: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // discovery (SPEC.md §11, docs/CONNECTIONS.md §9)
@@ -173,6 +187,7 @@ export interface ServiceConfig {
   readonly discovery: DiscoveryMode;
   readonly limits: ServiceLimits;
   readonly awarenessUser: AwarenessUser;
+  readonly presence?: PresenceConfig;
 }
 
 /**
@@ -187,6 +202,7 @@ export interface ServiceConfigInput {
   /** Partial override; unspecified budgets keep {@link DEFAULT_SERVICE_LIMITS}. */
   readonly limits?: Partial<ServiceLimits>;
   readonly awarenessUser?: Partial<AwarenessUser>;
+  readonly presence?: PresenceConfig;
 }
 
 /**
@@ -200,6 +216,7 @@ export function withDefaults(input: ServiceConfigInput): ServiceConfig {
     servers: input.servers ?? [],
     discovery: input.discovery ?? false,
     limits: { ...DEFAULT_SERVICE_LIMITS, ...input.limits },
-    awarenessUser: { ...DEFAULT_AWARENESS_USER, ...input.awarenessUser }
+    awarenessUser: { ...DEFAULT_AWARENESS_USER, ...input.awarenessUser },
+    ...(input.presence === undefined ? {} : { presence: { ...input.presence } })
   };
 }

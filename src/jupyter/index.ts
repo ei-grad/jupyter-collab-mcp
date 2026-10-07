@@ -72,6 +72,9 @@ export { SaveRequests } from './save-requests.js';
 export { authenticatedWebSocket } from './ws-auth.js';
 export type { WebSocketCtor } from './ws-auth.js';
 
+export { AwarenessRoom, GLOBAL_AWARENESS_ROOM } from './awareness-room.js';
+export type { AwarenessRoomOptions, AwarenessRoomState } from './awareness-room.js';
+
 export { RtcConnection, reconnectDelayMs } from './rtc-connection.js';
 export type {
   AwarenessUser,

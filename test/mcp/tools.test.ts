@@ -17,6 +17,7 @@ afterEach(async () => {
 
 const VALID_ARGS: Record<string, Record<string, unknown>> = {
   server_list: {},
+  session_identify: { name: 'Claude Code', task: 'tidy the analysis' },
   server_status: {},
   server_start: { request_id: '1' },
   notebook_list: { server_id: 'default', directory: 'work' },
@@ -55,12 +56,12 @@ async function openRefs(connection: Harness): Promise<{ notebookId: string; cell
 }
 
 describe('tools/list', () => {
-  it('publishes all 18 SPEC §9 tools with an input and an output schema', async () => {
+  it('publishes all 19 SPEC §9 tools with an input and an output schema', async () => {
     harness = await connect();
     const listed = await harness.client.listTools();
     const names = listed.tools.map((tool) => tool.name).sort();
     expect(names).toEqual(TOOL_SPECS.map((spec) => spec.name).sort());
-    expect(names).toHaveLength(18);
+    expect(names).toHaveLength(19);
     for (const tool of listed.tools) {
       expect(tool.inputSchema, tool.name).toBeDefined();
       expect(tool.inputSchema.type, tool.name).toBe('object');
@@ -175,6 +176,28 @@ describe('every tool round-trips', () => {
       }],
       waitMs: 1000
     });
+  });
+
+  it('passes session_identify to the service without a request number and reports the client', async () => {
+    harness = await connect();
+    const answer = await harness.call('session_identify', { name: 'Claude Code', model: 'opus', task: 'plots', color: '#112233' });
+    expect(answer.isError ?? false).toBe(false);
+    expect(harness.fake.lastRequest('sessionIdentify')).toEqual({ name: 'Claude Code', model: 'opus', task: 'plots', color: '#112233' });
+    const server = (answer.structuredContent?.['servers'] as Record<string, unknown>[])[0]!;
+    expect(server['owner_source']).toBe('configured');
+    expect((server['user'] as Record<string, unknown>)['display_name']).toBe('Claude Code (agent of alice)');
+    expect(answer.structuredContent).not.toHaveProperty('request_accepted');
+    expect(harness.fake.clientInfos.at(-1)).toMatchObject({ name: 'jupyter-collab-mcp-tests', version: '0.0.0' });
+  });
+
+  it('rejects session_identify without a name or with a request_id before the service', async () => {
+    harness = await connect();
+    for (const args of [{}, { name: '' }, { name: 'x', request_id: '1' }]) {
+      const answer = await harness.call('session_identify', args);
+      expect(answer.isError, JSON.stringify(args)).toBe(true);
+      expect(metaError(answer)['code']).toBe('INVALID_ARGUMENT');
+    }
+    expect(harness.fake.lastRequest('sessionIdentify')).toBeUndefined();
   });
 
   it('returns an immediately reusable final ref from notebook_apply', async () => {

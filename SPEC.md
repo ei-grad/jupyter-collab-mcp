@@ -802,6 +802,7 @@ read results and changes.
 | `server_list` | — | Safe descriptors for discovered/configured servers |
 | `server_status` | `server_id?` | Read-only readiness, `supports_start`, and available start profiles |
 | `server_start` | `server_id?`, `request_id`, `profile_id?` or `user_options?`, `wait_ms?` | Explicit own-user Hub singleuser start or join of an existing compatible start |
+| `session_identify` | `name`, `model?`, `task?`, `color?` | Self-declared presence of the connection context, republished in all its rooms (§10) |
 | `notebook_list` | `server_id?`, `directory`, `cursor?` | Notebook files and available session information |
 | `notebook_create` | `server_id?`, `directory`, `name?`, `request_id` | Untitled → optional rename → open; actual path, fileId, notebook_id, changes_cursor |
 | `notebook_open` | `server_id?`, `path` | Reusable handle, lifetime, status, summary, and `changes_cursor` |
@@ -835,6 +836,10 @@ after the preceding response, using its number. This constrains tool-call
 acceptance; a returned `execution_id` may still be running. Reads, observation,
 wait cancellation, and operations in different connection contexts may proceed in
 parallel. Interrupt remains available after obtaining an execution handle.
+`session_identify` is not deduplicated and takes no `request_id`: it changes
+only ephemeral awareness state, never a document, file or kernel, and each call
+replaces the whole declaration, so repeating it after a lost response is safe.
+It does not take the mutation lock and returns the current `next_request_id`.
 
 ### Optional JupyterHub server lifecycle
 
@@ -1156,8 +1161,66 @@ not kernel messages; overflow still explicitly returns `CURSOR_EXPIRED`.
 
 Local transaction origin distinguishes client-owned changes from remote ones.
 It does not prove which person made a remote edit. Yjs awareness presence shows
-the assistant's name/color and disappears on disconnect; it is not proof of
+the agent as described below and disappears on disconnect; it is not proof of
 authorship or a lock.
+
+### Presence
+
+Every document-room awareness state is `{user, autosave: true}`. While a server
+binding of a connection context has at least one open notebook handle, the
+client also joins `JupyterLab:globalAwareness`, the room JupyterLab's
+collaborators panel lists: `<base_url>/api/collaboration/room/JupyterLab:globalAwareness`,
+the standard Yjs sync and awareness protocol over an empty `Y.Doc`, with no
+document session, `sessionId` or RAW messages and the same handshake
+authentication as document rooms. Its local state is `{user, current,
+documents}`: `current` is `notebook:<path>` of the notebook most recently
+opened, read, edited or executed through that binding, and `documents` lists
+the binding's open notebook paths. The client leaves when the last handle of
+the binding closes, the context closes or the process shuts down; leaving first
+publishes a null local state, so other participants drop the entry at once
+rather than after the awareness timeout. Reconnects use the jittered bounded
+backoff and credential handling of document rooms. Presence is best-effort: a
+failed or unreachable presence room or a slow owner lookup never fails, delays
+or changes a notebook, kernel or file operation; its state is reported only by
+`session_identify`.
+
+`user` is a JupyterLab `IUser`: `username`, `name`, `display_name`,
+`initials` (always `AI`), `color` (`#rrggbb`) and `avatar_url: null`. It has
+two layers that never mix:
+
+- The **owner** is server-controlled. In order: the operator `presence.owner`
+  setting (the hosted transport sets it to the authenticated Hub user), the
+  profile's `hubUser`, the server's `GET /api/me` username, else a random
+  per-process fallback reported as unknown. The anonymous identity a
+  shared-token server generates per request (32-hex username, `Anonymous …`
+  name) names nobody and is ignored. Tool arguments and MCP `clientInfo` never
+  select the owner. The lookup is bounded and finishes before the global room
+  is joined, so other clients never see a provisional `username` there.
+- `username` is `<owner>~agent-<tag>`, with a random tag per connection context
+  (or library session). JupyterLab hides entries whose `username` equals the
+  viewer's own and groups entries by `username`, so the suffix keeps an agent
+  visible to its owner and keeps two agents of one owner apart.
+- The **declaration** is self-reported display text: `session_identify`, else
+  MCP `clientInfo` (title or name, plus version), else the operator
+  `awarenessUser` name; colour likewise falls back to the operator colour.
+  An operator may disable the `clientInfo` default (`presence.clientInfo:
+  false`); the hosted transport does, because its worker's MCP client is the
+  gateway. `name` is `<declared name><marker>` and `display_name` is
+  `<declared name>[ · <model>][ · <task>]<marker>`, where the marker
+  ` (agent of <owner>)`, or ` (agent, owner unknown)`, is appended outside
+  anything the agent controls.
+- Declared text is sanitized before use: Unicode format characters (including
+  bidi embeddings, overrides, isolates and zero-width characters) are removed,
+  other controls and line or paragraph separators become spaces, whitespace is
+  collapsed, and values are capped at 64 (name, model) and 120 (task) code
+  points; the owner is capped at 64. A name empty after sanitization is
+  `INVALID_ARGUMENT`; a colour that is not `#rrggbb` keeps the default and the
+  result reports `color_applied: false`. Each `session_identify` replaces the
+  whole declaration and republishes it at once in every document and global
+  room of the context.
+
+Owner and declaration are display information only: never authentication,
+authorization, ownership of a handle, authorship proof or a lock.
 
 Background replica updates do not mean the LLM has seen a change. The skill
 must require reading changes and refreshing observed refs before dependent edits. MCP notifications
@@ -1266,6 +1329,7 @@ browser test. Checking only a local `Y.Doc` or tool-response text is insufficien
 | Headless and persistence | Create, edit, and execute without an open browser; after acknowledged save, an independent file read contains expected data |
 | Save uncertainty | skipped/failed/timeout and update/save races are not presented as confirmed persistence of a specific revision |
 | Autosave | Validate awareness true/false/absent field and no states; MCP true persists after debounce without notebook_save, but is not confirmation of a particular revision |
+| Presence | An independent `JupyterLab:globalAwareness` participant sees the agent's `<owner>~agent-<tag>` username and `current` notebook while a handle is open and `session_identify` updates in global and document rooms, and sees the entry removed well before the awareness timeout after the last close |
 | Document data | Read/edit preserves unknown metadata, markdown attachments, and untouched outputs |
 | Tool coverage | Metadata operations validate revisions and preserve other keys; type changes/attachment writes are explicitly unsupported; a duplicate ID blocks only operations addressing it and batches containing them. Server ID changes during serialization update the index and old targets; an exact duplicate is not assumed removed from the shared array |
 | Create name | The standard manager supports name. An existing target returns ALREADY_EXISTS with the actual untitled path and side_effects=applied, without opening a room; likewise for 403 after creation. Successful rename opens the final path/fileId. Timeout does not retry; tests do not claim provider TOCTOU is absent |

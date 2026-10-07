@@ -66,6 +66,7 @@ see [skill/README.md](skill/README.md).
 | `server_list` | Configured/discovered servers, credential-free descriptors |
 | `server_status` | Read readiness and available Hub start profiles |
 | `server_start` | Explicitly start or join the configured own-user Hub server |
+| `session_identify` | Declare the agent's name/model/task shown in JupyterLab's collaborators panel |
 | `notebook_list` | List notebooks in a directory, with kernel session info |
 | `notebook_create` | Untitled -> optional rename -> open; returns the real path |
 | `notebook_open` | Join the shared document; reusable handle + summary |
