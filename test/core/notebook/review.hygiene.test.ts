@@ -201,6 +201,44 @@ describe('review: batch revision guards (SPEC.md §7)', () => {
     peer.dispose();
   });
 
+  it('attributes an overlap between two operations of the batch to the batch despite an unrelated remote edit', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'a\nb\nc\n')]));
+    const identity = peer.model.cellRef('c1').identityToken;
+    const rev = peer.model.summary().cells[0]!.sourceRevision;
+    typeInto(peer.notebook, 0, 'a\nb\nC\n');
+    try {
+      peer.model.apply([
+        { op: 'replace_source', cellId: 'c1', expectedCellIdentityToken: identity, expectedSourceRevision: rev, source: 'A\nb\nc\n' },
+        { op: 'replace_source', cellId: 'c1', expectedCellIdentityToken: identity, expectedSourceRevision: rev, source: 'Z\nb\nc\n' }
+      ]);
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toMatchObject({ code: 'REVISION_CONFLICT', details: { reason: 'overlapping_edits', in_batch: true } });
+    }
+    expect(peer.notebook.getCell(0).getSource()).toBe('a\nb\nC\n');
+    peer.dispose();
+  });
+
+  it('merges through the refreshed observation a conflict hands back', () => {
+    const peer = reviewPeer(11, reviewBook([reviewCode('c1', 'a\nb\nc\n')]));
+    const identity = peer.model.cellRef('c1').identityToken;
+    const rev = peer.model.summary().cells[0]!.sourceRevision;
+    typeInto(peer.notebook, 0, 'A\nb\nc\n');
+    let refreshed = '';
+    try {
+      peer.model.apply([{ op: 'replace_source', cellId: 'c1', expectedCellIdentityToken: identity, expectedSourceRevision: rev, source: 'X\nb\nc\n' }]);
+      expect.unreachable();
+    } catch (error) {
+      refreshed = String((error as CoreError).details?.['source_revision']);
+    }
+    // The ref recovered from the error is a fresh observation: later edits
+    // by others merge with it like with any read.
+    typeInto(peer.notebook, 0, 'A\nb\nC\n');
+    peer.model.apply([{ op: 'replace_source', cellId: 'c1', expectedCellIdentityToken: identity, expectedSourceRevision: refreshed as never, source: 'A\nB\nc\n' }]);
+    expect(peer.notebook.getCell(0).getSource()).toBe('A\nB\nC\n');
+    peer.dispose();
+  });
+
   it('falls back to an exact revision match once the observed source was evicted', () => {
     const peer = reviewPeer(
       11,

@@ -138,17 +138,27 @@ function outputsOfJson(json: CellJsonObject): NbOutput[] {
   return Array.isArray(raw) ? (raw as NbOutput[]) : [];
 }
 
-function observationDetails(cell: SimCell): Record<string, unknown> {
+/**
+ * The pre-batch observation an error hands back as the caller's refreshed
+ * reference. Its content is recorded as a merge base like that of any other
+ * revision handed out, so the recovery ref merges as well as a fresh read.
+ */
+function observationDetails(cell: SimCell, history: ObservationHistory): Record<string, unknown> {
   if (cell.entry === null) return { cell_id: cell.id };
   // Planning is all-or-nothing: on a validation error none of the simulated
   // earlier operations are applied, so the refresh ref must describe the
   // actual pre-batch object rather than an unreachable simulated state.
   const type = cellTypeOfJson(cell.original);
+  const source = sourceOfJson(cell.original);
+  const revision = sourceRevision(type, source);
+  const fullRevision = cellRevision(cell.original as JsonValue);
+  history.sources.remember(revision, () => ({ type, source }));
+  history.cellMetadata.remember(fullRevision, () => structuredClone(asObject(cell.original['metadata'])));
   return {
     cell_id: cell.id,
     identity_token: cell.entry.identityToken,
-    source_revision: sourceRevision(type, sourceOfJson(cell.original)),
-    cell_revision: cellRevision(cell.original as JsonValue),
+    source_revision: revision,
+    cell_revision: fullRevision,
     outputs_revision: type === 'code' ? outputsRevision(outputsOfJson(cell.original)) : null
   };
 }
@@ -242,17 +252,17 @@ class Simulation {
 
 /**
  * The source a `replace_source` was derived from: the pre-batch text when the
- * caller observed that, otherwise whatever {@link SourceHistory} still holds.
+ * caller observed that, otherwise whatever {@link ObservationHistory} still holds.
  */
 function mergeBase(
   cell: SimCell,
   expected: string,
-  history: ObservationHistory | undefined
+  history: ObservationHistory
 ): { readonly type: CellType; readonly source: string } | undefined {
   const type = cellTypeOfJson(cell.original);
   const source = sourceOfJson(cell.original);
   if (sourceRevision(type, source) === expected) return { type, source };
-  return history?.sources.get(expected);
+  return history.sources.get(expected);
 }
 
 /**
@@ -304,7 +314,7 @@ function mergedSource(
   current: string,
   expected: string,
   requested: string,
-  history: ObservationHistory | undefined
+  history: ObservationHistory
 ): string {
   if (sourceRevision(type, current) === expected) return requested;
   // A rejected batch applies nothing, so the conflict describes the live
@@ -313,7 +323,7 @@ function mergedSource(
   const fail = (reason: string, extra: Record<string, unknown> = {}): never => {
     throw coreError('REVISION_CONFLICT', conflictMessage(reason), {
       details: {
-        ...observationDetails(cell),
+        ...observationDetails(cell, history),
         reason,
         ...extra,
         expected,
@@ -327,11 +337,10 @@ function mergedSource(
   if (base.type !== type) return fail('cell_type_changed');
   const merged = mergeSources(base.source, current, requested);
   if (merged.kind === 'merged') return merged.text;
-  const originalRevision = sourceRevision(cellTypeOfJson(cell.original), sourceOfJson(cell.original));
   return fail('overlapping_edits', {
-    // The cell was unchanged when the batch started, so the competing edit is
-    // one of this batch's own earlier operations.
-    in_batch: originalRevision === expected,
+    // The request merges with everything other writers did before the batch,
+    // so the overlap is with one of this batch's own earlier operations.
+    in_batch: current !== live && mergeSources(base.source, live, requested).kind === 'merged',
     conflicts: merged.conflicts.slice(0, 8).map((conflict) => ({
       base_line: conflict.baseLine + 1,
       base_lines: conflict.baseLines
@@ -486,12 +495,12 @@ export function planOperations(
         const found = findSingleOccurrence(current, operation.oldText);
         if (found.kind === 'not_found') {
           throw coreError('MATCH_NOT_FOUND', 'old_text does not occur in the cell source', {
-            details: observationDetails(cell)
+            details: observationDetails(cell, history)
           });
         }
         if (found.kind === 'not_unique') {
           throw coreError('MATCH_NOT_UNIQUE', 'old_text occurs more than once in the cell source', {
-            details: { ...observationDetails(cell), occurrences: found.count }
+            details: { ...observationDetails(cell, history), occurrences: found.count }
           });
         }
         const edit: TextEdit = {
@@ -519,8 +528,8 @@ export function planOperations(
           operation.expectedCellRevision,
           cellRevision(cell.json as JsonValue),
           cellRevision(cell.original as JsonValue),
-          observationDetails(cell),
-          () => boundedPreview(sourceOfJson(cell.json))
+          observationDetails(cell, history),
+          () => boundedPreview(sourceOfJson(cell.original))
         );
         sim.order.splice(at, 1);
         ops.push({ kind: 'delete', op: 'delete_cell', at, target: cell });
@@ -541,8 +550,8 @@ export function planOperations(
           operation.expectedOutputsRevision,
           outputsRevision(outputs),
           outputsRevision(outputsOfJson(cell.original)),
-          observationDetails(cell),
-          () => outputsPreview(outputs)
+          observationDetails(cell, history),
+          () => outputsPreview(outputsOfJson(cell.original))
         );
         cell.json['outputs'] = [];
         ops.push(
@@ -566,10 +575,10 @@ export function planOperations(
         guardMetadataKey(
           path[0]!,
           operation.expectedCellRevision,
-          history?.cellMetadata.get(operation.expectedCellRevision),
+          history.cellMetadata.get(operation.expectedCellRevision),
           asObject(cell.original['metadata']),
           cellRevision(cell.original as JsonValue),
-          observationDetails(cell)
+          observationDetails(cell, history)
         );
         const before = asObject(cell.json['metadata']);
         const after = remove ? deleteAtPath(before, path) : setAtPath(before, path, operation.value);
@@ -601,10 +610,11 @@ export function planOperations(
         const originalRevision = notebookMetadataRevision(
           sim.originalMetadata as Record<string, JsonValue | undefined>
         );
+        history.notebookMetadata.remember(originalRevision, () => structuredClone(sim.originalMetadata));
         guardMetadataKey(
           path[0]!,
           operation.expectedNotebookMetadataRevision,
-          history?.notebookMetadata.get(operation.expectedNotebookMetadataRevision),
+          history.notebookMetadata.get(operation.expectedNotebookMetadataRevision),
           sim.originalMetadata,
           originalRevision,
           { notebook_metadata_revision: originalRevision }

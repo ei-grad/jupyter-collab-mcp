@@ -132,6 +132,21 @@ describe('global presence lifecycle', () => {
     expect(rooms.every((room) => room.disposed)).toBe(true);
   });
 
+  it('moves current to a notebook reopened through its live handle', async () => {
+    const { service, rooms } = rig({ config: { presence: { owner: 'alice' } } });
+    try {
+      await service.notebookOpen({ path: 'a.ipynb' });
+      await until(() => rooms.length === 1);
+      await service.notebookOpen({ path: 'b.ipynb' });
+      expect(last(rooms[0]!)['current']).toBe('notebook:b.ipynb');
+      const again = await service.notebookOpen({ path: 'a.ipynb' });
+      expect(again.reused).toBe(true);
+      expect(last(rooms[0]!)).toMatchObject({ current: 'notebook:a.ipynb', documents: ['b.ipynb', 'a.ipynb'] });
+    } finally {
+      await service.shutdown('client_request');
+    }
+  });
+
   it('never fails or blocks notebook work when the presence room cannot be created', async () => {
     const { service } = rig({ failRoom: true });
     try {

@@ -1995,6 +1995,7 @@ class CollabServiceImpl implements CollabService {
       maxCells: effective.maxCells,
       previewChars: effective.previewChars
     });
+    if (reused) session.presence?.touched(handle.path);
     return {
       notebook: handle.info(),
       reused,
